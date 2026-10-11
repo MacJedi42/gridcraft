@@ -83,7 +83,8 @@ fn round_dir(x: f64, digits: i32, up: bool) -> f64 {
 // Sums and products
 
 fn sum(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
-    num_val(numbers(a)?.iter().sum())
+    // Left to right, each addition rounded; Excel snaps only the last one to zero.
+    num_val(gridcraft_core::arith::sum_snapped(&numbers(a)?))
 }
 
 fn sumsq(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {

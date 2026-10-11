@@ -430,7 +430,7 @@ impl PassHost<'_> {
         let expr = std::sync::Arc::clone(expr);
         let v = {
             let mut ev = Evaluator::new(self, k.0, k.1);
-            ev.value(&expr)
+            ev.value_root(&expr)
         };
         // A legacy array formula fills the range it was entered in.
         let legacy = self.wb.sheet(k.0).and_then(|s| s.cell(k.1)).and_then(|c| c.formula.as_ref()).and_then(|f| f.array);
@@ -958,7 +958,7 @@ pub fn evaluate_expr(wb: &Workbook, sheet: usize, at: CellRef, expr: &Expr) -> V
         depth: 0,
     };
     let mut ev = Evaluator::new(&mut host, sheet, at);
-    ev.value(expr)
+    ev.value_root(expr)
 }
 
 #[allow(clippy::disallowed_methods)] // the clock is read only off wasm

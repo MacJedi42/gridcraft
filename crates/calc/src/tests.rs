@@ -467,3 +467,139 @@ fn sumif_resized_sum_range_on_another_sheet_and_through_a_name() {
     assert_eq!(t.num("C1"), 10.0);
     assert_eq!(t.num("C2"), 5.0);
 }
+
+// ---- Excel's snap to zero (suite: cancel-ulps, cancel-band, decimal-sum, excel-probe) ----
+
+impl T {
+    /// Stores an exact double, bypassing input parsing.
+    fn put(&mut self, at: &str, x: f64) {
+        self.wb.sheet_mut(0).unwrap().cells.set(c(at), Cell::value(Value::Number(x)));
+        self.calc.cells_changed(&mut self.wb, &[(0, c(at))]);
+    }
+}
+
+const ULP1: f64 = f64::EPSILON; // the spacing of doubles just above 1.0
+
+#[test]
+fn a_bare_root_add_or_sub_snaps_a_near_cancellation_to_zero() {
+    let mut t = T::new();
+    t.put("A1", 1.0);
+    t.put("B1", 1.0 + ULP1); // one ulp apart: Excel shows 0, not -2.22e-16
+    t.set("C1", "=A1-B1");
+    t.set("C2", "=B1-A1");
+    t.set("C3", "=A1+-B1");
+    t.set("C4", "=0+A1-B1"); // the end of =0+A-B snaps too
+    t.set("C5", "=SUM(A1,-B1)*1"); // the last addition of a SUM snaps even when SUM isn't the root
+    t.put("D1", -(1.0 + ULP1));
+    t.set("C6", "=SUM(A1,D1)");
+    t.set("C7", "=A1+D1");
+    for at in ["C1", "C2", "C3", "C4", "C5", "C6", "C7"] {
+        assert_eq!(t.get(at), Value::Number(0.0), "{at}");
+    }
+    // The classic: 0.1+0.2-0.3 is 0 in Excel (5.55e-17 in IEEE).
+    t.put("E1", 0.1);
+    t.put("E2", 0.2);
+    t.put("E3", 0.3);
+    t.set("E4", "=E1+E2-E3");
+    assert_eq!(t.get("E4"), Value::Number(0.0));
+}
+
+#[test]
+fn the_snap_threshold_is_two_to_the_e_minus_49_of_the_left_operand() {
+    let mut t = T::new();
+    t.put("A1", 1.0);
+    // 7 ulps below the threshold of 8 ulps (2^-49): snaps. Exactly 8: does not.
+    t.put("B1", 1.0 + 7.0 * ULP1);
+    t.put("B2", 1.0 + 8.0 * ULP1);
+    t.set("C1", "=A1-B1");
+    t.set("C2", "=A1-B2");
+    assert_eq!(t.get("C1"), Value::Number(0.0));
+    assert_eq!(t.get("C2"), Value::Number(-8.0 * ULP1));
+    // The binade is the LEFT operand's (Excel observed, request 4, excel-probe-4.00044 to 00046).
+    t.put("A3", 0.4999999999999998);
+    t.put("B3", 0.5000000000000002);
+    t.set("C3", "=A3-B3");
+    t.set("C4", "=B3-A3");
+    assert_eq!(t.get("C3"), Value::Number(-4.440892098500626e-16));
+    assert_eq!(t.get("C4"), Value::Number(0.0));
+}
+
+#[test]
+fn the_snap_does_not_apply_inside_parentheses_unary_if_or_inner_steps() {
+    let mut t = T::new();
+    t.put("A1", 1.0);
+    t.put("B1", 1.0 + ULP1);
+    let residue = 1.0 - (1.0 + ULP1);
+    for (at, f) in [
+        ("C1", "=(A1-B1)"),
+        ("C2", "=+(A1-B1)"),
+        ("C3", "=-(B1-A1)"),
+        ("C4", "=IF(TRUE,A1-B1)"),
+        ("C5", "=A1-B1+0"),       // the root is the +0; the inner subtraction is not a root
+        ("C6", "=SUM(A1,-B1,0)"), // the last addition is residue+0
+    ] {
+        t.set(at, f);
+        assert_eq!(t.get(at), Value::Number(residue), "{f}");
+    }
+    // Excel observed (request 3): =SUM(A-B) does not snap (the subtraction is an inner step, the SUM's
+    // last addition is residue + 0), and neither does a root that adds a zero.
+    t.set("C7", "=SUM(A1-B1)");
+    t.set("C8", "=A1-B1-0");
+    assert_eq!(t.get("C7"), Value::Number(residue));
+    assert_eq!(t.get("C8"), Value::Number(residue));
+    // Only the LAST addition of a SUM snaps: 3+1e16-1e16 is 4, not 0.
+    t.put("D1", 3.0);
+    t.put("D2", 1e16);
+    t.put("D3", -1e16);
+    t.put("D4", 0.0);
+    t.set("E1", "=SUM(D1:D4)");
+    assert_eq!(t.get("E1"), Value::Number(4.0));
+}
+
+#[test]
+fn same_sign_and_exact_arithmetic_never_snap() {
+    let mut t = T::new();
+    t.put("A1", 1e-20);
+    t.put("B1", 2e-20);
+    t.set("C1", "=A1+B1"); // a tiny sum of small numbers is not a cancellation
+    t.set("C2", "=A1-B1");
+    t.put("A2", 3.0);
+    t.put("B2", 2.0);
+    t.set("C3", "=A2-B2");
+    assert_eq!(t.num("C1"), 1e-20 + 2e-20);
+    assert_eq!(t.num("C2"), 1e-20 - 2e-20);
+    assert_eq!(t.num("C3"), 1.0);
+}
+
+#[test]
+fn the_snap_threshold_follows_the_left_operand_across_a_binade_boundary() {
+    // Windows Excel 16.0.20430, snap probe rows 226, 231 and 236 (=A-B, A just below 1.0): the
+    // threshold is 2^-50 (A's binade), not 2^-49 (B's), so 7.8e-16 snaps and 9.99e-16 does not.
+    let mut t = T::new();
+    t.put("A1", 0.9999999999999999);
+    t.put("B1", 1.0000000000000004);
+    t.put("B2", 1.0000000000000007);
+    t.put("B3", 1.0000000000000009);
+    t.set("D1", "=A1-B1");
+    t.set("D2", "=A1-B2");
+    t.set("D3", "=A1-B3");
+    assert_eq!(t.get("D1"), Value::Number(0.0));
+    assert_eq!(t.get("D2"), Value::Number(0.0));
+    assert_eq!(t.get("D3"), Value::Number(-9.992007221626409e-16));
+}
+
+#[test]
+fn the_snap_leaves_error_and_text_operands_alone() {
+    let mut t = T::new();
+    t.put("B1", 1.0 + ULP1);
+    t.set("A1", "=1/0");
+    t.set("C1", "=A1-B1");
+    assert_eq!(t.get("C1"), Value::Error(CellError::Div0));
+    t.set("A2", "abc");
+    t.set("C2", "=A2-B1");
+    assert_eq!(t.get("C2"), Value::Error(CellError::Value));
+    t.set("A3", "1"); // numeric text still converts, then the subtraction snaps like any other
+    t.put("B3", 1.0);
+    t.set("C3", "=A3-B3");
+    assert_eq!(t.get("C3"), Value::Number(0.0));
+}

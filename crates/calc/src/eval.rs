@@ -108,6 +108,20 @@ impl<'h> Evaluator<'h> {
         self.deref(ev)
     }
 
+    /// Evaluates the root of a formula. Excel snaps a near-cancelling add or subtract to exactly 0
+    /// only here (and in the last addition of a `SUM`), never inside parentheses, unary signs,
+    /// `IF` branches or an inner step: `=A1-B1` is 0 over two numbers one ulp apart, `=(A1-B1)` is not.
+    pub fn value_root(&mut self, e: &Expr) -> Value {
+        match e {
+            Expr::Binary(op @ (BinOp::Add | BinOp::Sub), a, b) => {
+                let x = self.value(a);
+                let y = self.value(b);
+                zip2(&x, &y, |l, r| binary_scalar_snapped(*op, l, r))
+            }
+            _ => self.value(e),
+        }
+    }
+
     fn resolve_sheet(&self, s: &SheetSel) -> Result<Vec<usize>, CellError> {
         let wb = self.host.workbook();
         match s {
@@ -1301,6 +1315,17 @@ fn zip3(c: &Array, t: &Value, f: &Value, g: impl Fn(&Value, &Value, &Value) -> V
 
 pub fn binary_values(op: BinOp, x: &Value, y: &Value) -> Value {
     zip2(x, y, |a, b| binary_scalar(op, a, b))
+}
+
+/// `a + b` or `a - b` with Excel's snap to zero (see [`Evaluator::value_root`]).
+fn binary_scalar_snapped(op: BinOp, a: &Value, b: &Value) -> Value {
+    match (a, b) {
+        (Value::Error(_), _) | (_, Value::Error(_)) => binary_scalar(op, a, b),
+        _ => match (a.to_number(), b.to_number()) {
+            (Ok(x), Ok(y)) => Value::number(gridcraft_core::arith::snap_add(x, if op == BinOp::Sub { -y } else { y })),
+            (Err(e), _) | (_, Err(e)) => Value::Error(e),
+        },
+    }
 }
 
 fn binary_scalar(op: BinOp, a: &Value, b: &Value) -> Value {
