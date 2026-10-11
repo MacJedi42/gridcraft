@@ -114,8 +114,16 @@ impl<'h> Evaluator<'h> {
     pub fn value_root(&mut self, e: &Expr) -> Value {
         match e {
             Expr::Binary(op @ (BinOp::Add | BinOp::Sub), a, b) => {
+                // The root skips `eval`, so it must pay its own depth: a name that refers to itself
+                // (directly or through cells) is bounded only by this counter.
+                self.depth += 1;
+                if self.depth > MAX_DEPTH {
+                    self.depth -= 1;
+                    return Value::Error(CellError::Calc);
+                }
                 let x = self.value(a);
                 let y = self.value(b);
+                self.depth -= 1;
                 zip2(&x, &y, |l, r| binary_scalar_snapped(*op, l, r))
             }
             _ => self.value(e),
@@ -261,7 +269,13 @@ impl<'h> Evaluator<'h> {
                     let saved = self.sheet;
                     // Unqualified references in a name refer to the scope sheet.
                     self.sheet = scope;
-                    let r = self.eval(&expr);
+                    // A name's body is a formula of its own, so Excel snaps it by the root rule wherever
+                    // the name is used (name probe, Windows Excel 16.0.20430). Only a value-producing
+                    // add or subtract needs it; any other body, a range included, stays as it is.
+                    let r = match &expr {
+                        Expr::Binary(BinOp::Add | BinOp::Sub, ..) => Ev::V(self.value_root(&expr)),
+                        _ => self.eval(&expr),
+                    };
                     self.sheet = saved;
                     r
                 }

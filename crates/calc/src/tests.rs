@@ -603,3 +603,156 @@ fn the_snap_leaves_error_and_text_operands_alone() {
     t.set("C3", "=A3-B3");
     assert_eq!(t.get("C3"), Value::Number(0.0));
 }
+
+// ---- the snap in a defined name's body (Windows Excel 16.0.20430, name probe: 8 bodies x 12 positions) ----
+
+impl T {
+    fn name(&mut self, name: &str, body: &str) {
+        self.wb.names.push(gridcraft_model::DefinedName {
+            name: name.into(),
+            scope: None,
+            formula: body.into(),
+            comment: String::new(),
+            hidden: false,
+        });
+    }
+}
+
+#[test]
+fn a_defined_name_is_a_formula_of_its_own_so_its_body_snaps_wherever_it_is_used() {
+    let mut t = T::new();
+    t.put("A1", 1.0);
+    t.put("B1", 1.0 + ULP1);
+    // (body, does Excel snap it?) Only the shape of the BODY matters, not where the name is used.
+    let bodies = [
+        ("N_sub", "Sheet1!$A$1-Sheet1!$B$1", true),
+        ("N_par", "(Sheet1!$A$1-Sheet1!$B$1)", false),
+        ("N_plus0", "Sheet1!$A$1-Sheet1!$B$1+0", false),
+        ("N_sum", "SUM(Sheet1!$A$1,-Sheet1!$B$1)", true),
+        ("N_neg", "-(Sheet1!$B$1-Sheet1!$A$1)", false),
+        ("N_ref", "N_sub", true), // a name that is a name inherits it
+        ("N_if", "IF(TRUE,Sheet1!$A$1-Sheet1!$B$1)", false),
+        ("N_sumsub", "SUM(Sheet1!$A$1-Sheet1!$B$1)", false),
+    ];
+    for (name, body, _) in bodies {
+        t.name(name, body);
+    }
+    // All 12 positions of the Excel probe.
+    let uses = ["{n}", "{n}*1", "{n}+0", "0+{n}", "({n})", "-{n}", "+{n}", "SUM({n})", "IF(TRUE,{n})", "ABS({n})", "1*{n}", "{n}-0"];
+    let mut row = 2;
+    for (name, body, snaps) in bodies {
+        for u in uses {
+            let at = format!("D{row}");
+            t.set(&at, &format!("={}", u.replace("{n}", name)));
+            // Every body is -1 ulp (A1-B1) or exactly 0; a minus sign or ABS flips the residue.
+            let flips = u.starts_with('-') || u.starts_with("ABS");
+            let want = if snaps {
+                0.0
+            } else if flips {
+                ULP1
+            } else {
+                -ULP1
+            };
+            assert_eq!(t.get(&at), Value::Number(want), "{u} over {name} = {body}");
+            row += 1;
+        }
+    }
+}
+
+#[test]
+fn excels_own_gap_shapes_from_lookup_shapes_xlsx() {
+    // excel-evidence/request-3/files/lookup-shapes.xlsx, Sheet1!H15:H26: the gaps of 1, 4 and 7 ulps
+    // snap to 0 as =Gap, =Gap*1 and =Gap+0; the gap of 8 ulps keeps its residue.
+    let mut t = T::new();
+    for (cell, v) in [("A1", 1.0000000000000002), ("A2", 1.0000000000000009), ("A3", 1.0000000000000016), ("A4", 1.0000000000000018)] {
+        t.put(cell, v);
+    }
+    for (cell, v) in [("B1", 1.0), ("B2", 1.0), ("B3", 1.0), ("B4", 1.0)] {
+        t.put(cell, v);
+    }
+    for (name, row) in [("Gap_1", 1), ("Gap_4", 2), ("Gap_7", 3), ("Gap_8", 4)] {
+        t.name(name, &format!("Sheet1!$A${row}-Sheet1!$B${row}"));
+    }
+    let mut r = 10;
+    for (name, residue) in [("Gap_1", 0.0), ("Gap_4", 0.0), ("Gap_7", 0.0), ("Gap_8", 1.7763568394002505e-15)] {
+        for f in ["{n}", "{n}*1", "{n}+0"] {
+            let at = format!("F{r}");
+            t.set(&at, &format!("={}", f.replace("{n}", name)));
+            assert_eq!(t.get(&at), Value::Number(residue), "{f} over {name}");
+            r += 1;
+        }
+    }
+}
+
+#[test]
+fn a_name_that_refers_to_a_range_still_refers_to_it() {
+    // Only a reference answers these: ISREF, ROW and OFFSET over a name. Wrapping every name
+    // body in value_root would turn the range into an array and fail all three.
+    let mut t = T::new();
+    t.put("A1", 1.0);
+    t.put("A2", 2.0);
+    t.put("B1", 3.0);
+    t.put("B2", 4.0);
+    t.name("Block", "Sheet1!$A$1:$B$2");
+    t.set("D1", "=ISREF(Block)");
+    t.set("D2", "=MIN(ROW(Block))");
+    t.set("D3", "=SUM(OFFSET(Block,0,1))");
+    assert_eq!(t.get("D1"), Value::Bool(true));
+    assert_eq!(t.num("D2"), 1.0);
+    assert_eq!(t.num("D3"), 7.0);
+}
+
+#[test]
+fn a_name_whose_body_is_an_array_difference_snaps_element_wise() {
+    // Windows Excel (review probe): INDEX(Arr,1)*1 and INDEX(Arr,2)*1 are 0 for Arr = A1:A2-B1:B2.
+    let mut t = T::new();
+    for (a, b) in [("A1", "B1"), ("A2", "B2")] {
+        t.put(a, 1.0);
+        t.put(b, 1.0 + ULP1);
+    }
+    t.name("Arr", "Sheet1!$A$1:$A$2-Sheet1!$B$1:$B$2");
+    t.set("D1", "=INDEX(Arr,1)*1");
+    t.set("D2", "=INDEX(Arr,2)*1");
+    t.set("D3", "=SUM(Arr)");
+    assert_eq!((t.get("D1"), t.get("D2")), (Value::Number(0.0), Value::Number(0.0)));
+    assert_eq!(t.get("D3"), Value::Number(0.0));
+}
+
+#[test]
+fn a_sheet_scoped_name_snaps_on_its_own_sheet() {
+    // Windows Excel (review probe): a sheet-scoped Loc = S2!$A$1-S2!$B$1 gives 0 as =S2!Loc*1.
+    let mut t = T::new();
+    t.wb.sheets.push(std::sync::Arc::new(gridcraft_model::Sheet::new("S2")));
+    t.wb.sheet_mut(1).unwrap().cells.set(c("A1"), Cell::value(Value::Number(1.0)));
+    t.wb.sheet_mut(1).unwrap().cells.set(c("B1"), Cell::value(Value::Number(1.0 + ULP1)));
+    t.wb.names.push(gridcraft_model::DefinedName {
+        name: "Loc".into(),
+        scope: Some(1),
+        formula: "S2!$A$1-S2!$B$1".into(),
+        comment: String::new(),
+        hidden: false,
+    });
+    t.set("D1", "=S2!Loc*1");
+    t.set("D2", "=S2!Loc");
+    assert_eq!((t.get("D1"), t.get("D2")), (Value::Number(0.0), Value::Number(0.0)));
+}
+
+#[test]
+fn recursive_names_stay_bounded_and_cost_the_same_depth_as_before_the_snap() {
+    let mut t = T::new();
+    // A name that refers to itself ends in #CALC!, not a stack overflow.
+    t.name("Rec", "Rec-1");
+    t.set("A1", "=Rec");
+    assert_eq!(t.get("A1"), Value::Error(CellError::Calc));
+    // A long chain of names, each one `-0` over the last, runs out of depth at the same place as it did
+    // before names were snapped (value_root must charge its own level, or each link would be cheaper
+    // and a chain through cells could overflow the stack).
+    t.name("Nm_0", "1");
+    for i in 1..=250 {
+        t.name(&format!("Nm_{i}"), &format!("Nm_{}-0", i - 1));
+    }
+    t.set("A2", "=Nm_250");
+    assert_eq!(t.get("A2"), Value::Error(CellError::Calc));
+    t.set("A3", "=Nm_20");
+    assert_eq!(t.get("A3"), Value::Number(1.0));
+}
