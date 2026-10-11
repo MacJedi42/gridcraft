@@ -808,7 +808,13 @@ impl<'h> Evaluator<'h> {
     fn call_lambda_values(&mut self, l: &Lambda, bound: Vec<(String, Ev)>) -> Ev {
         let saved = std::mem::replace(&mut self.env, l.env.clone());
         self.env.extend(bound);
-        let r = self.eval(&l.body);
+        // A LAMBDA body is a formula of its own, so Excel snaps it by the root rule in every context
+        // (named, inline, LET-bound, MAP, REDUCE, SCAN, MAKEARRAY, BYROW, BYCOL; LAMBDA probe on Windows
+        // Excel 16.0.20430). A LET, IF, parenthesis or unary sign at the root of the body does not.
+        let r = match &l.body {
+            Expr::Binary(BinOp::Add | BinOp::Sub, ..) => Ev::V(self.value_root(&l.body)),
+            _ => self.eval(&l.body),
+        };
         self.env = saved;
         r
     }

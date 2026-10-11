@@ -756,3 +756,169 @@ fn recursive_names_stay_bounded_and_cost_the_same_depth_as_before_the_snap() {
     t.set("A3", "=Nm_20");
     assert_eq!(t.get("A3"), Value::Number(1.0));
 }
+
+// ---- the snap in a LAMBDA body (Windows Excel 16.0.20430, LAMBDA probe: 126 formulas) ----
+// A LAMBDA body is a formula of its own, like a defined name's: Excel snaps it by the root rule in every
+// context (named, inline, LET-bound, and under MAP, REDUCE, SCAN, MAKEARRAY, BYROW and BYCOL).
+
+fn lambda_t() -> T {
+    let mut t = T::new();
+    t.put("A1", 1.0);
+    t.put("B1", 1.0 + ULP1);
+    t.put("A2", 1.0 + ULP1);
+    t.put("B2", 1.0 + ULP1);
+    t
+}
+
+#[test]
+fn a_lambda_body_snaps_by_its_own_root_wherever_the_lambda_is_called() {
+    let mut t = lambda_t();
+    // (name, body, does Excel snap it?)
+    let lambdas = [
+        ("L_sub", "LAMBDA(x,y,x-y)", true),
+        ("L_par", "LAMBDA(x,y,(x-y))", false),
+        ("L_plus0", "LAMBDA(x,y,x-y+0)", false),
+        ("L_sum", "LAMBDA(x,y,SUM(x,-y))", true),
+        ("L_neg", "LAMBDA(x,y,-(y-x))", false),
+        ("L_if", "LAMBDA(x,y,IF(TRUE,x-y))", false),
+        ("L_sumsub", "LAMBDA(x,y,SUM(x-y))", false),
+        ("L_let", "LAMBDA(x,y,LET(d,x-y,d))", false), // a LET inside the body does not snap
+        ("L_letroot", "LAMBDA(x,y,LET(a,x,a-y))", false),
+        ("L_ref", "LAMBDA(x,y,L_sub(x,y))", true), // a lambda that calls one inherits it
+    ];
+    for (name, body, _) in lambdas {
+        t.name(name, body);
+    }
+    let uses = ["{c}", "{c}*1", "{c}+0", "0+{c}", "({c})", "-{c}", "SUM({c})", "IF(TRUE,{c})", "ABS({c})"];
+    let mut row = 5;
+    for (name, body, snaps) in lambdas {
+        for u in uses {
+            let at = format!("D{row}");
+            t.set(&at, &format!("={}", u.replace("{c}", &format!("{name}(Sheet1!$A$1,Sheet1!$B$1)"))));
+            let flips = u.starts_with('-') || u.starts_with("ABS");
+            let want = if snaps {
+                0.0
+            } else if flips {
+                ULP1
+            } else {
+                -ULP1
+            };
+            assert_eq!(t.get(&at), Value::Number(want), "{u} over {name} = {body}");
+            row += 1;
+        }
+    }
+}
+
+#[test]
+fn inline_and_let_bound_lambdas_snap_the_same_way() {
+    let mut t = lambda_t();
+    for (i, (f, snaps)) in [
+        ("LAMBDA(x,y,x-y)(Sheet1!$A$1,Sheet1!$B$1)", true),
+        ("LAMBDA(x,y,x-y)(Sheet1!$A$1,Sheet1!$B$1)*1", true),
+        ("LAMBDA(x,y,(x-y))(Sheet1!$A$1,Sheet1!$B$1)", false),
+        ("LAMBDA(x,y,x-y+0)(Sheet1!$A$1,Sheet1!$B$1)", false),
+        ("LAMBDA(x,y,SUM(x,-y))(Sheet1!$A$1,Sheet1!$B$1)", true),
+        ("LET(f,LAMBDA(x,y,x-y),f(Sheet1!$A$1,Sheet1!$B$1))", true),
+        ("LET(f,LAMBDA(x,y,x-y),f(Sheet1!$A$1,Sheet1!$B$1))*1", true),
+        ("LET(f,LAMBDA(x,y,(x-y)),f(Sheet1!$A$1,Sheet1!$B$1))", false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = format!("D{}", i + 5);
+        t.set(&at, &format!("={f}"));
+        assert_eq!(t.get(&at), Value::Number(if snaps { 0.0 } else { -ULP1 }), "{f}");
+    }
+}
+
+#[test]
+fn higher_order_functions_snap_their_lambda_body() {
+    let mut t = lambda_t();
+    // The cell is INDEX(<result>,1,1), bare and times 1. A is (1, 1+ulp), B is (1+ulp, 1+ulp).
+    let cases = [
+        ("MAP(Sheet1!$A$1:$A$2,Sheet1!$B$1:$B$2,LAMBDA(x,y,{b}))", "x-y"),
+        ("REDUCE(Sheet1!$A$1,Sheet1!$B$1,LAMBDA(x,y,{b}))", "x-y"),
+        ("SCAN(Sheet1!$A$1,Sheet1!$B$1:$B$2,LAMBDA(x,y,{b}))", "x-y"),
+        ("MAKEARRAY(1,1,LAMBDA(x,y,{b}))", "Sheet1!$A$1-Sheet1!$B$1"),
+        ("BYROW(Sheet1!$A$1:$B$2,LAMBDA(r,{b}))", "INDEX(r,1,1)-INDEX(r,1,2)"),
+        ("BYCOL(Sheet1!$A$1:$B$2,LAMBDA(r,{b}))", "INDEX(r,1,1)-INDEX(r,2,1)"),
+    ];
+    let mut row = 5;
+    for (f, bare) in cases {
+        for (b, snaps) in [(bare.to_string(), true), (format!("({bare})"), false)] {
+            for u in ["INDEX({c},1,1)", "INDEX({c},1,1)*1"] {
+                let at = format!("D{row}");
+                let formula = u.replace("{c}", &f.replace("{b}", &b));
+                t.set(&at, &format!("={formula}"));
+                assert_eq!(t.get(&at), Value::Number(if snaps { 0.0 } else { -ULP1 }), "{formula}");
+                row += 1;
+            }
+        }
+    }
+}
+
+#[test]
+fn a_lambda_body_that_returns_a_reference_still_returns_one() {
+    // Windows Excel (review probe): a body that returns a reference is still a reference, so only an
+    // add or subtract root takes the snapping path. ISREF and OFFSET need the reference; wrapping every
+    // body in value_root would turn it into a value.
+    let mut t = lambda_t();
+    t.set("D5", "=ISREF(LAMBDA(x,x)(Sheet1!$A$1))");
+    t.set("D6", "=ISREF(LAMBDA(x,IF(TRUE,x))(Sheet1!$A$1))");
+    t.set("D7", "=ROW(LAMBDA(x,OFFSET(x,1,0))(Sheet1!$A$1))");
+    assert_eq!(t.get("D5"), Value::Bool(true));
+    assert_eq!(t.get("D6"), Value::Bool(true));
+    assert_eq!(t.num("D7"), 2.0);
+}
+
+#[test]
+fn nested_curried_and_closed_over_lambda_bodies_snap_by_the_root_of_the_inner_body() {
+    // Windows Excel (review probe): each of these is exactly 0.
+    let mut t = lambda_t();
+    for (i, f) in [
+        "LAMBDA(x,LAMBDA(y,x-y))(Sheet1!$A$1)(Sheet1!$B$1)",         // curried
+        "LAMBDA(x,y,LAMBDA(p,q,p-q)(x,y))(Sheet1!$A$1,Sheet1!$B$1)", // a body that calls an inner lambda
+        "LAMBDA(x,y,0+x-y)(Sheet1!$A$1,Sheet1!$B$1)",                // the end of 0+x-y snaps like =0+A-B
+        "LET(a,Sheet1!$A$1,LAMBDA(y,a-y)(Sheet1!$B$1))",             // a closure over a LET variable
+        "LAMBDA(x,y,x-y)(Sheet1!$A$1+0,Sheet1!$B$1+0)",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = format!("D{}", i + 5);
+        t.set(&at, &format!("={f}"));
+        assert_eq!(t.get(&at), Value::Number(0.0), "{f}");
+    }
+}
+
+#[test]
+fn a_lambda_body_uses_the_same_threshold_and_snaps_array_arguments_element_wise() {
+    // Windows Excel (review probe): 7 ulps snap, 8 ulps keep the residue, inside a body as in a cell.
+    let mut t = lambda_t();
+    t.put("G1", 1.0);
+    t.put("G2", 1.0 + 7.0 * ULP1);
+    t.put("G3", 1.0 + 8.0 * ULP1);
+    t.set("D5", "=LAMBDA(x,y,x-y)(Sheet1!$G$1,Sheet1!$G$2)");
+    t.set("D6", "=LAMBDA(x,y,x-y)(Sheet1!$G$1,Sheet1!$G$3)");
+    assert_eq!(t.get("D5"), Value::Number(0.0));
+    assert_eq!(t.get("D6"), Value::Number(-8.0 * ULP1));
+    // Array arguments: each element snaps by its own left operand (1 and 3 are different binades).
+    t.put("E1", 1.0);
+    t.put("E2", 3.0);
+    t.put("F1", 1.0 + ULP1);
+    t.put("F2", 3.0 + 2.0 * ULP1);
+    t.set("D8", "=INDEX(LAMBDA(x,y,x-y)(Sheet1!$E$1:$E$2,Sheet1!$F$1:$F$2),1,1)");
+    t.set("D9", "=INDEX(LAMBDA(x,y,x-y)(Sheet1!$E$1:$E$2,Sheet1!$F$1:$F$2),2,1)");
+    assert_eq!(t.get("D8"), Value::Number(0.0));
+    assert_eq!(t.get("D9"), Value::Number(0.0));
+}
+
+#[test]
+fn a_lambda_that_calls_itself_ends_in_an_error_not_a_crash() {
+    // Which error depends on where the depth runs out first (#CALC! or #NAME?); what matters is that
+    // it ends. A recursion through cells is a separate, existing limit.
+    let mut t = lambda_t();
+    t.name("Loop", "LAMBDA(x,Loop(x)-1)");
+    t.set("D5", "=Loop(1)");
+    assert!(matches!(t.get("D5"), Value::Error(_)), "{:?}", t.get("D5"));
+}
