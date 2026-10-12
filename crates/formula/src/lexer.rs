@@ -4,6 +4,8 @@
 
 use gridcraft_core::CellError;
 
+use crate::ast::TrimMode;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tok {
     Number(f64),
@@ -27,6 +29,8 @@ pub enum Tok {
     Comma,
     Semicolon,
     Colon,
+    /// Trim reference range operator `.:`, `:.` or `.:.`.
+    Trim(TrimMode),
     Space,
     Eof,
 }
@@ -47,6 +51,20 @@ pub struct LexError {
 
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '_' | '.' | '$' | '\\' | '?')
+}
+
+/// `A1`, `$A$1`, `A`, `$A`, `1`, `$1`: a word that can end a range, so `A1.:` is a trim
+/// reference and not a name ending in a dot.
+fn is_range_end(w: &str) -> bool {
+    let s = w.strip_prefix('$').unwrap_or(w);
+    let (letters, rest) = s.split_at(s.find(|c: char| !c.is_ascii_alphabetic()).unwrap_or(s.len()));
+    let digits = if letters.is_empty() { rest } else { rest.strip_prefix('$').unwrap_or(rest) };
+    letters.len() <= 3 && if digits.is_empty() { !letters.is_empty() && rest.is_empty() } else { digits.bytes().all(|b| b.is_ascii_digit()) }
+}
+
+/// Whether `c` can start the second end of a range after `:.` (`A1:.E10`, `A:.$C`, `1:.5`).
+fn starts_range_end(c: Option<char>) -> bool {
+    c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '$')
 }
 
 /// Tokenizes formula text (without the leading `=`).
@@ -178,6 +196,16 @@ pub fn tokenize_locale(src: &str, locale: crate::FormulaLocale) -> Result<Vec<To
                 push(&mut out, Tok::Struct(inner), j);
                 i = j;
             }
+            '.' if ch(i + 1) == Some(':') => {
+                // Trim reference `A1.:E10` / `A1.:.E10` (the word before stopped at the dot).
+                if ch(i + 2) == Some('.') && starts_range_end(ch(i + 3)) {
+                    push(&mut out, Tok::Trim(TrimMode::All), i + 3);
+                    i += 3;
+                } else {
+                    push(&mut out, Tok::Trim(TrimMode::Leading), i + 2);
+                    i += 2;
+                }
+            }
             c if c.is_ascii_digit() || (c == locale.decimal_separator() && ch(i + 1).is_some_and(|d| d.is_ascii_digit())) => {
                 // Number, unless it is a row range like 1:3 (handled by parser via Word) — numbers
                 // followed by ':' and digits are row refs: lex as Word.
@@ -185,12 +213,22 @@ pub fn tokenize_locale(src: &str, locale: crate::FormulaLocale) -> Result<Vec<To
                 while ch(j).is_some_and(|d| d.is_ascii_digit()) {
                     j += 1;
                 }
-                let is_row_ref = ch(j) == Some(':') && {
-                    let mut k = j + 1;
-                    if ch(k) == Some('$') {
+                // Row ranges `1:3`, and the trim forms `1.:3`, `1:.3`, `1.:.3`.
+                let is_row_ref = {
+                    let mut k = j;
+                    if ch(k) == Some('.') && ch(k + 1) == Some(':') {
                         k += 1;
                     }
-                    ch(k).is_some_and(|d| d.is_ascii_digit())
+                    ch(k) == Some(':') && {
+                        k += 1;
+                        if ch(k) == Some('.') {
+                            k += 1;
+                        }
+                        if ch(k) == Some('$') {
+                            k += 1;
+                        }
+                        ch(k).is_some_and(|d| d.is_ascii_digit())
+                    }
                 };
                 // A word like "1A" can't happen in valid formulas; numbers then.
                 if is_row_ref {
@@ -252,8 +290,13 @@ pub fn tokenize_locale(src: &str, locale: crate::FormulaLocale) -> Result<Vec<To
                 i += 1;
             }
             ':' => {
-                push(&mut out, Tok::Colon, i + 1);
-                i += 1;
+                if ch(i + 1) == Some('.') && starts_range_end(ch(i + 2)) {
+                    push(&mut out, Tok::Trim(TrimMode::Trailing), i + 2);
+                    i += 2;
+                } else {
+                    push(&mut out, Tok::Colon, i + 1);
+                    i += 1;
+                }
             }
             '+' | '-' | '*' | '/' | '^' | '&' | '%' | '@' | '=' => {
                 let op = match c {
@@ -315,6 +358,11 @@ pub fn tokenize_locale(src: &str, locale: crate::FormulaLocale) -> Result<Vec<To
                 } else if w.eq_ignore_ascii_case("FALSE") && ch(j) != Some('[') {
                     push(&mut out, Tok::Bool(false), j);
                     i = j;
+                } else if w.len() > 1 && w.ends_with('.') && ch(j) == Some(':') && is_range_end(w.get(..w.len() - 1).unwrap_or("")) {
+                    // `A1.:E10`: the dot belongs to the trim operator, lexed next.
+                    let w = w.get(..w.len() - 1).unwrap_or("").to_string();
+                    push(&mut out, Tok::Word(w), j - 1);
+                    i = j - 1;
                 } else {
                     push(&mut out, Tok::Word(w), j);
                     i = j;

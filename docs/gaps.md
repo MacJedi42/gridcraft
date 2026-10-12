@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** major (created from the full re-measure against Excel for Mac 16.113.4 and the issue tracker) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-11 · **Change:** minor (§6: iterative calculation landed) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -33,18 +33,20 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Impact:** finance and data users routinely have big workbooks.
 - **Estimate:** 25–40 h. [target-app-parity.md](target-app-parity.md#performance), [hardware-parity.md](hardware-parity.md)
 
-### 3. Unmodelled XLSX content is dropped on save (FF)
-- **Missing:** pass-through of parts and extensions we don't model (form controls, slicers,
-  timelines, external links, OLE objects, custom XML, query tables, data model, chart details).
-- **Evidence:** reader warns and skips (`crates/xlsx/src/read.rs`); external links "not supported".
-- **Impact:** open-edit-save silently simplifies colleagues' workbooks.
-- **Estimate:** 10–15 h. [file-format-parity.md](file-format-parity.md)
+### 3. Some unmodelled XLSX content is dropped on save (FF)
+- **Missing:** slicers and their caches, timelines, the data model, query tables attached to
+  tables, unmodelled `extLst` entries, chart details. Pass-through (#330) keeps custom XML,
+  external links, connections, sheet query tables, printer settings, form and ActiveX controls,
+  OLE objects and sheet backgrounds; never checked in Excel (repair prompts unknown).
+- **Evidence:** `crates/xlsx/src/passthrough.rs` (what is kept, and why the rest isn't).
+- **Impact:** open-edit-save still simplifies workbooks with slicers, timelines or Power Pivot.
+- **Estimate:** 6–10 h. [file-format-parity.md](file-format-parity.md)
 
 ### 4. Charts lose type and options on round trip; shallow chart model (F, FF)
 - **Missing:** kinds that survive XLSX (stock, combo, histogram, box, waterfall, funnel, treemap,
-  sunburst), axis scaling, label options, trendlines, error bars, per-point formatting.
+  sunburst), axis scaling, label options, error bars, per-point formatting.
 - **Evidence:** `Chart` holds only title, legend position, two flags and axis titles
-  (`crates/model/src/features.rs`); PRs #158, #161 open; charts can't be resized (#190). Smooth lines (#62) and Switch Row/Column (#116) landed.
+  (`crates/model/src/features.rs`); PRs #158, #161 open; charts can't be resized (#190). Smooth lines (#62), Switch Row/Column (#116) and trendlines (read, written, drawn) landed.
 - **Impact:** charts are in most business workbooks.
 - **Estimate:** 25–35 h for beta (40–60 h full). [chart-parity.md](chart-parity.md)
 
@@ -58,26 +60,31 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 ### 6. Calculation correctness bugs (F)
 - **Missing:** 15-significant-digit equality; spill updates after structural edits and cleared
-  blockers; 3-D span deletion; qualified names after sheet rename; iterative calculation.
-- **Evidence:** #57, #133, #139, #140, #134; Enable Iterative Calculation stored but unused;
-  PRs #148, #155, #156, #157.
+  blockers; 3-D span deletion; qualified names after sheet rename.
+- **Evidence:** #57, #133, #139, #140, #134; PRs #148, #155, #156, #157. Iterative calculation
+  for circular references landed (no Options dialog yet).
 - **Impact:** wrong numbers are worse than missing features.
 - **Estimate:** 10–15 h. [function-parity.md](function-parity.md#formula-language)
 
-### 7. No legacy `.xls`; no password-protected workbooks (FF)
-- **Evidence:** #121. Since #17 (closed #11) both are recognised through a CFB sniff and refused with a clear message, but neither opens.
+### 7. Legacy `.xls` only partly read; encrypted workbooks can't be saved with a password (FF)
+- **Evidence:** #121: Excel 97-2003 (BIFF8) `.xls` files now open (values, formulas, number
+  formats, merges, sizes, names); fonts, fills, borders, charts, pictures, comments, conditional
+  formats, validation and BIFF5 files are not read, and `.xls` is never written. Password-encrypted
+  `.xlsx` workbooks (Agile and Standard encryption) open with their password since #11, but are
+  saved without it: GridCraft can't write an encrypted file yet. Encrypted `.xls` (FILEPASS) and
+  RC4-encrypted files are still refused with a message.
 - **Impact:** common in finance, government and anything older than 2007; encrypted files are
   routine in business.
-- **Estimate:** 28–42 h (`.xls` read 20–30, encryption 8–12). [file-format-parity.md](file-format-parity.md)
+- **Estimate:** 14–21 h (`.xls` styles and objects 10–15, encryption 4–6). [file-format-parity.md](file-format-parity.md)
 
-### 8. PivotTables: no slicers, calculated fields, PivotCharts; unverified in Excel (F)
+### 8. PivotTables: no slicers, calculated items, PivotCharts; unverified in Excel (F)
 - **Evidence:** `parity-checklist.md` missing `insert.slicer`, `insert.timeline`,
-  `insert.pivotChart`, `pivot.calculatedField`, `table.insertSlicer`; GETPIVOTDATA missing.
+  `insert.pivotChart`, `table.insertSlicer`; calculated items and GETPIVOTDATA missing (calculated fields done).
 - **Impact:** pivots are the analyst's main tool.
 - **Estimate:** 20–30 h for beta (25–40 h full).
 
 ### 9. Keyboard-first users: key tips, shortcuts, context menus (U)
-- **Evidence:** #33, #49 (key tips: initial Home-tab support landed in #43 on 10-10, the rest of the ribbon not yet), #110, #21 (Insert Copied Cells), #28 (selection),
+- **Evidence:** #33, #49 (key tips: initial Home-tab support landed in #43 on 10-10, the rest of the ribbon not yet), #110, #28 (selection),
   59 command shortcuts vs Excel's 200+.
 - **Estimate:** 12–20 h. [ui-parity.md](ui-parity.md)
 
@@ -98,19 +105,23 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   data model (`data.fromWeb`, `data.relationships` missing). **Estimate:** 60–100 h.
 
 ### 13. Analysis tools: Solver, Analysis ToolPak, Forecast Sheet (F)
-- `data.solver`, `data.analysisToolPak`, `data.forecastSheet` missing; FORECAST.ETS family missing.
-  **Estimate:** 22–35 h.
+- `data.solver`, `data.analysisToolPak` missing. Forecast Sheet (`data.forecastSheet`) and the
+  FORECAST.ETS family are in; the sheet has no Forecast Start (hindcast) option yet. **Estimate:** 15–25 h.
 
 ### 14. Page Layout view and print polish (U, F)
-- No paper view with rulers and in-place header/footer editing; web print exports only (#141, PR
-  #143). **Estimate:** 12–20 h.
+- Page Layout view landed (#329): paper view with rulers and in-place header/footer editing.
+  Remaining: pictures in headers/footers, Different First Page / Odd & Even pages, dragging
+  margins on the ruler; web print exports only (#141, PR #143). **Estimate:** 5–10 h.
 
 ### 15. Remaining functions and an oracle suite (F)
-- 22 missing, 9 stubs; no Excel-computed oracle corpus; #137, #138. **Estimate:** 18–30 h.
+- 18 missing, 9 stubs; no Excel-computed oracle corpus; #137, #138. **Estimate:** 16–26 h.
+- 20 missing, 9 stubs; no Excel-computed oracle corpus; #137, #138. **Estimate:** 17–29 h.
+- 21 missing, 9 stubs; no Excel-computed oracle corpus; #137, #138. **Estimate:** 18–30 h.
+- 18 missing, 9 stubs; no Excel-computed oracle corpus; #137, #138. **Estimate:** 18–30 h.
   [function-parity.md](function-parity.md)
 
 ### 16. Collaboration and review (F)
-- No co-authoring, Show Changes, Allow Edit Ranges, comment navigation, notes ↔ comments
+- No co-authoring, Show Changes, comment navigation, notes ↔ comments
   conversion; cloud storage requested (#86). **Estimate:** 35–55 h (co-authoring scope needs the owner).
 
 ### 17. Insert objects (F)
@@ -149,6 +160,22 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-11 | minor | §6: iterative calculation for circular references landed (Maximum Iterations, Maximum Change) |
+| 2026-10-11 | minor | §15: trim-reference operators (`A1:.E10`, `A1.:E10`, `A1.:.E10`) parse and evaluate |
+| 2026-10-11 | minor | §4: trendlines (six types, forecast, equation and R²) read, written and drawn |
+| 2026-10-11 | minor | §7: password-encrypted workbooks open with their password; saving with one remains (#11) |
+| 2026-10-11 | minor | §16: comment navigation, Show Comments, Show All Notes and Convert to Comments landed (#281) |
+| 2026-10-11 | minor | §7: `.xls` (BIFF8) import of values, formulas and number formats (#121) |
+| 2026-10-11 | minor | §3: XLSX pass-through keeps custom XML, external links, connections, query tables, printer settings, controls and OLE objects (#330, #324) |
+| 2026-10-11 | minor | §13: Forecast Sheet landed (#322) |
+| 2026-10-11 | minor | §15: ODDFPRICE, ODDFYIELD, ODDLPRICE, ODDLYIELD added (18 functions missing) |
+| 2026-10-11 | minor | §15: PERCENTOF and EUROCONVERT added (20 functions missing) |
+| 2026-10-11 | minor | §15: BAHTTEXT added (21 functions missing) |
+| 2026-10-11 | minor | §15: TRIMRANGE added (21 functions missing; trim-reference operators still missing) |
+| 2026-10-11 | minor | §16: Allow Edit Ranges landed (#307) |
+| 2026-10-11 | minor | §8: calculated fields added |
+| 2026-10-11 | minor | §8: PivotCharts added |
+| 2026-10-11 | minor | §13, §15: FORECAST.ETS family landed (#314) |
 | 2026-10-10 | minor | Updated for the 10-10 merges (#17, #31, #38, #62, #82, #104, #116) and the new chart resize bug (#190) |
 | 2026-10-10 | minor | Noted that no gap blocks the alpha gate |
 | 2026-10-10 | major | Created: 24 ranked gaps with evidence, from the full re-measure and the 60 open issues |

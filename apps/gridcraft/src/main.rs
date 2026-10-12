@@ -17,6 +17,9 @@ mod logging;
 #[cfg(target_os = "macos")]
 mod native_menu;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use gridcraft_engine::Session;
 use gridcraft_ui_egui::{Services, SheetApp};
 use serde_json::json;
@@ -51,6 +54,16 @@ impl eframe::App for App {
     }
     fn on_exit(&mut self) {
         save_prefs(&self.0);
+        // macOS (#117): end the process here, before eframe tears the window down. AccessKit's
+        // macOS adapter subclasses the window's content view and restores its class on teardown;
+        // AppKit's Touch Bar support observes that view (KVO), so in the next display cycle
+        // `-[_NSTouchBarFinderObservation invalidate]` throws "not registered" and the quit ends
+        // in a crash report. eframe calls `on_exit` on every way of quitting (Quit/⌘Q, the Dock,
+        // the close button, `app.quit`), and nothing after it is needed: the preferences are
+        // saved and the log file is unbuffered. eframe does the same when it doesn't
+        // run-and-return. `on_exit` only runs once the app exists, never on a failed start.
+        #[cfg(target_os = "macos")]
+        std::process::exit(0);
     }
 }
 
@@ -84,6 +97,8 @@ fn load_prefs(app: &mut SheetApp) {
     }
     // First run (or a ui.json without a usable language): follow the desktop's language.
     app.ui.language = gridcraft_ui_egui::i18n::Language::system();
+    // ...and its light or dark appearance (#239), until a theme is chosen and saved in ui.json.
+    app.ui.system_theme = true;
     let Some(dir) = config_dir() else { return };
     if let Ok(b) = std::fs::read(dir.join("ui.json"))
         && let Ok(ui) = serde_json::from_slice::<gridcraft_ui_egui::UiState>(&b)
@@ -116,18 +131,28 @@ fn save_prefs(app: &SheetApp) {
 
 fn services() -> Services {
     // Keep the owner alive: X11/Wayland serve clipboard data from this handle.
-    let mut clipboard: Option<arboard::Clipboard> = None;
+    let clipboard: Rc<RefCell<Option<arboard::Clipboard>>> = Rc::default();
+    let paste_clipboard = clipboard.clone();
     Services {
         copy_html: Some(Box::new(move |html, text| {
+            let mut clipboard = clipboard.borrow_mut();
             if clipboard.is_none() {
-                clipboard = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
+                *clipboard = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
             }
             clipboard.as_mut().ok_or("clipboard unavailable")?.set_html(html, Some(text)).map_err(|e| e.to_string())
         })),
+        paste_html: Some(Box::new(move || {
+            let mut clipboard = paste_clipboard.try_borrow_mut().ok()?;
+            if clipboard.is_none() {
+                *clipboard = arboard::Clipboard::new().ok();
+            }
+            clipboard.as_mut()?.get().html().ok()
+        })),
         pick_open: Some(Box::new(|| {
             rfd::FileDialog::new()
-                .add_filter("Spreadsheets", &["xlsx", "xlsm", "xlsb", "ods", "csv", "tsv", "txt", "json"])
+                .add_filter("Spreadsheets", &["xlsx", "xlsm", "xls", "xlsb", "ods", "csv", "tsv", "txt", "json"])
                 .add_filter("Excel Workbook", &["xlsx", "xlsm"])
+                .add_filter("Excel 97-2003 Workbook (import)", &["xls"])
                 .add_filter("Excel Binary Workbook (data import)", &["xlsb"])
                 .add_filter("OpenDocument Spreadsheet (data import)", &["ods"])
                 .add_filter("CSV", &["csv"])
@@ -141,30 +166,74 @@ fn services() -> Services {
                 .and_then(|p| p.to_str().map(str::to_string))
         })),
         pick_save: Some(Box::new(|suggested: &str| {
-            let stem = std::path::Path::new(suggested).file_stem().and_then(|s| s.to_str()).unwrap_or("Book1").to_string();
-            rfd::FileDialog::new()
-                .set_file_name(format!("{stem}.xlsx"))
-                .add_filter("Excel Workbook (.xlsx)", &["xlsx"])
-                .add_filter("CSV UTF-8 (.csv)", &["csv"])
-                .add_filter("Web Page (.html)", &["html"])
-                .save_file()
-                .and_then(|p| p.to_str().map(str::to_string))
+            let path = std::path::Path::new(suggested);
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Book1").to_string();
+            // The suggested name's type (an export asks for .pdf, .csv or .html) comes first.
+            const TYPES: [(&str, &str); 4] =
+                [("Excel Workbook (.xlsx)", "xlsx"), ("CSV UTF-8 (.csv)", "csv"), ("Web Page (.html)", "html"), ("PDF (.pdf)", "pdf")];
+            let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).filter(|e| TYPES.iter().any(|(_, x)| x == e));
+            let ext = ext.unwrap_or_else(|| "xlsx".to_string());
+            let mut dialog = rfd::FileDialog::new().set_file_name(format!("{stem}.{ext}"));
+            for (label, x) in TYPES.iter().filter(|(_, x)| *x == ext).chain(TYPES.iter().filter(|(_, x)| *x != ext)) {
+                dialog = dialog.add_filter(*label, &[*x]);
+            }
+            dialog.save_file().and_then(|p| p.to_str().map(str::to_string))
         })),
-        open_url: Some(Box::new(|url: &str| {
-            let cmd = if cfg!(target_os = "macos") {
-                "open"
-            } else if cfg!(windows) {
-                "explorer"
-            } else {
-                "xdg-open"
-            };
-            let _ = std::process::Command::new(cmd).arg(url).spawn();
+        open_url: Some(Box::new(|url: &str| open_with_system(url))),
+        // File › Print, Ctrl+P: the print PDF opens in the system's PDF viewer, whose Print
+        // command reaches the printer dialog (GridCraft has no printer driver of its own).
+        print: Some(Box::new(|bytes: &[u8]| match write_print_pdf(&std::env::temp_dir(), bytes) {
+            Ok(path) => open_with_system(&path.to_string_lossy()),
+            Err(e) => log::warn!("print: {e}"),
         })),
         ..Default::default()
     }
 }
 
+/// Opens a URL or file with the system's default application.
+fn open_with_system(target: &str) {
+    let cmd = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(windows) {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    if let Err(e) = std::process::Command::new(cmd).arg(target).spawn() {
+        log::warn!("{cmd} {target}: {e}");
+    }
+}
+
+/// Writes a print PDF into `dir` under a fresh name (an earlier print may still be open in the
+/// viewer) and returns its path. The temp folder is shared, so the file is created exclusively
+/// (an existing file or a planted symlink is never followed or overwritten) and, on Unix, readable
+/// only by the user.
+fn write_print_pdf(dir: &std::path::Path, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    static PRINTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    for _ in 0..64 {
+        let n = PRINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed).wrapping_add(1);
+        let path = dir.join(format!("GridCraft print {}-{n}.pdf", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        match options.open(&path) {
+            Ok(mut file) => {
+                file.write_all(bytes)?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free print file name"))
+}
+
 fn icon() -> Option<egui::IconData> {
+    #[cfg(target_os = "macos")]
+    let bytes = include_bytes!("../../../assets/app-icon/gridcraft-macos-512.png");
+    #[cfg(not(target_os = "macos"))]
     let bytes = include_bytes!("../../../assets/app-icon/hicolor/256x256/apps/ai.storyteller.gridcraft.png");
     let img = image::load_from_memory(bytes).ok()?.to_rgba8();
     Some(egui::IconData { width: img.width(), height: img.height(), rgba: img.into_raw() })
@@ -235,18 +304,20 @@ fn main() -> eframe::Result<()> {
     {
         log::warn!("sample {s}: {e}");
     }
-    for f in &files {
-        if let Err(e) = session.execute("file.open", json!({"path": f})) {
-            log::warn!("{f}: {e}");
-        }
-    }
     if session.documents().is_empty() {
         session.new_workbook();
     }
     let mut app = SheetApp::new(session, services());
-    app.after_engine(); // Show warnings from files opened on the command line.
+    app.watch_desktop_theme();
+    app.after_engine(); // Show warnings from the sample.
     let control_port = control_port;
     load_prefs(&mut app);
+    // Files named on the command line (a double-click on Windows and Linux) open as File › Open
+    // opens them: a password-protected one asks for its password, and errors are shown, not
+    // only logged. Each replaces the untouched blank Book1, as a file opened from Finder does.
+    for f in &files {
+        app.open_path(f);
+    }
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("GridCraft")
         .with_inner_size([1440.0, 900.0])
@@ -260,37 +331,95 @@ fn main() -> eframe::Result<()> {
         viewport = viewport.with_icon(i);
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
-    // Before eframe creates the wgpu instance: default Windows to DirectX 12 only (see graphics.rs).
+    // Before eframe creates the wgpu instance: Windows starts on DirectX 12, or OpenGL when
+    // DirectX 12 has no GPU driver, and never touches Vulkan unless asked (see graphics.rs).
     #[cfg(target_os = "windows")]
-    let options = {
+    let backend_override = eframe::wgpu::Backends::from_env();
+    #[cfg(target_os = "windows")]
+    let (options, first_backends) = {
         let mut options = options;
-        graphics::configure(&mut options, eframe::wgpu::Backends::from_env());
-        options
+        let backends = graphics::configure(&mut options, backend_override);
+        (options, backends)
     };
+    #[cfg(target_os = "windows")]
+    let retry_options = options.clone();
     // Registered before the event loop starts, so it catches the Finder event that launched us as
     // well as later ones. Lives until the event loop returns; the app creator only borrows it.
     #[cfg(target_os = "macos")]
     let apple_events = apple_events::AppleEvents::install();
     #[cfg(target_os = "macos")]
     let apple_events = &apple_events;
-    eframe::run_native(
-        "GridCraft",
-        options,
-        Box::new(move |cc| {
-            SheetApp::setup_context_for_language(&cc.egui_ctx, app.ui.dark, app.ui.language);
-            if let Some(port) = control_port {
-                match control_server::start(port, cc.egui_ctx.clone()) {
-                    Ok(rx) => app.control_rx = Some(rx),
-                    Err(e) => log::error!("control channel on port {port}: {e}"),
+    // The app waits here until a start gets as far as creating it; a start that fails before
+    // (no graphics adapter, device or surface) leaves it here for the next attempt.
+    let pending = std::cell::Cell::new(Some(app));
+    let run = |options: eframe::NativeOptions| {
+        eframe::run_native(
+            "GridCraft",
+            options,
+            Box::new(|cc| {
+                let Some(mut app) = pending.take() else {
+                    return Err("the app was already created".into());
+                };
+                SheetApp::setup_context_for_language(&cc.egui_ctx, app.ui.dark, app.ui.language);
+                if let Some(port) = control_port {
+                    match control_server::start(port, cc.egui_ctx.clone()) {
+                        Ok(rx) => app.control_rx = Some(rx),
+                        Err(e) => log::error!("control channel on port {port}: {e}"),
+                    }
                 }
-            }
-            Ok(Box::new(App(
-                app,
-                #[cfg(target_os = "macos")]
-                None,
-                #[cfg(target_os = "macos")]
-                apple_events.connect(&cc.egui_ctx),
-            )))
-        }),
-    )
+                Ok(Box::new(App(
+                    app,
+                    #[cfg(target_os = "macos")]
+                    None,
+                    #[cfg(target_os = "macos")]
+                    apple_events.connect(&cc.egui_ctx),
+                )))
+            }),
+        )
+    };
+    let result = run(options);
+    // A graphics error before the app existed: start once more with the other backend (eframe
+    // reuses its event loop for the second run). Errors after that, or from winit, are returned.
+    #[cfg(target_os = "windows")]
+    if let Err(eframe::Error::Wgpu(e)) = &result
+        && let Some(app) = pending.take()
+        && let Some(backends) = graphics::fallback_backends(backend_override, first_backends)
+    {
+        log::error!("graphics: the renderer didn't start on {first_backends:?} ({e}); trying {backends:?}");
+        pending.set(Some(app));
+        let mut options = retry_options;
+        graphics::configure_backends(&mut options, backends);
+        return run(options);
+    }
+    result
+}
+
+#[cfg(test)]
+mod print_tests {
+    #[test]
+    fn print_pdfs_get_fresh_names_in_the_given_folder() {
+        let dir = std::env::temp_dir().join(format!("gridcraft-print-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = super::write_print_pdf(&dir, b"%PDF-1.4 a").unwrap();
+        let b = super::write_print_pdf(&dir, b"%PDF-1.4 b").unwrap();
+        assert_ne!(a, b);
+        assert!(a.starts_with(&dir) && a.extension().is_some_and(|e| e == "pdf"));
+        assert_eq!(std::fs::read(&b).unwrap(), b"%PDF-1.4 b");
+        assert!(super::write_print_pdf(&dir.join("missing"), b"x").is_err());
+        // A file (or symlink) already at the next name is skipped, never overwritten.
+        let pid = std::process::id();
+        let taken: Vec<_> = (1..=200).map(|n| dir.join(format!("GridCraft print {pid}-{n}.pdf"))).filter(|p| !p.exists()).take(3).collect();
+        for p in &taken {
+            std::fs::write(p, b"keep").unwrap();
+        }
+        let c = super::write_print_pdf(&dir, b"%PDF-1.4 c").unwrap();
+        assert!(taken.iter().all(|p| std::fs::read(p).unwrap() == b"keep"));
+        assert_eq!(std::fs::read(&c).unwrap(), b"%PDF-1.4 c");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&c).unwrap().permissions().mode() & 0o077, 0, "only the user can read it");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

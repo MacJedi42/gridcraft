@@ -171,6 +171,8 @@ fn moves_and_renames() {
     let mv = Edit::Move { from: gridcraft_core::RangeRef::parse("A1:B2").unwrap(), to_row: 9, to_col: 3 };
     let e = parse("A1+B2+C3+SUM(A1:B2)").unwrap();
     assert_eq!(print(&adjust(e, "S", "S", &mv)), "D10+E11+C3+SUM(D10:E11)");
+    let mv = Edit::Move { from: gridcraft_core::RangeRef::parse("B:C").unwrap(), to_row: 0, to_col: 4 };
+    assert_eq!(print(&adjust(parse("SUM(B:B)+SUM($C:$C)+D1").unwrap(), "S", "S", &mv)), "SUM(E:E)+SUM($F:$F)+D1");
     let e = parse("Old!A1+'Old'!B2").unwrap();
     assert_eq!(print(&rename_sheet(e, "Old", "New Name")), "'New Name'!A1+'New Name'!B2");
 }
@@ -217,4 +219,85 @@ fn spans() {
     let toks = lexer::tokenize("SUM(A1, B2)").unwrap();
     let a1 = toks.iter().find(|t| t.tok == lexer::Tok::Word("A1".into())).unwrap();
     assert_eq!((a1.start, a1.end), (4, 6));
+}
+
+#[test]
+fn unbracketed_this_row_column() {
+    // Writers such as xlsxwriter spell `[@Units]` as `[[#This Row],Units]`.
+    let p = |f: &str| parse(f).unwrap_or_else(|e| panic!("{f}: {e}"));
+    let Expr::Binary(BinOp::Mul, a, _) = p("[[#This Row],Units]*[[#This Row],Price]") else { panic!() };
+    let Expr::Struct(s) = *a else { panic!() };
+    assert_eq!((s.specifiers.as_slice(), s.col_start.as_deref()), ([StructItem::ThisRow].as_slice(), Some("Units")));
+    assert_eq!(rt("[[#This Row],Units]*[[#This Row],Price]"), "[@Units]*[@Price]");
+    assert_eq!(rt("Sales[[#This Row],Units]"), "Sales[@Units]");
+    assert_eq!(rt("Sales[[#This Row], Units ]"), "Sales[@Units]");
+    assert_eq!(rt("[[#This Row],Units]+[@[Unit Price]]+Sales[[#This Row],[Qty]]"), "[@Units]+[@[Unit Price]]+Sales[@Qty]");
+    // Unexpected text between the brackets is an error, never silently dropped.
+    for bad in [
+        "[[#This Row]x]",
+        "[[#This Row],[A]]x",
+        "[[#Data],Col]",
+        "[[#This Row],A:B]",
+        "[x[#This Row]]",
+        "[[#This Row],]x",
+        "Sales[[#All],[A]]junk",
+        "Sales[[A],[B],[C]]",
+        "Sales[@[A]x]",
+    ] {
+        assert!(parse(bad).is_err(), "{bad} should fail");
+    }
+}
+
+#[test]
+fn trim_references() {
+    for f in [
+        "SUM(A1:.E10)",
+        "SUM(A1.:E10)",
+        "SUM(A1.:.E10)",
+        "SUM(A:.A)",
+        "SUM($A.:.$C)",
+        "ROWS(1:.5)",
+        "ROWS($1.:$5)",
+        "ROWS(1.:.5)",
+        "Sheet2!$A$1:.B9",
+        "Q1.2026!A1.:.B2",
+        "'Q1 2026'!A1:.B2",
+        "SUM(A1:.A9,B1.:B9)",
+        "A1:.A9*2",
+    ] {
+        assert_eq!(rt(f), f, "round trip of {f}");
+    }
+    let Expr::Call(_, args) = parse("SUM(A1:.E10)").unwrap() else { panic!() };
+    assert!(matches!(args.as_slice(), [Expr::Unary(UnOp::Trim(TrimMode::Trailing), r)] if matches!(**r, Expr::Ref(_))));
+    // Decimals, row ranges and dotted names keep their meaning.
+    assert_eq!(parse("1.5+.5").unwrap(), Expr::Binary(BinOp::Add, Box::new(Expr::Number(1.5)), Box::new(Expr::Number(0.5))));
+    for f in ["SUM(1:5)", "Q1.2026!A1:B2", "my.name+1", "SUM(A1:B2)*1.5", "1.:5"] {
+        assert_eq!(rt(f), f);
+    }
+    assert_eq!(rt("'Q1.2026'!A1:B2"), "Q1.2026!A1:B2");
+    assert!(matches!(parse("Q1.2026!A1:B2").unwrap(), Expr::Ref(_)));
+    // File call forms.
+    assert_eq!(rt("SUM(_xlfn._TRO_TRAILING(A1:E10))"), "SUM(A1:.E10)");
+    assert_eq!(rt("_xlfn._TRO_LEADING(A:A)"), "A.:A");
+    assert_eq!(rt("_xlfn._TRO_ALL(Sheet1!A1:B2)"), "Sheet1!A1.:.B2");
+    // Not a range: printed as the equivalent call.
+    assert_eq!(rt("_xlfn._TRO_ALL(B2)"), "TRIMRANGE(B2,3,3)");
+    for bad in ["A1.:", ".:A1", "A1:.:B2", "A1.:.:B2"] {
+        assert!(parse(bad).is_err(), "{bad} should fail");
+    }
+    // R1C1 keeps the operator.
+    assert_eq!(print_r1c1(&parse("SUM(A1:.B2)+ROWS(2.:2)").unwrap(), gridcraft_core::CellRef::new(0, 0)), "SUM(RC:.R[1]C[1])+ROWS(R[1].:R[1])");
+}
+
+#[test]
+fn trim_references_adjust() {
+    let ins = Edit::Insert { axis: Axis::Rows, at: 2, count: 2 };
+    let e = parse("SUM(A1:.A5)+SUM(B:.B)+ROWS(2.:.4)").unwrap();
+    assert_eq!(print(&adjust(e, "S", "S", &ins)), "SUM(A1:.A7)+SUM(B:.B)+ROWS(2.:.6)");
+    let del = Edit::Delete { axis: Axis::Cols, at: 0, count: 1 };
+    let e = parse("SUM(A1.:C1)+SUM(A:.A)").unwrap();
+    assert_eq!(print(&adjust(e, "S", "S", &del)), "SUM(A1.:B1)+SUM(#REF!)");
+    assert_eq!(print(&shift_relative(parse("SUM(A1.:.B2)").unwrap(), 1, 1)), "SUM(B2.:.C3)");
+    let refs: Vec<String> = parse("SUM(Sheet2!A1:.B5)").unwrap().references().iter().map(|r| printer::reference_a1(r)).collect();
+    assert_eq!(refs, ["Sheet2!A1:B5"]);
 }

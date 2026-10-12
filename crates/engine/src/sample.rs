@@ -109,6 +109,7 @@ fn sales(s: &mut Session) -> bool {
                 secondary: false,
                 kind: None,
                 smooth: false,
+                trendlines: Vec::new(),
             }];
         }
     }

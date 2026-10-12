@@ -1,12 +1,23 @@
 //! Sequential ribbon shortcuts. The host paints hints from `prefix` and runs returned actions.
+//!
+//! The sequence table lives in [`keytip_table`]: the match below only walks the prefix.
 
 use egui::{Context, Event, Key, Modifiers, os::OperatingSystem};
 
+pub mod keytip_table;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
-    Home,
+    Tab(&'static str),
     Command(&'static str),
     Dialog(&'static str),
+    /// The target command does not exist yet: the sequence is reserved, its badge shows, and
+    /// invoking it is a silent no-op until the command lands (see keytips.json `pending`).
+    Pending(&'static str),
+    /// Route the keytip to the matching ribbon control: open its dropdown or run its click
+    /// handler (which carries the right params), instead of firing the engine command with
+    /// empty params.
+    Control(&'static str),
 }
 
 #[derive(Default)]
@@ -85,25 +96,33 @@ impl KeyTips {
                     } else if self.prefix.is_some() && !matches!(key, Key::ShiftLeft | Key::ShiftRight) {
                         handled = true;
                         if *key == Key::Escape {
-                            if let Some(prefix) = self.prefix.as_mut()
-                                && prefix.pop().is_none()
-                            {
-                                self.prefix = None;
+                            // Escape pops one level; at a single-letter level it
+                            // returns to the armed root (empty prefix).
+                            if let Some(prefix) = self.prefix.as_mut() {
+                                if prefix.is_empty() {
+                                    self.prefix = None;
+                                } else {
+                                    prefix.pop();
+                                }
                             }
                         } else if key.name().len() == 1 {
                             let next = format!("{}{key_name}", self.prefix.as_deref().unwrap_or_default(), key_name = key.name());
-                            match next.as_str() {
-                                "H" => {
-                                    self.prefix = Some(next);
-                                    actions.push(Action::Home);
+                            match keytip_table::lookup(&next) {
+                                Some(keytip_table::Entry::Tab(tab)) => {
+                                    // A tab with deeper sequences stays as an active level
+                                    // (its group badges show); a terminal unit like "JI"
+                                    // finishes and clears the prefix.
+                                    self.prefix = keytip_table::has_deeper(&next).then_some(next);
+                                    actions.push(Action::Tab(tab));
                                 }
-                                "HA" | "HV" | "HO" | "E" | "O" | "OC" => self.prefix = Some(next),
-                                "HAR" => self.finish(Action::Command("home.alignRight"), &mut actions),
-                                "HAL" => self.finish(Action::Command("home.alignLeft"), &mut actions),
-                                "HAC" => self.finish(Action::Command("home.alignCenter"), &mut actions),
-                                "HVS" | "ES" => self.finish(Action::Dialog("pasteSpecial"), &mut actions),
-                                "HOI" | "OCA" => self.finish(Action::Command("home.autofitColumnWidth"), &mut actions),
-                                _ => {}
+                                Some(keytip_table::Entry::Continue) => self.prefix = Some(next),
+                                Some(keytip_table::Entry::Finish(action)) => self.finish(action, &mut actions),
+                                // No complete sequence, but deeper ones start here: wait for
+                                // more input (Excel's two-letter units like Draw's "JI").
+                                None if keytip_table::has_deeper(&next) => self.prefix = Some(next),
+                                // Unknown letters are consumed while a prefix is active but
+                                // leave it unchanged, as Excel does.
+                                None => {}
                             }
                         }
                     }

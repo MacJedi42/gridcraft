@@ -114,3 +114,80 @@ fn dragging_a_header_boundary_still_resizes_normally() {
         assert!(!h.state().session.journal.iter().any(|(id, _)| id.starts_with("home.autofit")));
     }
 }
+
+#[test]
+fn dragging_a_boundary_inside_a_multi_area_selection_resizes_every_selected_line() {
+    // Issue #341: Ctrl-selected rows/columns resize together; unselected lines keep their size.
+    for (rows, selection, dragged, changed) in [
+        (false, "A:A,C:C", 2, [true, false, true, false]),
+        (false, "A:A,C:C", 0, [true, false, true, false]),
+        (false, "A:A,C:D", 3, [true, false, true, true]),
+        (false, "A:A,C:C", 1, [false, true, false, false]),
+        (false, "A:A,C3", 0, [true, false, false, false]),
+        (true, "1:1,3:3", 2, [true, false, true, false]),
+        (true, "1:1,3:3", 0, [true, false, true, false]),
+        (true, "1:1,3:4", 3, [true, false, true, true]),
+        (true, "1:1,3:3", 1, [false, true, false, false]),
+        (true, "1:1,C3", 0, [true, false, false, false]),
+    ] {
+        let mut h = harness(selection);
+        let before = sizes(&h, rows);
+        let (start, zoom) = edge(&h, rows, dragged);
+        let delta = if rows { vec2(0.0, 30.0) } else { vec2(30.0, 0.0) };
+        button(&mut h, start, true);
+        h.input_mut().events.push(Event::PointerMoved(start + delta / 2.0));
+        h.step();
+        h.input_mut().events.push(Event::PointerMoved(start + delta));
+        h.step();
+        button(&mut h, start + delta, false);
+        h.run_steps(2);
+        let after = sizes(&h, rows);
+        let expected = (before[dragged as usize] + 30.0 / zoom).round();
+        for (index, changed) in changed.iter().enumerate() {
+            let want = if *changed { expected } else { before[index] };
+            assert_eq!(after[index], want, "selection {selection}, dragged {dragged}, line {index}");
+        }
+        assert_eq!(h.state().session.active().unwrap().undo.len(), 1, "selection {selection}: one undo step");
+        h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(sizes(&h, rows), before, "selection {selection}: undo restores every line");
+    }
+}
+
+#[test]
+fn table_filter_autofit_works_through_command_and_header_double_click() {
+    for zoom in [50, 100, 200] {
+        for double_click in [false, true] {
+            let mut h = harness("A:A");
+            h.state_mut().session.execute("range.setValues", json!({"range":"A1", "values":[["Quarterly Revenue"], ["1"], ["2"]]})).unwrap();
+            h.state_mut().session.execute("insert.table", json!({"range":"A1:A3", "header":true})).unwrap();
+            h.state_mut().session.execute("home.rowHeight", json!({"rows":"1:1", "height":20})).unwrap();
+            h.state_mut().session.execute("view.zoom", json!({"percent":zoom})).unwrap();
+            h.run_steps(3);
+            h.state_mut().session.active_mut().unwrap().undo.clear();
+            h.state_mut().session.journal.clear();
+            if double_click {
+                let (pos, _) = edge(&h, false, 0);
+                button(&mut h, pos, true);
+                button(&mut h, pos, false);
+                h.step();
+                button(&mut h, pos, true);
+                button(&mut h, pos, false);
+            } else {
+                h.state_mut().run("home.autofitColumnWidth", json!({"cols":"A:A"})).unwrap();
+            }
+            h.run_steps(2);
+            let app = h.state();
+            let sheet = app.session.active().unwrap().wb.active().unwrap();
+            let geo = Geo::new(sheet, app.grid.rect.unwrap(), app.view().scroll);
+            let cell = gridcraft_engine::core::CellRef::new(0, 0);
+            let rect = geo.cell_rect(sheet, cell);
+            let button = gridcraft_ui_egui::grid::filter_button_rect(&geo, sheet, cell);
+            let style = app.session.active().unwrap().wb.styles.get(sheet.style_id(cell));
+            let text_width = gridcraft_engine::cmd::format::approx_text_width("Quarterly Revenue", style.font.size, style.font.bold) * geo.z;
+            assert!(rect.left() + text_width + 2.5 * geo.z < button.left(), "heading overlaps filter: zoom={zoom}, double_click={double_click}");
+            assert_eq!(app.session.active().unwrap().undo.len(), 1);
+            h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+            assert_eq!(sizes(&h, false)[0], 100.0);
+        }
+    }
+}

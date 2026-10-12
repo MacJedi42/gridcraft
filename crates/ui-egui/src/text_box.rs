@@ -129,7 +129,7 @@ pub(crate) fn show(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, sh: &gridcr
             None
         }
     });
-    let rect = crate::chartview::anchor_rect(geo, sh, &shape.anchor).shrink(4.0).intersect(geo.cells);
+    let rect = geo.mirror_rect(crate::chartview::anchor_rect(geo, sh, &shape.anchor).shrink(4.0).intersect(geo.cells));
     if !rect.is_positive() {
         ed.rect = None;
         app.text_box_editor = Some(ed);

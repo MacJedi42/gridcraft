@@ -46,7 +46,7 @@ fn inspect(s: &mut Session, _: &Json) -> Result<Json> {
                 "freeze": sh.freeze,
                 "merges": sh.merges.iter().map(|m| m.a1()).collect::<Vec<_>>(),
                 "tables": sh.tables.iter().map(|t| json!({"name": t.name, "range": t.range.a1(), "style": t.style, "totals": t.totals_row, "columns": t.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()})).collect::<Vec<_>>(),
-                "charts": sh.charts.iter().map(|c| json!({"id": c.id, "kind": format!("{:?}", c.kind), "title": c.title, "at": c.anchor.cell.a1(), "series": c.series.len()})).collect::<Vec<_>>(),
+                "charts": sh.charts.iter().map(|c| json!({"id": c.id, "kind": format!("{:?}", c.kind), "title": c.title, "at": c.anchor.cell.a1(), "series": c.series.len(), "trendlines": c.series.iter().flat_map(|s| s.trendlines.iter().map(|t| format!("{:?}", t.kind))).collect::<Vec<_>>()})).collect::<Vec<_>>(),
                 "images": sh.images.len(),
                 "shapes": sh.shapes.len(),
                 "conditionalFormats": sh.cond_formats.len(),
@@ -119,7 +119,7 @@ fn cell_get(s: &mut Session, p: &Json) -> Result<Json> {
     let sheet = target_sheet(s, p)?;
     let d = s.doc()?;
     let sh = d.wb.sheet(sheet).ok_or(EngineError::NoDocument)?;
-    let c = cell_param(p, "cell").unwrap_or(d.selection.active);
+    let c = cell_param_on(s, p, "cell", sheet)?.unwrap_or(d.selection.active);
     let cell = sh.cell(c);
     let style = d.wb.styles.get(sh.style_id(c));
     Ok(json!({

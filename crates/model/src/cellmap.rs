@@ -40,6 +40,7 @@ mod tests {
                 threaded: true,
                 resolved: false,
                 visible: false,
+                dates: vec![],
             },
         );
         s.hyperlinks.insert(c3, Hyperlink { target: "Sheet1!A1".into(), tooltip: Some("jump".into()) });

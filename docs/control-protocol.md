@@ -21,21 +21,22 @@ Errors come back as `{"id": …, "ok": false, "error": "…"}`.
 |---|---|---|
 | `engine.execute` | `{command, params}` | Runs any engine command (see `engine.commands` or `gridcraft-cli commands`) |
 | `engine.commands` | `{search?}` | Every command: id, label, ribbon path, shortcut, params doc, enabled; `search` keeps those whose id, label or ribbon path contains it (case-insensitive) |
-| `engine.journal` | | Commands run so far (replayable) |
+| `engine.journal` | | Commands run so far (replayable). Passwords (`password`, `…Password` params) are left out, so a replayed Protect Sheet has no password |
 | `document.inspect` | | Workbook summary: sheets, used ranges, tables, charts, names, selection, undo labels |
 | `sheet.read` | `{range?, sheet?, formulas?, formatted?}` | Values (or formulas / displayed text) of a range |
 | `cell.get` | `{cell?}` | One cell: value, formula, displayed text, style, merge, comment, link |
-| `ui.inspect` | | UI state: ribbon tab, editor, open dialog, message, grid rect, scroll, perf |
+| `ui.inspect` | | UI state: ribbon tab, editor, open dialog, Backstage page, message, grid rect, scroll, perf |
 | `ui.click` / `ui.drag` / `ui.move` | `{x, y, toX?, toY?, button?, count?, shift?, cmd?, alt?}` | Real pointer input in window points |
 | `ui.cell.click` / `ui.cell.drag` | `{cell}` / `{from, to}` | Pointer input at a cell's centre (works in point mode while editing) |
 | `ui.key` / `ui.text` | `{key, shift?, cmd?, alt?, ctrl?}` / `{text}` | Keyboard input (typing in the grid starts editing) |
 | `ui.edit.begin` / `ui.edit.text` / `ui.edit.commit` / `ui.edit.cancel` | `{text?}` / `{move?: down\|right\|up\|left\|none}` | Drive the cell editor |
 | `ui.ribbon` | `{tab}` | Switch ribbon tab |
 | `ui.dialog` / `ui.dialog.set` / `ui.dialog.confirm` / `ui.dialog.cancel` | `{name}` / `{field, value}` | Open, fill in and confirm dialogs |
-| `ui.screenshot` | `{path?}` | PNG of the window (base64 when no path) |
-| `ui.set` | `{dark?, formulaBar?, ribbonCollapsed?}` | UI preferences |
+| `ui.backstage` (via `engine.execute`) | `{page?: home\|new\|open\|info\|saveAs\|print\|export\|options\|close}` | Open the File tab's Backstage view on a page, or close it (`ui.inspect` reports the open page as `backstage`) |
+| `ui.screenshot` | `{path?}` | PNG of the window (base64 when no path). Animations are settled first: the picture shows the final state |
+| `ui.set` | `{dark?, formulaBar?, ribbonCollapsed?, animations?}` | UI preferences (`formulaBar` runs `view.formulaBar`) |
 | `ui.resize` / `ui.focus` | `{width, height}` | Window control |
-| `app.open` / `app.save` / `app.quit` | `{path}` / `{path?}` | Files and lifetime |
+| `app.open` / `app.save` / `app.quit` | `{path, password?}` / `{path?}` | Files and lifetime. `password` opens a password-protected workbook; without it, such a workbook returns an error (never a dialog) |
 
 Any other method name that is a command id (e.g. `home.bold`) runs that command.
 
@@ -45,11 +46,22 @@ System follows live OS appearance changes and falls back to Light when the platf
 The saved choice remains System; new users still start in Light. The legacy
 `view.darkMode` command and `ui.set {dark}` select a fixed Light or Dark theme.
 
+`{command: "view.animations", params: {on: false}}` turns motion in the UI off (the selection
+outline then jumps to a new selection instead of gliding there); without `on` it toggles. It is
+the View ▸ Animations checkbox, saved with the other UI preferences and on by default.
+
 `{command: "app.language.set", params: {language: "ja"}}` switches the interface language
 (`code` is accepted as an alias for `language`); `app.language.english` and
 `app.language.japanese` are shortcuts. Only interface chrome is translated, never command ids or
 document text. The choice is saved in `ui.json`; with nothing saved the desktop app follows the
 system language.
+
+`{command: "file.open", params: {path: "Secret.xlsx", password: "…"}}` opens a password-protected
+workbook (Agile or Standard encryption). Without `password` it returns an error containing
+"is password-protected. Enter its password to open it." and never opens a dialog; a wrong
+password returns "The password is incorrect." The password is left out of the journal and never
+quoted in an error. The opened workbook has no save path, so Save asks where to save it, without
+the password, and never replaces the encrypted original.
 
 For a headless equivalent (no window), use `gridcraft-cli mcp` or `gridcraft-cli run`;
 see [`mcp.md`](mcp.md) and [`cli.md`](cli.md).

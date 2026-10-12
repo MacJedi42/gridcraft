@@ -22,6 +22,7 @@ fn sample() -> Workbook {
     wb.date_system = DateSystem::D1904;
     wb.calc = CalcSettings { mode: CalcMode::Manual, iterative: true, max_iterations: 42, max_change: 0.5, precision_as_displayed: true };
     wb.protected_structure = true;
+    wb.structure_password = Some(gridcraft_model::PasswordHash::new_sha512("s3cret", b"0123456789abcdef"));
     wb.props = DocProps {
         title: "T & <x>".into(),
         subject: "S".into(),
@@ -118,6 +119,7 @@ fn sample() -> Workbook {
     s.show_zeros = false;
     s.right_to_left = true;
     s.zoom = 125;
+    s.view = gridcraft_model::SheetViewMode::PageLayout;
     s.view_active = at("C7");
 
     let red_b = Box::new(red.clone());
@@ -187,15 +189,56 @@ fn sample() -> Workbook {
         allow_blank: false,
         ..Default::default()
     });
+    s.edit_ranges = vec![
+        EditRange { title: "Open & <free>".into(), ranges: vec![rr("A1:B2"), rr("D4")], password: None, security_descriptor: None },
+        EditRange {
+            title: "Old".into(),
+            ranges: vec![rr("C1:C9")],
+            password: Some(PasswordHash::Legacy(0x83AF)),
+            security_descriptor: Some("O:WDG:WDD:(A;;CC;;;WD)".into()),
+        },
+        EditRange {
+            title: "New".into(),
+            ranges: vec![rr("E1")],
+            password: Some(PasswordHash::new_sha512("pw", b"0123456789abcdef")),
+            security_descriptor: None,
+        },
+    ];
     s.hyperlinks.insert(at("A2"), Hyperlink { target: "https://example.com/?a=1&b=2".into(), tooltip: Some("go".into()) });
     s.hyperlinks.insert(at("A3"), Hyperlink { target: "'Data & Stuff'!B2".into(), tooltip: None });
     s.hyperlinks.insert(at("A4"), Hyperlink { target: "mailto:me@example.com".into(), tooltip: None });
     s.comments.insert(
         at("B2"),
-        Comment { author: "Ann".into(), text: "Note & <stuff>\nline 2".into(), replies: vec![], threaded: false, resolved: false, visible: false },
+        Comment {
+            author: "Ann".into(),
+            text: "Note & <stuff>\nline 2".into(),
+            replies: vec![],
+            threaded: false,
+            resolved: false,
+            visible: false,
+            dates: vec![],
+        },
     );
-    s.comments
-        .insert(at("C3"), Comment { author: "Bob".into(), text: "second".into(), replies: vec![], threaded: false, resolved: false, visible: false });
+    s.comments.insert(
+        at("C3"),
+        Comment { author: "Bob".into(), text: "second".into(), replies: vec![], threaded: false, resolved: false, visible: true, dates: vec![] },
+    );
+    s.comments.insert(
+        at("D4"),
+        Comment {
+            author: "Ann & Co".into(),
+            text: "Threaded <one>\nsecond line".into(),
+            replies: vec![("Bob".into(), "first reply".into()), ("Ann & Co".into(), "second reply".into())],
+            threaded: true,
+            resolved: true,
+            visible: false,
+            dates: vec!["2026-10-11T09:30:00.00".into(), String::new(), "2026-10-11T10:15:00.00".into()],
+        },
+    );
+    s.comments.insert(
+        at("E5"),
+        Comment { author: "Cy".into(), text: "open thread".into(), replies: vec![], threaded: true, resolved: false, visible: false, dates: vec![] },
+    );
     s.autofilter = Some(AutoFilter {
         range: rr("K1:N20"),
         criteria: vec![
@@ -205,7 +248,14 @@ fn sample() -> Workbook {
             (3, FilterCriterion::FillColor(Color::Rgb(0xFF0000))),
         ],
     });
-    s.protection = Some(SheetProtection { format_cells: true, sort: true, select_locked: true, select_unlocked: true, ..Default::default() });
+    s.protection = Some(SheetProtection {
+        format_cells: true,
+        sort: true,
+        select_locked: true,
+        select_unlocked: true,
+        password: Some(gridcraft_model::PasswordHash::new_sha512("sheet pw", b"fedcba9876543210")),
+        ..Default::default()
+    });
     s.print = PrintSettings {
         orientation: Orientation::Landscape,
         paper: "A4".into(),
@@ -223,6 +273,14 @@ fn sample() -> Workbook {
         footer: "&C&F".into(),
         row_breaks: vec![15, 30],
         col_breaks: vec![4],
+        different_first: true,
+        different_odd_even: true,
+        first_header: "&CCover".into(),
+        first_footer: String::new(),
+        even_header: "&LEven &P".into(),
+        even_footer: "&R&A".into(),
+        hf_scale_with_doc: false,
+        hf_align_with_margins: true,
     };
     s.sparklines.push(Sparkline { cell: at("J2"), source: "B2:B3".into(), kind: SparklineKind::WinLoss, color: Color::Rgb(0x112233), markers: true });
     s.tables.push(Table {
@@ -242,6 +300,10 @@ fn sample() -> Workbook {
         first_col: true,
         last_col: false,
         filter_button: true,
+        filter: vec![
+            (0, FilterCriterion::Values { values: vec!["East".into()], blanks: false }),
+            (1, FilterCriterion::Icon { set: "3TrafficLights1".into(), id: Some(1) }),
+        ],
     });
     let png = b"\x89PNG\r\n\x1a\n0000IHDRfake".to_vec();
     s.images.push(Image {
@@ -259,6 +321,7 @@ fn sample() -> Workbook {
         fill: Color::Rgb(0x4472C4),
         line: Color::Rgb(0x000000),
         text: "Hi\nthere".into(),
+        format: Default::default(),
     });
     s.shapes.push(Shape {
         id: 12,
@@ -267,6 +330,7 @@ fn sample() -> Workbook {
         fill: Color::Auto,
         line: Color::Rgb(0xFF0000),
         text: String::new(),
+        format: Default::default(),
     });
     s.shapes.push(Shape {
         id: 13,
@@ -275,6 +339,17 @@ fn sample() -> Workbook {
         fill: Color::Auto,
         line: Color::Auto,
         text: "box".into(),
+        format: ShapeFormat {
+            no_line: true,
+            font_size: Some(20.0),
+            bold: true,
+            italic: true,
+            font: Some("Arial".into()),
+            text_color: Some(Color::Rgb(0x112233)),
+            text_outline: Some((Color::Rgb(0xFF0000), 1.5)),
+            align: Some(ShapeTextAlign::Right),
+            anchor: Some(ShapeTextAnchor::Bottom),
+        },
     });
     let base_chart = Chart {
         id: 20,
@@ -290,6 +365,7 @@ fn sample() -> Workbook {
             secondary: false,
             kind: None,
             smooth: false,
+            trendlines: Vec::new(),
         }],
         legend: LegendPos::Bottom,
         data_labels: true,
@@ -299,6 +375,7 @@ fn sample() -> Workbook {
         y_title: Some("Amount".into()),
         source: None,
         by_rows: false,
+        pivot: None,
     };
     for kind in [
         ChartKind::ColumnClustered,
@@ -340,6 +417,10 @@ fn sample() -> Workbook {
     wb.sheets.push(Arc::new(s2));
     let mut s3 = Sheet::new("2024");
     s3.visibility = Visibility::VeryHidden;
+    s3.comments.insert(
+        at("A1"),
+        Comment { author: "Bob".into(), text: "other sheet".into(), replies: vec![], threaded: true, resolved: false, visible: false, dates: vec![] },
+    );
     wb.sheets.push(Arc::new(s3));
     wb.names.push(DefinedName { name: "Rate".into(), scope: None, formula: "0.07".into(), comment: "c".into(), hidden: false });
     wb.names.push(DefinedName { name: "Local".into(), scope: Some(1), formula: "Hidden!$A$1".into(), comment: String::new(), hidden: true });
@@ -365,6 +446,8 @@ fn full_roundtrip() {
     assert_eq!(back.date_system, wb.date_system);
     assert_eq!(back.calc, wb.calc);
     assert!(back.protected_structure);
+    assert_eq!(back.structure_password, wb.structure_password);
+    assert!(back.structure_password.as_ref().unwrap().verify("s3cret").unwrap());
     assert_eq!(back.props, wb.props);
     assert_eq!(back.theme, wb.theme);
     assert_eq!(back.names, wb.names);
@@ -373,6 +456,7 @@ fn full_roundtrip() {
     assert_eq!(back.sheets[1].visibility, Visibility::Hidden);
     assert_eq!(back.sheets[2].visibility, Visibility::VeryHidden);
     assert_eq!(back.sheets[2].name, "2024");
+    assert_eq!(back.sheets[2].comments, wb.sheets[2].comments);
 
     let (a, b) = (wb.sheet(0).unwrap(), back.sheet(0).unwrap());
     assert_eq!(b.name, a.name);
@@ -398,12 +482,14 @@ fn full_roundtrip() {
     assert_eq!(b.tab_color, a.tab_color);
     assert_eq!((b.show_gridlines, b.show_headings, b.show_zeros, b.right_to_left, b.zoom), (false, false, false, true, 125));
     assert_eq!(b.view_active, a.view_active);
+    assert_eq!(b.view, gridcraft_model::SheetViewMode::PageLayout, "sheetView view=\"pageLayout\" round-trips");
     assert_eq!(b.cond_formats, a.cond_formats);
     assert_eq!(b.validations, a.validations);
     assert_eq!(b.hyperlinks, a.hyperlinks);
     assert_eq!(b.comments, a.comments);
     assert_eq!(b.autofilter, a.autofilter);
     assert_eq!(b.protection, a.protection);
+    assert_eq!(b.edit_ranges, a.edit_ranges);
     assert_eq!(b.print, a.print);
     let mut sp = a.sparklines.clone();
     sp[0].source = "'Data & Stuff'!B2:B3".into();
@@ -413,6 +499,7 @@ fn full_roundtrip() {
     assert_eq!(tb.name, "Sales_Table");
     assert_eq!((tb.range, tb.header_row, tb.totals_row, &tb.columns, &tb.style), (ta.range, ta.header_row, ta.totals_row, &ta.columns, &ta.style));
     assert_eq!((tb.banded_rows, tb.banded_cols, tb.first_col, tb.last_col, tb.filter_button), (true, true, true, false, true));
+    assert_eq!(tb.filter, ta.filter, "the table's filter criteria survive (SUBTOTAL tells filtered rows apart)");
     assert_eq!(b.value(at("P1")), Value::text("Region"), "header cells carry the column names");
     // Drawings.
     assert_eq!(b.images.len(), 1);
@@ -430,7 +517,7 @@ fn full_roundtrip() {
     assert_eq!(b.shapes[1].anchor.mode, AnchorMode::MoveAndSize, "default anchor mode");
     assert_eq!(b.shapes.len(), 3);
     for (x, y) in a.shapes.iter().zip(&b.shapes) {
-        assert_eq!((x.kind, &x.text, x.fill, x.line), (y.kind, &y.text, y.fill, y.line));
+        assert_eq!((x.kind, &x.text, x.fill, x.line, &x.format), (y.kind, &y.text, y.fill, y.line, &y.format));
     }
     assert_eq!(b.charts.len(), a.charts.len());
     for (x, y) in a.charts.iter().zip(&b.charts) {
@@ -523,6 +610,60 @@ fn package_structure() {
 }
 
 #[test]
+fn iterative_calculation_settings_roundtrip() {
+    let calc_pr = |wb: &Workbook| {
+        let bytes = write_xlsx(wb).unwrap();
+        let mut pkg = Package::open(&bytes).unwrap();
+        let book = pkg.read_xml("xl/workbook.xml").unwrap().unwrap();
+        let c = book.child("calcPr").unwrap();
+        let attrs = ["calcMode", "iterate", "iterateCount", "iterateDelta", "fullPrecision"].map(|a| c.attr(a).map(str::to_string));
+        (attrs, read_xlsx(&bytes).unwrap().0.calc)
+    };
+    let s = |v: &str| Some(v.to_string());
+    // Defaults: nothing written.
+    let mut wb = Workbook::new();
+    assert_eq!(calc_pr(&wb), ([None, None, None, None, None], CalcSettings::default()));
+    // On: the switch and both limits, beside the other calculation settings.
+    wb.calc.mode = CalcMode::Manual;
+    wb.calc.iterative = true;
+    wb.calc.precision_as_displayed = true;
+    let (attrs, back) = calc_pr(&wb);
+    assert_eq!(attrs, [s("manual"), s("1"), s("100"), s("0.001"), s("0")]);
+    assert_eq!(back, wb.calc);
+    // Off: limits that differ from the defaults are kept for when it is switched on again.
+    wb.calc.iterative = false;
+    wb.calc.set_max_iterations(250);
+    wb.calc.set_max_change(0.0005);
+    let (attrs, back) = calc_pr(&wb);
+    assert_eq!(attrs, [s("manual"), None, s("250"), s("0.0005"), s("0")]);
+    assert_eq!(back, wb.calc);
+    // Out-of-range values in a file are kept within Excel's limits.
+    let xml = |attrs: &str| {
+        format!(
+            r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="A" sheetId="1" r:id="rId1"/></sheets><calcPr {attrs}/></workbook>"#
+        )
+    };
+    for (attrs, count, change) in [
+        (r#"iterate="1" iterateCount="0" iterateDelta="-2""#, 1, 2.0),
+        (r#"iterate="true" iterateCount="99999" iterateDelta="NaN""#, CalcSettings::MAX_ITERATIONS, CalcSettings::DEFAULT_CHANGE),
+    ] {
+        let wbx = xml(attrs);
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#;
+        let ws = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData/></worksheet>"#;
+        let bytes = super::make_zip(&[
+            ("[Content_Types].xml", super::CT.as_bytes()),
+            ("_rels/.rels", super::ROOT_RELS.as_bytes()),
+            ("xl/workbook.xml", wbx.as_bytes()),
+            ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+            ("xl/worksheets/sheet1.xml", ws.as_bytes()),
+        ]);
+        let calc = read_xlsx(&bytes).unwrap().0.calc;
+        assert!(calc.iterative, "{attrs}");
+        assert_eq!((calc.max_iterations, calc.max_change), (count, change), "{attrs}");
+    }
+}
+
+#[test]
 fn empty_workbook_roundtrip() {
     let wb = Workbook::new();
     let bytes = write_xlsx(&wb).unwrap();
@@ -559,6 +700,7 @@ fn writing_repairs_invalid_models() {
         first_col: false,
         last_col: false,
         filter_button: true,
+        filter: vec![],
     });
     s.cells.set(at("B2"), Cell { value: Value::Number(1.0), formula: None, style: StyleId(9999) });
     let (back, _) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
@@ -569,6 +711,56 @@ fn writing_repairs_invalid_models() {
     assert_eq!(s.value(at("A1")), Value::text("X"));
     assert_eq!(s.tables[0].name, "Table1");
     assert_eq!(s.cell(at("B2")).unwrap().style, StyleId::DEFAULT);
+}
+
+#[test]
+fn vba_project_roundtrip() {
+    // A VBA project blob is preserved byte-identically through write and read, and the package
+    // carries the macro-enabled content type plus the vbaProject relationship.
+    let vba = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1 fake OLE2 vbaProject".to_vec();
+    let mut wb = Workbook::new();
+    wb.vba_project = Some(vba.clone());
+    let bytes = write_xlsx(&wb).unwrap();
+    assert_eq!(write_xlsx(&wb).unwrap(), bytes, "output is deterministic");
+
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes.clone())).unwrap();
+    let names: Vec<String> = (0..z.len()).map(|i| z.name_for_index(i).unwrap().to_string()).collect();
+    assert!(names.iter().any(|x| x == "xl/vbaProject.bin"), "missing vbaProject.bin");
+    let mut bin = vec![];
+    z.by_name("xl/vbaProject.bin").unwrap().read_to_end(&mut bin).unwrap();
+    assert_eq!(bin, vba, "vbaProject.bin written byte-identically");
+    let mut ct = String::new();
+    z.by_name("[Content_Types].xml").unwrap().read_to_string(&mut ct).unwrap();
+    assert!(ct.contains("macroEnabled.main+xml"), "macro-enabled main content type: {ct}");
+    assert!(ct.contains("/xl/vbaProject.bin"), "vbaProject content type override: {ct}");
+    let mut rels = String::new();
+    z.by_name("xl/_rels/workbook.xml.rels").unwrap().read_to_string(&mut rels).unwrap();
+    assert!(rels.contains("relationships/vbaProject"), "vbaProject relationship: {rels}");
+
+    let (back, rep) = read_xlsx(&bytes).unwrap();
+    assert_eq!(back.vba_project.as_deref(), Some(vba.as_slice()), "vbaProject survives the read");
+    assert!(rep.warnings.iter().any(|w| w.contains("not executed")), "{:?}", rep.warnings);
+
+    // A workbook without macros stays macro-free and free of VBA warnings.
+    let (plain, rp) = read_xlsx(&write_xlsx(&Workbook::new()).unwrap()).unwrap();
+    assert_eq!(plain.vba_project, None);
+    assert!(rp.warnings.iter().all(|w| !w.contains("VBA")), "{:?}", rp.warnings);
+}
+
+#[test]
+fn vba_project_read_from_foreign_file() {
+    // An .xlsm built by another producer is captured on read (not dropped with a plain warning).
+    let vba: &[u8] = b"PK\x03\x04-not-really-but-opaque-bytes";
+    let bytes = super::minimal(
+        "<sheetData/>",
+        &[("xl/vbaProject.bin", "ignored-as-text")],
+        r#"<Relationship Id="rId9" Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" Target="vbaProject.bin"/>"#,
+        "",
+    );
+    let (wb, rep) = read_xlsx(&bytes).unwrap();
+    assert!(wb.vba_project.is_some(), "VBA blob captured");
+    assert!(rep.warnings.iter().any(|w| w.contains("not executed")), "{:?}", rep.warnings);
+    let _ = vba;
 }
 
 fn sheet1_xml(bytes: &[u8]) -> (String, bool) {
@@ -599,4 +791,226 @@ fn spill_and_calc_errors_are_cached_as_value_errors() {
         assert_eq!(cell.child("f").unwrap().text, text);
         assert_eq!(cell.child("v").unwrap().text, value);
     }
+}
+
+/// `CT_IconSet` needs one `cfvo` per icon (at least two); a rule without stored thresholds
+/// gets Excel's defaults, one without the lower bound gets it prepended (#235).
+#[test]
+fn icon_sets_always_write_one_cfvo_per_icon() {
+    let mut wb = Workbook::new();
+    let s = wb.sheet_mut(0).unwrap();
+    for (i, (set, thresholds)) in [
+        ("3Arrows", vec![]),
+        ("4Rating", vec![CfValueKind::Number(2.0), CfValueKind::Number(5.0), CfValueKind::Number(8.0)]),
+        ("9Bogus", vec![CfValueKind::Percent(50.0)]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        s.cond_formats.push(CondFormat {
+            ranges: vec![rr(&format!("A{}", i + 1))],
+            rule: CfRule::IconSet { set: set.into(), thresholds, reverse: false, show_value: true },
+            priority: i as u32 + 1,
+            stop_if_true: false,
+        });
+    }
+    let bytes = write_xlsx(&wb).unwrap();
+    let (xml, _) = sheet1_xml(&bytes);
+    assert!(
+        xml.contains(
+            "<iconSet iconSet=\"3Arrows\"><cfvo type=\"percent\" val=\"0\"/><cfvo type=\"percent\" val=\"33\"/><cfvo type=\"percent\" val=\"67\"/></iconSet>"
+        ),
+        "{xml}"
+    );
+    assert!(
+        xml.contains("<iconSet iconSet=\"4Rating\"><cfvo type=\"percent\" val=\"0\"/><cfvo type=\"num\" val=\"2\"/><cfvo type=\"num\" val=\"5\"/><cfvo type=\"num\" val=\"8\"/></iconSet>"),
+        "{xml}"
+    );
+    assert!(xml.contains("<iconSet iconSet=\"9Bogus\"><cfvo type=\"percent\" val=\"0\"/>"), "{xml}");
+    let (back, _) = read_xlsx(&bytes).unwrap();
+    let rules: Vec<usize> = back
+        .sheet(0)
+        .unwrap()
+        .cond_formats
+        .iter()
+        .map(|cf| match &cf.rule {
+            CfRule::IconSet { thresholds, .. } => thresholds.len(),
+            _ => 0,
+        })
+        .collect();
+    assert_eq!(rules, [3, 4, 5]);
+}
+
+/// Files have no `@` operator: Excel writes `@x` as `_xlfn.SINGLE(x)` in a dynamic-array
+/// formula, and reads it back as `@x`.
+#[test]
+fn implicit_intersection_is_written_as_single() {
+    let mut wb = Workbook::new();
+    let s = wb.sheet_mut(0).unwrap();
+    for (r, n) in [(0, 1.0), (1, 3.0), (2, 5.0)] {
+        s.set_value(CellRef::new(r, 0), Value::Number(n));
+    }
+    s.cells.set(at("D3"), Cell { value: Value::Number(10.0), ..Cell::formula(Formula::new("@A1:A3*2")) });
+    s.cells.set(at("D4"), Cell { value: Value::Number(2.0), ..Cell::formula(Formula::new("A1*2")) });
+    let bytes = write_xlsx(&wb).unwrap();
+    let (xml, metadata) = sheet1_xml(&bytes);
+    assert!(xml.contains("<c r=\"D3\" cm=\"1\"><f t=\"array\" ref=\"D3\">_xlfn.SINGLE(A1:A3)*2</f><v>10</v>"), "{xml}");
+    assert!(xml.contains("<c r=\"D4\"><f>A1*2</f>"), "{xml}");
+    assert!(!xml.contains('@'), "{xml}");
+    assert!(metadata);
+    let (back, _) = read_xlsx(&bytes).unwrap();
+    let sh = back.sheet(0).unwrap();
+    assert_eq!(sh.cell(at("D3")).and_then(|c| c.formula.as_ref()).map(|f| f.text.as_str()), Some("@A1:A3*2"));
+    assert_eq!(sh.cell(at("D3")).and_then(|c| c.formula.as_ref()).and_then(|f| f.array), None);
+}
+
+#[test]
+fn threaded_comments_write_persons_and_linked_legacy_notes() {
+    let wb = sample();
+    let bytes = write_xlsx(&wb).unwrap();
+    let mut pkg = Package::open(&bytes).unwrap();
+    let text = |pkg: &mut Package, part: &str| String::from_utf8(pkg.read(part).unwrap().unwrap()).unwrap();
+    // One person per author across the workbook, ids unique.
+    let persons = text(&mut pkg, "xl/persons/person.xml");
+    assert_eq!(persons.matches("<person ").count(), 3, "{persons}");
+    assert!(persons.contains("displayName=\"Ann &amp; Co\""));
+    let ct = text(&mut pkg, "[Content_Types].xml");
+    assert!(ct.contains("application/vnd.ms-excel.threadedcomments+xml") && ct.contains("application/vnd.ms-excel.person+xml"));
+    let tc = text(&mut pkg, "xl/threadedComments/threadedComment1.xml");
+    assert_eq!(tc.matches("<threadedComment ").count(), 4, "{tc}");
+    assert_eq!(tc.matches("parentId=").count(), 2);
+    assert_eq!(tc.matches("done=\"1\"").count(), 1);
+    // The legacy note of each thread points at it.
+    let legacy = text(&mut pkg, "xl/comments1.xml");
+    for id in tc.split("id=\"{").skip(1).filter_map(|s| s.split('}').next()).take(1) {
+        assert!(legacy.contains(&format!("<author>tc={{{id}}}</author>")) && legacy.contains(&format!("xr:uid=\"{{{id}}}\"")), "{legacy}");
+    }
+}
+
+#[test]
+fn bad_comment_dates_are_left_out() {
+    let mut wb = Workbook::new();
+    let s = Arc::make_mut(&mut wb.sheets[0]);
+    let c = Comment {
+        author: "A".into(),
+        text: "t".into(),
+        replies: vec![],
+        threaded: true,
+        resolved: false,
+        visible: false,
+        dates: vec!["\"/><evil".into()],
+    };
+    s.comments.insert(at("A1"), c);
+    let (back, _) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
+    let c = &back.sheets[0].comments[&at("A1")];
+    assert!(c.threaded && c.dates.is_empty());
+}
+
+/// #378: the saved scroll position survives a round trip, with and without frozen panes (where it
+/// is the scrolling pane's `topLeftCell`).
+#[test]
+fn scroll_position_round_trips_with_and_without_frozen_panes() {
+    let mut wb = Workbook::new();
+    wb.sheet_mut(0).unwrap().view_top_left = at("A31");
+    let (back, _) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
+    assert_eq!(back.sheet(0).unwrap().view_top_left, at("A31"));
+
+    let s = wb.sheet_mut(0).unwrap();
+    s.freeze = Some((1, 0));
+    s.view_top_left = at("C40");
+    let bytes = write_xlsx(&wb).unwrap();
+    let (xml, _) = sheet1_xml(&bytes);
+    assert!(xml.contains(r#"<pane ySplit="1" topLeftCell="C40""#), "{xml}");
+    let (back, _) = read_xlsx(&bytes).unwrap();
+    assert_eq!(back.sheet(0).unwrap().view_top_left, at("C40"));
+    assert_eq!(back.sheet(0).unwrap().freeze, Some((1, 0)));
+
+    // A scroll position inside the frozen rows is written as the first scrolling row.
+    wb.sheet_mut(0).unwrap().view_top_left = at("A1");
+    let (xml, _) = sheet1_xml(&write_xlsx(&wb).unwrap());
+    assert!(xml.contains(r#"topLeftCell="A2""#), "{xml}");
+}
+
+/// Excel stores LET/LAMBDA parameters as `_xlpm.name`; the model shows bare names.
+#[test]
+fn let_lambda_parameters_drop_xlpm_on_read() {
+    let mut wb = Workbook::new();
+    let s = wb.sheet_mut(0).unwrap();
+    s.cells.set(at("A1"), Cell { value: Value::Number(2.0), ..Cell::formula(Formula::new("LET(x,1,x+1)")) });
+    s.cells.set(at("A2"), Cell { value: Value::Number(6.0), ..Cell::formula(Formula::new("LAMBDA(a,a*2)(3)")) });
+    let mut arr = Formula::new("MAP(B1:B2,LAMBDA(v,v+1))");
+    arr.array = Some(rr("C1:C2"));
+    s.cells.set(at("C1"), Cell::formula(arr));
+    let bytes = write_xlsx(&wb).unwrap();
+    let (xml, _) = sheet1_xml(&bytes);
+    assert!(xml.contains("_xlfn.LET(_xlpm.x,1,_xlpm.x+1)"), "{xml}");
+    assert!(xml.contains("_xlpm.v"), "{xml}");
+    let (back, _) = read_xlsx(&bytes).unwrap();
+    let sh = back.sheet(0).unwrap();
+    let text = |a: &str| sh.cell(at(a)).and_then(|c| c.formula.as_ref()).map(|f| f.text.clone());
+    assert_eq!(text("A1").as_deref(), Some("LET(x,1,x+1)"));
+    assert_eq!(text("A2").as_deref(), Some("LAMBDA(a,a*2)(3)"));
+    assert_eq!(text("C1").as_deref(), Some("MAP(B1:B2,LAMBDA(v,v+1))"));
+}
+
+/// A line break in a table column name (and its header cell) survives; a
+/// leading backslash in a table name is legal and kept.
+#[test]
+fn table_newline_column_and_backslash_name_survive() {
+    let mut wb = Workbook::new();
+    let s = wb.sheet_mut(0).unwrap();
+    s.set_value(at("A1"), Value::text("Handle\nBars"));
+    s.set_value(at("B1"), Value::text("Name"));
+    s.set_value(at("B2"), Value::text("x"));
+    let col = |n: &str| TableColumn { name: n.into(), totals: TotalsFn::None, totals_label: None, formula: None };
+    s.tables.push(Table {
+        id: 1,
+        name: "\\_Prime.1".into(),
+        range: rr("A1:B2"),
+        header_row: true,
+        totals_row: false,
+        columns: vec![col("Handle\nBars"), col("Name")],
+        style: String::new(),
+        banded_rows: true,
+        banded_cols: false,
+        first_col: false,
+        last_col: false,
+        filter_button: true,
+        filter: vec![],
+    });
+    s.cells.set(at("D1"), Cell::formula(Formula::new("COUNTA(\\_Prime.1[Name])")));
+    let (back, _) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
+    let s = back.sheet(0).unwrap();
+    assert_eq!(s.tables[0].name, "\\_Prime.1");
+    assert_eq!(s.tables[0].columns[0].name, "Handle\nBars");
+    assert_eq!(s.value(at("A1")), Value::text("Handle\nBars"));
+    assert_eq!(s.cell(at("D1")).and_then(|c| c.formula.as_ref()).map(|f| f.text.as_str()), Some("COUNTA(\\_Prime.1[Name])"));
+    assert!(gridcraft_formula::parse("COUNTA(\\_Prime.1[Name])").is_ok(), "backslash table name parses as a structured reference");
+}
+
+/// Templates and macro-enabled files differ from `.xlsx` only in the workbook part's content
+/// type; a template saved with the workbook type is rejected by Excel.
+#[test]
+fn package_kind_sets_workbook_content_type() {
+    let mut wb = Workbook::new();
+    wb.sheet_mut(0).unwrap().set_value(at("A1"), Value::Number(7.0));
+    for (path, kind, ct) in [
+        ("a.xlsx", crate::XlsxKind::Workbook, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"),
+        ("a.XLTX", crate::XlsxKind::Template, "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml"),
+        ("a.xlsm", crate::XlsxKind::MacroWorkbook, "application/vnd.ms-excel.sheet.macroEnabled.main+xml"),
+        ("dir.x/a.xltm", crate::XlsxKind::MacroTemplate, "application/vnd.ms-excel.template.macroEnabled.main+xml"),
+    ] {
+        assert_eq!(crate::XlsxKind::from_path(path), kind);
+        let bytes = crate::write_xlsx_as(&wb, kind).unwrap();
+        let mut pkg = Package::open(&bytes).unwrap();
+        let types = pkg.read_xml("[Content_Types].xml").unwrap().unwrap();
+        let main: Vec<_> =
+            types.kids("Override").filter(|e| e.attr("PartName") == Some("/xl/workbook.xml")).filter_map(|e| e.attr("ContentType")).collect();
+        assert_eq!(main, [ct], "{path}");
+        // Every kind reads back.
+        let (back, report) = read_xlsx(&bytes).unwrap();
+        assert!(report.warnings.is_empty(), "{path}: {:?}", report.warnings);
+        assert_eq!(back.sheet(0).unwrap().value(at("A1")), Value::Number(7.0));
+    }
+    assert_eq!(crate::XlsxKind::from_path("noext"), crate::XlsxKind::Workbook);
 }

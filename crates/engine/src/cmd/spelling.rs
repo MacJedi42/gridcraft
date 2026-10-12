@@ -21,17 +21,23 @@ pub fn specs() -> Vec<CommandSpec> {
 fn dictionary() -> &'static HashSet<String> {
     static DICT: OnceLock<HashSet<String>> = OnceLock::new();
     DICT.get_or_init(|| {
-        let mut set = HashSet::new();
-        #[cfg(not(target_arch = "wasm32"))]
-        for path in ["/usr/share/dict/words", "/usr/share/dict/american-english", "/usr/share/dict/british-english"] {
-            if let Ok(text) = std::fs::read_to_string(path) {
-                for w in text.lines().take(2_000_000) {
-                    set.insert(w.trim().to_lowercase());
-                }
-                break;
-            }
+        #[cfg(target_arch = "wasm32")]
+        {
+            HashSet::new()
         }
-        set
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut set = HashSet::new();
+            for path in ["/usr/share/dict/words", "/usr/share/dict/american-english", "/usr/share/dict/british-english"] {
+                if let Ok(text) = std::fs::read_to_string(path) {
+                    for w in text.lines().take(2_000_000) {
+                        set.insert(w.trim().to_lowercase());
+                    }
+                    break;
+                }
+            }
+            set
+        }
     })
 }
 
@@ -155,7 +161,7 @@ fn change(s: &mut Session, p: &Json) -> Result<Json> {
     if bool_param(p, "all").unwrap_or(false) {
         return s.execute("edit.replace", json!({"what": word, "with": to, "matchCase": true, "all": true}));
     }
-    let c = cell_param(p, "cell").ok_or_else(|| bad("review.changeSpelling", "missing `cell`"))?;
+    let c = cell_param(s, p, "cell")?.ok_or_else(|| bad("review.changeSpelling", "missing `cell`"))?;
     let text = s.doc()?.wb.active().and_then(|sh| sh.cell(c)).map(|x| x.input_text()).unwrap_or_default();
     s.execute("cell.set", json!({"cell": c.a1(), "input": text.replacen(&word, &to, 1)}))
 }

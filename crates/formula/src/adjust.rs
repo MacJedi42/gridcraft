@@ -16,6 +16,35 @@ pub fn shift_relative(e: Expr, dr: i64, dc: i64) -> Expr {
     })
 }
 
+/// Defined names: relative parts move by `(dr, dc)`, wrapping around the sheet's edges. Files
+/// store a name's relative references as seen from A1 (a name for "the cell to the left" defined
+/// in B1 is `Sheet1!XFD1`), and a use in another cell moves them by that cell's offset from A1.
+pub fn shift_relative_wrapping(e: Expr, dr: i64, dc: i64) -> Expr {
+    let wrap = |v: u32, abs: bool, d: i64, max: u32| if abs { v } else { (v as i64 + d).rem_euclid(max as i64) as u32 };
+    let anchor = |a: Anchor| Anchor { row: wrap(a.row, a.row_abs, dr, MAX_ROWS), col: wrap(a.col, a.col_abs, dc, MAX_COLS), ..a };
+    e.map(&mut |x| match x {
+        Expr::Ref(r) => {
+            let kind = match r.kind {
+                RefKind::Cell(a) => RefKind::Cell(anchor(a)),
+                RefKind::Range(a, b) => RefKind::Range(anchor(a), anchor(b)),
+                RefKind::Rows(r0, a0, r1, a1) => RefKind::Rows(wrap(r0, a0, dr, MAX_ROWS), a0, wrap(r1, a1, dr, MAX_ROWS), a1),
+                RefKind::Cols(c0, a0, c1, a1) => RefKind::Cols(wrap(c0, a0, dc, MAX_COLS), a0, wrap(c1, a1, dc, MAX_COLS), a1),
+            };
+            Expr::Ref(Reference { sheet: r.sheet, kind })
+        }
+        other => other,
+    })
+}
+
+/// Whether the formula has a relative (no `$`) row or column anywhere.
+pub fn has_relative_refs(e: &Expr) -> bool {
+    e.references().iter().any(|r| match r.kind {
+        RefKind::Cell(a) => !a.row_abs || !a.col_abs,
+        RefKind::Range(a, b) => !a.row_abs || !a.col_abs || !b.row_abs || !b.col_abs,
+        RefKind::Rows(_, a0, _, a1) | RefKind::Cols(_, a0, _, a1) => !a0 || !a1,
+    })
+}
+
 fn shift_anchor(a: &Anchor, dr: i64, dc: i64) -> Option<Anchor> {
     let row = if a.row_abs { a.row as i64 } else { a.row as i64 + dr };
     let col = if a.col_abs { a.col as i64 } else { a.col as i64 + dc };
@@ -195,17 +224,6 @@ fn adjust_ref(r: &Reference, edit: &Edit) -> Option<Reference> {
             let kind = match &r.kind {
                 RefKind::Cell(a) => RefKind::Cell(mv(a)?),
                 RefKind::Range(a, b) => RefKind::Range(mv(a)?, mv(b)?),
-                k => k.clone(),
-            };
-            Some(Reference { sheet: r.sheet.clone(), kind })
-        }
-        Edit::MoveToSheet { from, to_sheet, to_row, to_col } => {
-            if !from.contains_range(&r.range()) {
-                return Some(r.clone());
-            }
-            let mut moved = adjust_ref(r, &Edit::Move { from: *from, to_row: *to_row, to_col: *to_col })?;
-            // Whole-row/column references have no anchors, but their indices must move too.
-            moved.kind = match &r.kind {
                 RefKind::Rows(a, aa, b, ba) => {
                     let dr = *to_row as i64 - from.start.row as i64;
                     RefKind::Rows(shift_line(*a, false, dr, MAX_ROWS)?, *aa, shift_line(*b, false, dr, MAX_ROWS)?, *ba)
@@ -214,8 +232,14 @@ fn adjust_ref(r: &Reference, edit: &Edit) -> Option<Reference> {
                     let dc = *to_col as i64 - from.start.col as i64;
                     RefKind::Cols(shift_line(*a, false, dc, MAX_COLS)?, *aa, shift_line(*b, false, dc, MAX_COLS)?, *ba)
                 }
-                _ => moved.kind,
             };
+            Some(Reference { sheet: r.sheet.clone(), kind })
+        }
+        Edit::MoveToSheet { from, to_sheet, to_row, to_col } => {
+            if !from.contains_range(&r.range()) {
+                return Some(r.clone());
+            }
+            let mut moved = adjust_ref(r, &Edit::Move { from: *from, to_row: *to_row, to_col: *to_col })?;
             moved.sheet = SheetSel::Named(to_sheet.clone());
             Some(moved)
         }

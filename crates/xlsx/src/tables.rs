@@ -133,6 +133,7 @@ const FUTURE_FUNCTIONS: &[&str] = &[
     "DAYS",
     "DECIMAL",
     "DROP",
+    "ENCODEURL",
     "ERF.PRECISE",
     "ERFC.PRECISE",
     "EXPAND",
@@ -157,6 +158,7 @@ const FUTURE_FUNCTIONS: &[&str] = &[
     "GAMMA.INV",
     "GAMMALN.PRECISE",
     "GAUSS",
+    "GROUPBY",
     "HSTACK",
     "HYPGEOM.DIST",
     "IFNA",
@@ -194,10 +196,12 @@ const FUTURE_FUNCTIONS: &[&str] = &[
     "PDURATION",
     "PERCENTILE.EXC",
     "PERCENTILE.INC",
+    "PERCENTOF",
     "PERCENTRANK.EXC",
     "PERCENTRANK.INC",
     "PERMUTATIONA",
     "PHI",
+    "PIVOTBY",
     "POISSON.DIST",
     "QUARTILE.EXC",
     "QUARTILE.INC",
@@ -205,6 +209,9 @@ const FUTURE_FUNCTIONS: &[&str] = &[
     "RANK.AVG",
     "RANK.EQ",
     "REDUCE",
+    "REGEXEXTRACT",
+    "REGEXREPLACE",
+    "REGEXTEST",
     "RRI",
     "SCAN",
     "SEC",
@@ -231,6 +238,7 @@ const FUTURE_FUNCTIONS: &[&str] = &[
     "TEXTSPLIT",
     "TOCOL",
     "TOROW",
+    "TRIMRANGE",
     "UNICHAR",
     "UNICODE",
     "UNIQUE",
@@ -321,7 +329,10 @@ mod tests {
     #[test]
     fn functions() {
         assert_eq!(file_function_name("xlookup").as_deref(), Some("_xlfn.XLOOKUP"));
+        assert_eq!(file_function_name("forecast.ets.confint").as_deref(), Some("_xlfn.FORECAST.ETS.CONFINT"));
         assert_eq!(file_function_name("FILTER").as_deref(), Some("_xlfn._xlws.FILTER"));
+        assert_eq!(file_function_name("PERCENTOF").as_deref(), Some("_xlfn.PERCENTOF"));
+        assert_eq!(file_function_name("TRIMRANGE").as_deref(), Some("_xlfn.TRIMRANGE"));
         assert_eq!(file_function_name("SUM"), None);
         assert_eq!(builtin_format(14), Some("m/d/yyyy"));
         assert_eq!(builtin_id("0.00%"), Some(10));

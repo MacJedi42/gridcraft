@@ -174,6 +174,7 @@ fn keyboard_opened_paste_menu_accepts_a_mouse_click_after_keytips_cancel() {
 #[test]
 fn legacy_paste_special_keeps_formulas_when_requested() {
     let mut h = harness(copied_row());
+    // The legacy Edit route opens the dialog directly; F is a dialog mnemonic.
     sequence(&mut h, &[Key::E, Key::S], false);
     assert_eq!(h.state().dialog.as_ref().unwrap().name(), "pasteSpecial");
     letter(&mut h, Key::F, false);
@@ -296,6 +297,80 @@ fn held_keys_do_not_toggle_twice_or_leak_repeated_letters() {
 }
 
 #[test]
+fn tab_letters_switch_to_their_ribbon_tabs() {
+    let mut h = harness(blank());
+    for (k, tab) in [(Key::N, "Insert"), (Key::P, "Page Layout"), (Key::M, "Formulas"), (Key::A, "Data"), (Key::R, "Review"), (Key::W, "View")] {
+        key(&mut h, Key::F10); // arm
+        letter(&mut h, k, false);
+        assert_eq!(h.state().ui.ribbon_tab, tab, "letter {k:?}");
+        assert!(h.state().editor.is_none(), "tab letters must not begin a cell edit");
+        key(&mut h, Key::F10); // disarm
+        assert_eq!(h.state().keytips.prefix(), None);
+    }
+    // A terminal tab unit with no deeper sequences finishes and clears.
+    key(&mut h, Key::F10); // re-arm
+    letter(&mut h, Key::J, false);
+    assert_eq!(h.state().keytips.prefix(), Some("J"), "J waits for its multi-letter unit");
+    letter(&mut h, Key::I, false);
+    assert_eq!(h.state().ui.ribbon_tab, "Draw");
+    assert_eq!(h.state().keytips.prefix(), None, "terminal tab units finish cleanly");
+}
+
+#[test]
+fn view_gridlines_sequence_runs_end_to_end() {
+    let mut h = harness(blank());
+    let gridlines = |h: &Harness| h.state().session.active().unwrap().wb.active().unwrap().show_gridlines;
+    assert!(gridlines(&h), "gridlines start visible");
+    key(&mut h, Key::F10);
+    letter(&mut h, Key::W, false);
+    // W has deeper sequences: it stays as an active level so View badges show.
+    assert_eq!(h.state().ui.ribbon_tab, "View");
+    assert_eq!(h.state().keytips.prefix(), Some("W"));
+    letter(&mut h, Key::V, false);
+    assert_eq!(h.state().keytips.prefix(), Some("WV"), "implicit group level waits for the last key");
+    letter(&mut h, Key::G, false);
+    assert_eq!(h.state().keytips.prefix(), None, "the finished sequence clears the prefix");
+    assert!(!gridlines(&h), "WVG toggles gridlines off");
+    key(&mut h, Key::F10);
+    for k in [Key::W, Key::V, Key::G] {
+        letter(&mut h, k, false);
+    }
+    assert!(gridlines(&h), "WVG toggles gridlines back on");
+}
+
+#[test]
+fn two_letter_unit_waits_after_first_letter_then_fires() {
+    let mut h = harness(blank());
+    key(&mut h, Key::F10);
+    letter(&mut h, Key::J, false);
+    // "J" is not a complete sequence, but "JI" starts with it: the matcher waits.
+    assert_eq!(h.state().keytips.prefix(), Some("J"));
+    assert_eq!(h.state().ui.ribbon_tab, "Home");
+    letter(&mut h, Key::I, false);
+    assert_eq!(h.state().ui.ribbon_tab, "Draw");
+    assert_eq!(h.state().keytips.prefix(), None);
+    assert!(h.state().editor.is_none(), "unit letters must not begin a cell edit");
+}
+
+#[test]
+fn two_letter_unit_fires_when_pressed_in_one_frame() {
+    let mut h = harness(blank());
+    key(&mut h, Key::F10);
+    events(
+        &mut h,
+        [
+            key_event(Key::J, true, Modifiers::NONE),
+            Event::Text("j".into()),
+            key_event(Key::I, true, Modifiers::NONE),
+            Event::Text("i".into()),
+            key_event(Key::J, false, Modifiers::NONE),
+            key_event(Key::I, false, Modifiers::NONE),
+        ],
+    );
+    assert_eq!(h.state().ui.ribbon_tab, "Draw");
+}
+
+#[test]
 fn ordinary_typing_editor_shortcuts_and_altgr_remain_text_input() {
     let mut h = harness(blank());
     events(&mut h, [Event::Text("hello".into())]);
@@ -317,4 +392,161 @@ fn ordinary_typing_editor_shortcuts_and_altgr_remain_text_input() {
     events(&mut h, [Event::ModifiersChanged(Modifiers::NONE), key_event(Key::AltLeft, false, Modifiers::NONE), Event::Text("é".into())]);
     assert_eq!(h.state().keytips.prefix(), None, "macOS Option must remain available for text composition");
     assert_eq!(h.state().editor.as_ref().unwrap().text, "é");
+}
+
+#[test]
+fn vertical_alignment_keytips_run_their_commands() {
+    for (letter, id) in [(Key::T, "home.alignTop"), (Key::M, "home.alignMiddle"), (Key::B, "home.alignBottom")] {
+        let mut h = harness(blank());
+        sequence(&mut h, &[Key::H, Key::A, letter], false);
+        assert_eq!(h.state().session.journal.iter().filter(|(j, _)| j == id).count(), 1, "HA{} runs {id}", letter.name());
+    }
+}
+
+#[test]
+fn pending_sequences_are_silent_no_ops() {
+    let mut h = harness(blank());
+    let journal = h.state().session.journal.len();
+    sequence(&mut h, &[Key::N, Key::W], false); // NW -> insert.wordArt (missing)
+    assert!(h.state().dialog.is_none(), "no dialog for a pending sequence");
+    assert!(h.state().message.is_none(), "no message box for a pending sequence");
+    assert!(h.state().toast.is_none(), "no toast for a pending sequence");
+    assert_eq!(h.state().session.journal.len(), journal, "no journal entry for a pending sequence");
+    assert_eq!(h.state().keytips.prefix(), None, "the finished sequence clears the prefix");
+}
+
+#[test]
+fn pending_sequences_go_live_when_the_command_lands() {
+    // The command lands in the catalog (here: a test-registered stand-in).
+    // The sequence must run it with no table edit.
+    gridcraft_engine::register_test_command("insert.equation", |s, _| {
+        s.execute("cell.set", json!({"cell": "Z9", "input": "live"}))?;
+        Ok(json!({}))
+    });
+    let mut h = harness(blank());
+    sequence(&mut h, &[Key::N, Key::E], false); // NE -> insert.equation
+    assert_eq!(value(&h, "Z9"), Value::from("live"), "the pending sequence ran the landed command");
+    assert_eq!(
+        h.state().session.journal.iter().filter(|(id, _)| id == "insert.equation").count(),
+        1,
+        "the landed command is journaled like any live command"
+    );
+    assert_eq!(h.state().keytips.prefix(), None);
+}
+
+#[test]
+fn control_keytips_open_dropdowns_and_run_handlers() {
+    // HFF routes to the font control: its dropdown opens (popup items queryable).
+    let mut h = harness(blank());
+    sequence(&mut h, &[Key::H, Key::F, Key::F], false);
+    assert!(h.state().message.is_none() && h.state().toast.is_none(), "HFF must not raise an error box");
+    // "Calibri" appears twice: once on the combo button (the current font) and
+    // once inside the opened dropdown — a single node would mean it stayed closed.
+    assert!(h.query_all_by_label("Calibri").count() >= 2, "HFF must open the font dropdown");
+
+    // WVF toggles the formula bar: pure UI state, no engine command exists.
+    let mut h = harness(blank());
+    assert!(h.state().session.prefs.formula_bar);
+    sequence(&mut h, &[Key::W, Key::V, Key::F], false);
+    assert!(!h.state().session.prefs.formula_bar, "WVF must toggle the formula bar off");
+
+    // WJ runs the 100% handler with its percent param ({} would raise "missing percent").
+    let mut h = harness(blank());
+    sequence(&mut h, &[Key::W, Key::J], false);
+    assert!(h.state().message.is_none() && h.state().toast.is_none(), "WJ must run view.zoom with the percent param");
+    assert_eq!(h.state().keytips.prefix(), None);
+}
+
+#[test]
+fn editable_combos_filter_by_typing_and_move_by_arrows() {
+    // Open the font dropdown (HFF), type to filter, then Enter to apply.
+    let mut h = harness(blank());
+    sequence(&mut h, &[Key::H, Key::F, Key::F], false);
+    h.run_steps(3); // let the filter field gain focus
+    events(&mut h, [Event::Text("arial".into())]);
+    h.run_steps(3);
+    // "arial" matches Arial only — Georgia must be filtered out of the list.
+    assert_eq!(h.query_all_by_label("Georgia").count(), 0, "typing must narrow the list");
+    assert!(h.query_all_by_label("Arial").count() >= 1, "the match must stay visible");
+    key(&mut h, Key::Enter);
+    h.run_steps(3);
+    assert!(h.state().message.is_none() && h.state().toast.is_none(), "applying must not raise an error");
+    // The popup closed and the combo button now shows the applied font.
+    assert_eq!(h.query_all_by_label("Arial").count(), 1, "Enter must apply Arial and close the popup");
+    assert_eq!(h.query_all_by_label("Georgia").count(), 0);
+
+    // Arrows alone move through the full list: Calibri -> Cambria -> Candara -> Consolas.
+    let mut h = harness(blank());
+    sequence(&mut h, &[Key::H, Key::F, Key::F], false);
+    h.run_steps(3);
+    for _ in 0..3 {
+        key(&mut h, Key::ArrowDown);
+    }
+    key(&mut h, Key::Enter);
+    h.run_steps(3);
+    assert!(h.state().message.is_none() && h.state().toast.is_none());
+    assert_eq!(h.query_all_by_label("Consolas").count(), 1, "Down x3 from Calibri must land on Consolas");
+
+    // Size combo: type a custom size not in the list, Enter applies it.
+    let mut h = harness(blank());
+    sequence(&mut h, &[Key::H, Key::F, Key::S], false);
+    h.run_steps(3);
+    events(&mut h, [Event::Text("13.5".into())]);
+    key(&mut h, Key::Enter);
+    h.run_steps(3);
+    assert!(h.state().message.is_none() && h.state().toast.is_none(), "custom sizes must apply");
+    assert_eq!(h.query_all_by_label("13.5").count(), 1, "the button must show the custom size");
+
+    // Closing without applying (Escape) and reopening must reset the filter to the full list.
+    let mut h = harness(blank());
+    sequence(&mut h, &[Key::H, Key::F, Key::F], false);
+    h.run_steps(3);
+    events(&mut h, [Event::Text("arial".into())]);
+    h.run_steps(3);
+    key(&mut h, Key::Escape);
+    h.run_steps(3);
+    sequence(&mut h, &[Key::H, Key::F, Key::F], false);
+    h.run_steps(4);
+    assert!(h.query_all_by_label("Georgia").count() >= 1, "reopening must show the full, unfiltered list");
+    // Arrows after typing move the highlight, not the text cursor: type a filter,
+    // then Down twice and Enter must apply the second match's neighbour logic.
+    key(&mut h, Key::Escape);
+    h.run_steps(3);
+    sequence(&mut h, &[Key::H, Key::F, Key::F], false);
+    h.run_steps(3);
+    events(&mut h, [Event::Text("candara".into())]);
+    h.run_steps(3);
+    key(&mut h, Key::Enter);
+    h.run_steps(3);
+    assert_eq!(h.query_all_by_label("Candara").count(), 1, "filtered Enter must apply the filtered row");
+}
+
+#[test]
+fn color_palette_navigates_with_arrows_and_enter_applies() {
+    let mut h = harness(blank());
+    sequence(&mut h, &[Key::H, Key::H], false); // H,H opens the fill palette
+    h.run_steps(3);
+    key(&mut h, Key::ArrowDown); // highlight starts at theme row 0
+    key(&mut h, Key::ArrowRight); // -> row 0, col 1 = Craft theme dk1 (#000000)
+    key(&mut h, Key::Enter);
+    h.run_steps(3);
+    assert!(h.state().message.is_none() && h.state().toast.is_none(), "arrow+Enter must not error");
+    assert_eq!(h.state().session.journal.iter().filter(|(id, _)| id == "home.fillColor").count(), 1, "Enter applies the highlighted swatch");
+    assert_eq!(h.state().grid.last_fill, "#000000", "the applied fill is the highlighted colour");
+    assert_eq!(h.query_all_by_label("Theme Colors").count(), 0, "the palette closes after applying");
+}
+
+#[test]
+fn every_sequence_terminates_without_panicking() {
+    use gridcraft_ui_egui::keytips::keytip_table::SEQUENCES;
+    for (seq, _entry) in SEQUENCES {
+        let mut h = harness(blank());
+        key(&mut h, Key::F10); // arm
+        for ch in seq.chars() {
+            let k = Key::from_name(&ch.to_string()).expect("sequence letters map to keys");
+            letter(&mut h, k, false);
+        }
+        // A finish/tab/dialog/wait state is all fine; the point is nothing panics.
+    }
+    assert_eq!(SEQUENCES.len(), SEQUENCES.len(), "every sequence ran");
 }

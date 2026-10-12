@@ -80,6 +80,7 @@ pub enum Icon {
     TextBox,
     Symbol,
     Sparkline,
+    Checkbox,
     Function,
     Name,
     Trace,
@@ -101,6 +102,7 @@ pub enum Icon {
     Theme,
     Margins,
     Orient,
+    SheetRtl,
     Paper,
     PrintArea,
     Script,
@@ -108,9 +110,25 @@ pub enum Icon {
     Share,
     Search,
     Settings,
+    /// Light/dark appearance: a circle, its right half filled.
+    Appearance,
     Sheet,
     Book,
     Folder,
+    /// Header & Footer: a page with its top / bottom band marked.
+    Header,
+    Footer,
+    PageNumber,
+    PageCount,
+    Calendar,
+    Clock,
+    FileName,
+    /// File › Backstage navigation (line art, drawn in the navigation colour).
+    Back,
+    NewFile,
+    OpenFolder,
+    Info,
+    Print,
 }
 
 struct G<'a> {
@@ -415,6 +433,10 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32) {
             g.line(&[(12.0, 4.0), (4.0, 12.0)], c, 1.3);
         }
         Icon::Check => g.line(&[(3.0, 8.5), (6.5, 12.0), (13.0, 4.5)], c, 1.3),
+        Icon::Checkbox => {
+            g.rect(2.0, 2.0, 12.0, 12.0, None, Some(c));
+            g.line(&[(4.5, 8.0), (7.0, 10.5), (11.5, 5.0)], c, 1.4);
+        }
         Icon::Fx => g.text(8.0, 8.0, "fx", 10.5, c, false, true),
         Icon::Plus => {
             g.line(&[(8.0, 3.0), (8.0, 13.0)], c, 1.3);
@@ -574,6 +596,14 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32) {
             g.rect(2.0, 4.0, 8.0, 10.0, None, Some(c));
             g.rect(6.0, 2.0, 8.0, 6.0, Some(Color32::WHITE), Some(BLUE));
         }
+        Icon::SheetRtl => {
+            // A sheet with an arrow running right to left.
+            g.rect(2.0, 2.5, 12.0, 8.0, None, Some(c));
+            g.stroke(&[(6.0, 2.5), (6.0, 10.5)], light);
+            g.stroke(&[(10.0, 2.5), (10.0, 10.5)], light);
+            g.line(&[(13.5, 13.0), (4.5, 13.0)], BLUE, 1.4);
+            g.poly(&[(2.0, 13.0), (5.0, 10.5), (5.0, 15.5)], BLUE);
+        }
         Icon::PrintArea => {
             g.rect(2.5, 2.5, 11.0, 11.0, None, Some(light));
             g.line(&[(4.0, 4.0), (11.0, 4.0), (11.0, 10.0), (4.0, 10.0), (4.0, 4.0)], BLUE, 1.4);
@@ -596,6 +626,16 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32) {
             g.circle(8.0, 8.0, 5.0, None, Some(c));
             g.circle(8.0, 8.0, 2.0, Some(c), None);
         }
+        Icon::Appearance => {
+            g.circle(8.0, 8.0, 5.5, None, Some(c));
+            let half: Vec<(f32, f32)> = (0..=12)
+                .map(|i| {
+                    let a = std::f32::consts::PI * (i as f32 / 12.0 - 0.5);
+                    (8.0 + 5.5 * a.cos(), 8.0 + 5.5 * a.sin())
+                })
+                .collect();
+            g.poly(&half, c);
+        }
         Icon::Book => {
             g.rect(2.0, 2.0, 12.0, 12.0, Some(GREEN), None);
             g.rect(4.0, 4.0, 8.0, 8.0, Some(Color32::WHITE), None);
@@ -604,6 +644,67 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32) {
         }
         Icon::Folder => {
             g.poly(&[(1.5, 4.0), (6.0, 4.0), (7.5, 5.5), (14.5, 5.5), (14.5, 13.0), (1.5, 13.0)], YELLOW);
+        }
+        Icon::Header | Icon::Footer => {
+            g.rect(3.5, 1.5, 9.0, 13.0, None, Some(c));
+            let y = if icon == Icon::Header { 2.5 } else { 11.0 };
+            g.rect(4.5, y, 7.0, 2.5, Some(BLUE), None);
+            for yy in if icon == Icon::Header { [7.0, 9.5] } else { [4.5, 7.0] } {
+                g.stroke(&[(5.5, yy), (10.5, yy)], light);
+            }
+        }
+        Icon::PageNumber | Icon::PageCount => {
+            if icon == Icon::PageCount {
+                g.rect(5.5, 1.0, 8.5, 11.5, None, Some(light));
+            }
+            g.rect(2.5, 3.0, 8.5, 12.0, Some(Color32::WHITE), Some(c));
+            // A "#" mark.
+            g.stroke(&[(5.3, 6.5), (4.8, 12.5)], BLUE);
+            g.stroke(&[(8.3, 6.5), (7.8, 12.5)], BLUE);
+            g.stroke(&[(4.0, 8.4), (9.6, 8.4)], BLUE);
+            g.stroke(&[(3.8, 10.8), (9.4, 10.8)], BLUE);
+        }
+        Icon::Calendar => {
+            g.rect(2.0, 3.0, 12.0, 11.0, Some(Color32::WHITE), Some(c));
+            g.rect(2.0, 3.0, 12.0, 3.0, Some(BLUE), None);
+            for (x, y) in [(4.5, 8.5), (7.5, 8.5), (10.5, 8.5), (4.5, 11.5), (7.5, 11.5)] {
+                g.rect(x - 0.6, y - 0.6, 1.4, 1.4, Some(c), None);
+            }
+        }
+        Icon::Clock => {
+            let center = g.pt(8.0, 8.0);
+            g.p.circle_stroke(center, 6.0 * g.s, Stroke::new(1.15 * g.s.clamp(1.0, 2.0), c));
+            g.stroke(&[(8.0, 4.5), (8.0, 8.0), (10.8, 9.6)], BLUE);
+        }
+        Icon::FileName => {
+            g.poly(&[(3.0, 1.5), (10.0, 1.5), (13.0, 4.5), (13.0, 14.5), (3.0, 14.5)], Color32::WHITE);
+            g.line(&[(3.0, 1.5), (10.0, 1.5), (13.0, 4.5), (13.0, 14.5), (3.0, 14.5), (3.0, 1.5)], c, 1.15);
+            g.stroke(&[(10.0, 1.5), (10.0, 4.5), (13.0, 4.5)], c);
+            g.line(&[(5.0, 9.0), (11.0, 9.0)], BLUE, 1.4);
+            g.stroke(&[(5.0, 11.5), (9.0, 11.5)], light);
+        }
+        Icon::Back => {
+            g.circle(8.0, 8.0, 6.5, None, Some(c));
+            g.line(&[(11.5, 8.0), (4.8, 8.0)], c, 1.2);
+            g.line(&[(7.5, 5.3), (4.8, 8.0), (7.5, 10.7)], c, 1.2);
+        }
+        Icon::NewFile => {
+            g.line(&[(9.5, 1.5), (3.5, 1.5), (3.5, 14.5), (12.5, 14.5), (12.5, 4.5), (9.5, 1.5), (9.5, 4.5), (12.5, 4.5)], c, 1.1);
+        }
+        Icon::OpenFolder => {
+            g.line(&[(13.0, 6.5), (13.0, 4.5), (7.5, 4.5), (6.0, 3.0), (1.5, 3.0), (1.5, 13.0)], c, 1.1);
+            g.line(&[(1.5, 13.0), (4.0, 7.0), (15.0, 7.0), (12.5, 13.0), (1.5, 13.0)], c, 1.1);
+        }
+        Icon::Info => {
+            g.circle(8.0, 8.0, 6.5, None, Some(c));
+            g.line(&[(8.0, 7.0), (8.0, 11.8)], c, 1.3);
+            g.circle(8.0, 4.8, 0.8, Some(c), None);
+        }
+        Icon::Print => {
+            g.line(&[(4.5, 5.5), (4.5, 1.5), (11.5, 1.5), (11.5, 5.5)], c, 1.1);
+            g.line(&[(4.0, 11.5), (1.5, 11.5), (1.5, 5.5), (14.5, 5.5), (14.5, 11.5), (12.0, 11.5)], c, 1.1);
+            g.line(&[(4.5, 9.0), (4.5, 14.5), (11.5, 14.5), (11.5, 9.0), (4.5, 9.0)], c, 1.1);
+            g.circle(12.3, 7.6, 0.6, Some(c), None);
         }
     }
 }

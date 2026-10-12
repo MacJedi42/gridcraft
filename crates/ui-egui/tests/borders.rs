@@ -127,3 +127,36 @@ fn border_preview_uses_the_colored_draft_until_ok_and_cancel_discards_it() {
     h.state_mut().run("edit.undo", json!({})).unwrap();
     assert_eq!(borders(&h, "A1"), original);
 }
+
+/// #376: a merged range's outline lives on the cells along each edge (the right edge on the last
+/// column's cells, the bottom on the last row's), not on the anchor alone. All four sides are drawn.
+#[test]
+fn merged_range_draws_the_outline_from_its_edge_cells() {
+    let mut h = harness();
+    h.state_mut().run("home.borders", json!({"range": "B2:E5", "preset": "thickOutside", "color": "#C81E1E"})).unwrap();
+    h.state_mut().run("home.mergeCells", json!({"range": "B2:E5"})).unwrap();
+    h.state_mut().run("selection.set", json!({"range": "H10"})).unwrap();
+    h.run_steps(6);
+    assert!(borders(&h, "B2").right.is_none(), "the anchor carries only the top and left edges");
+    let red = Color32::from_rgb(0xC8, 0x1E, 0x1E);
+    let segs: Vec<[egui::Pos2; 2]> = h
+        .output()
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            Shape::LineSegment { points, stroke } if stroke.color == red => Some(*points),
+            _ => None,
+        })
+        .collect();
+    let vertical = |s: &[egui::Pos2; 2]| (s[0].x - s[1].x).abs() < 0.5;
+    let xs: Vec<f32> = segs.iter().filter(|s| vertical(s)).map(|s| s[0].x).collect();
+    let ys: Vec<f32> = segs.iter().filter(|s| !vertical(s)).map(|s| s[0].y).collect();
+    let (min_x, max_x) = xs.iter().fold((f32::MAX, f32::MIN), |(a, b), x| (a.min(*x), b.max(*x)));
+    let (min_y, max_y) = ys.iter().fold((f32::MAX, f32::MIN), |(a, b), y| (a.min(*y), b.max(*y)));
+    // Left and right edges (four rows each), top and bottom edges (four columns each).
+    assert_eq!(xs.iter().filter(|x| (**x - min_x).abs() < 0.5).count(), 4, "left edge");
+    assert_eq!(xs.iter().filter(|x| (**x - max_x).abs() < 0.5).count(), 4, "right edge");
+    assert_eq!(ys.iter().filter(|y| (**y - min_y).abs() < 0.5).count(), 4, "top edge");
+    assert_eq!(ys.iter().filter(|y| (**y - max_y).abs() < 0.5).count(), 4, "bottom edge");
+    assert!(max_x - min_x > 100.0 && max_y - min_y > 40.0, "the outline spans the whole merged area");
+}

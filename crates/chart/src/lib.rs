@@ -15,17 +15,18 @@ mod raster;
 mod render;
 mod resolve;
 mod sparkline;
+mod trend;
 
 #[cfg(test)]
 mod tests;
 
-pub use gridcraft_model::{Chart, ChartKind, LegendPos, SparklineKind};
+pub use gridcraft_model::{Chart, ChartKind, LegendPos, SparklineKind, Trendline, TrendlineKind};
 use serde::{Deserialize, Serialize};
 
 pub use axis::{Scale, format_number, nice_scale};
 pub use raster::rasterize;
-pub use render::{Swatch, legend_entries, render};
-pub use resolve::{default_palette, resolve, series_color};
+pub use render::{Swatch, legend_entries, render, supports_trendline};
+pub use resolve::{default_palette, resolve, series_color, series_plot_kind};
 pub use sparkline::render_sparkline;
 
 /// Straight (non-premultiplied) RGBA colour.
@@ -140,8 +141,17 @@ pub struct SeriesData {
     pub secondary: bool,
     /// Draw line segments as a smoothed (spline) curve.
     pub smooth: bool,
+    /// Trendlines to fit and draw over this series.
+    pub trendlines: Vec<TrendlineData>,
     /// Number format code of the source values ("General" by default).
     pub number_format: String,
+}
+
+/// A trendline to draw: the model settings with the line colour resolved against the theme.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TrendlineData {
+    pub spec: Trendline,
+    pub color: Rgba,
 }
 
 impl Default for SeriesData {
@@ -155,6 +165,7 @@ impl Default for SeriesData {
             kind: ChartKind::ColumnClustered,
             secondary: false,
             smooth: false,
+            trendlines: vec![],
             number_format: "General".into(),
         }
     }

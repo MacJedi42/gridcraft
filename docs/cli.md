@@ -3,6 +3,11 @@
 Headless GridCraft: inspect, convert, evaluate, script and serve MCP without a window. Errors go to stderr with a
 non-zero exit code.
 
+`.xls` (Excel 97-2003, BIFF8) files are imported with values, formulas, number formats, merges,
+column widths, row heights and defined names; fonts, fills, borders, charts and other objects are
+not imported yet. Import warnings go to stderr. Convert to `.xlsx` to save; `.xls` output is not
+supported.
+
 `.xlsb` files support [worksheet data import](xlsb-import.md). Formula cells use their last saved
 values; source formatting and other workbook features are omitted. Import warnings go to stderr.
 Convert to `.xlsx` to save the imported workbook; XLSB output is not supported.
@@ -21,6 +26,7 @@ cargo install --path apps/gridcraft-cli     # or: cargo run -p gridcraft-cli -- 
 | `convert <in> <out> [--sheet NAME]` | `gridcraft-cli convert book.xlsx data.csv --sheet Sales` — output format from the extension: `.xlsx`, `.csv`, `.tsv`, `.json`, `.html`. |
 | `eval <formula> [--in FILE] [--sheet S] [--cell A1] [--json]` | `gridcraft-cli eval '=PMT(5%/12,360,-300000)'`; `gridcraft-cli eval '=SUM(B2:B9)' --in book.xlsx` |
 | `cat <file> [--range R] [--sheet S] [--formulas] [--csv]` | `gridcraft-cli cat book.xlsx --range A1:F20` — aligned table of displayed values. |
+| `check <file-or-dir>... [--json] [--tolerance 1e-9] [--max-report N]` | `gridcraft-cli check corpus/` — calc oracle and XLSX round-trip fidelity, see below. |
 | `run …` | see below |
 | `commands [--json] [--search X]` | `gridcraft-cli commands --search border` — every command with its parameter docs. |
 | `functions [--json] [--search X] [--category C]` | `gridcraft-cli functions --search lookup` |
@@ -52,3 +58,77 @@ gridcraft-cli run --in book.xlsx \
 ```
 
 Command ids and parameters: `gridcraft-cli commands`.
+
+## `check`
+
+```sh
+gridcraft-cli check <file-or-dir>... [--json] [--tolerance 1e-9] [--max-report 20]
+```
+
+Measures calculation correctness and file fidelity on any set of `.xlsx`/`.xlsm` files (directories are searched
+recursively). Nothing is written next to the inputs.
+
+**Calc oracle.** A file saved by Excel (or another calculating app) stores the app's own result beside every formula.
+`check` reads each file keeping those cached values, recalculates every formula with GridCraft and compares:
+numbers within a relative `--tolerance` (absolute when the magnitude is below 1), errors by kind, text and logicals
+exactly. Skipped, and counted separately:
+
+- *no oracle*: formulas saved without a value, and every formula of a file whose producer asked for a full
+  recalculation on load (`fullCalcOnLoad`: libraries that don't calculate, such as xlsxwriter, store 0 or nothing).
+- *volatile*: `RAND`, `RANDARRAY`, `RANDBETWEEN`, `NOW`, `TODAY`, `INFO`, `CELL("filename")`, names that use them, and
+  every formula that reads such a cell (through the dependency graph).
+
+Each mismatch lists the cell, formula, expected (cached) and actual (GridCraft) values and the functions the formula
+calls. Mismatches roll up by function: *checked* (formula cells calling it), *mismatched*, and *primary* (mismatched
+while none of the cell's precedents mismatch — the likely culprit, as opposed to a downstream effect). They also roll
+up by *signature*, `expected type → actual type` (e.g. `number → #SPILL!`), which often groups one root cause.
+
+**Round trip.** The recalculated workbook is written with GridCraft's XLSX writer, the package is validated (every
+part has a content type, every content-type override and internal relationship target exists, relationship ids are
+unique: what Excel would "repair") and read back. Categories compared: `package`, `sheets` (names and order),
+`values`, `formulas`, `numFmts` (per cell), `merges`, `names`, `tables` (name, range, columns), `condFormats` (rules
+per sheet), `validations`, `charts` (kinds and series counts), `comments`, `hyperlinks`, `pivots`. `#SPILL!`/`#CALC!`
+compare equal to `#VALUE!` and `#CIRC!` to 0, as that's what the file format stores.
+
+Files that fail to open are reported with GridCraft's error and don't stop the run. Exit code: 0 when every file
+opened with no mismatch and no round-trip difference, 1 otherwise, 2 on a usage error. `--max-report` caps the
+examples listed per file and category (counts are always complete).
+
+The human report prints each file's mismatches and differing categories, a summary table, the most mismatching
+functions, mismatch signatures and totals. `--json` prints one object (schema `gridcraft-check/1`; new fields may be
+added, a changed meaning bumps the version):
+
+```jsonc
+{
+  "schema": "gridcraft-check/1",
+  "tolerance": 1e-9,
+  "files": [{
+    "path": "book.xlsx",
+    "opened": true,
+    "error": null,                     // GridCraft's message when the file can't be opened
+    "warnings": ["..."],               // import warnings
+    "calc": {
+      "formulaCells": 3, "checked": 2, "matched": 1, "mismatched": 1, "noOracle": 1, "volatile": 0,
+      "staleCache": false,             // fullCalcOnLoad: nothing compared
+      "mismatches": [{"cell": "Sheet1!B1", "formula": "=SUM(A1:A2)", "expected": 7, "actual": 6,
+                      "kind": "numeric",  // numeric | text | bool | error | blank (GridCraft empty) | type
+                      "functions": ["SUM"], "primary": true}],
+      "functions": [{"name": "SUM", "checked": 1, "mismatched": 1, "primary": 1}],
+      "signatures": {"number → number": 1}
+    },
+    "roundTrip": {
+      "error": null,                   // write or read-back failure
+      "differing": ["values"],
+      "categories": {"values": {"equal": false, "diffs": 1, "examples": ["Sheet1!A1: 2 → 3"]}, "...": {}}
+    }
+  }],
+  "totals": {"files": 1, "opened": 1, "failedToOpen": 0, "formulaCells": 3, "checked": 2, "matched": 1,
+             "mismatched": 1, "noOracle": 1, "volatile": 0, "roundTripFailed": 0, "roundTripDiffering": 1,
+             "categoriesDiffering": {"values": 1}},
+  "functions": [{"name": "SUM", "checked": 1, "mismatched": 1, "primary": 1}],  // all files, most mismatched first
+  "signatures": {"number → number": 1}
+}
+```
+
+Values use the same JSON shapes as `eval --json`: numbers, strings, booleans, `null` (empty) and
+`{"error": "#N/A"}`. Mismatch lists are capped by `--max-report`; the counts are not.

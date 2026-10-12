@@ -37,115 +37,145 @@ pub fn sheet_tabs(app: &mut SheetApp, ui: &mut Ui) {
                     .filter(|(_, s)| s.visibility == Visibility::Visible)
                     .map(|(i, s)| (i, s.name.clone(), s.tab_color.and_then(|c| c.resolve(&d.wb.theme)), i == d.wb.active_sheet))
                     .collect();
-            for (i, name, color, active) in sheets {
-                let renaming = app.grid.renaming_tab == Some(i);
-                let font = if active { theme::ui_bold(13.0) } else { theme::ui_font(13.0) };
-                let tw = ui.painter().layout_no_wrap(name.clone(), font.clone(), t.text).size().x;
-                let w = (tw + 32.0).max(72.0);
-                let (r, resp) = ui.allocate_exact_size(vec2(w, 30.0), Sense::click_and_drag());
-                let r = r.shrink2(vec2(0.0, 1.0));
-                if active {
-                    ui.painter().rect_filled(Rect::from_min_max(pos2(r.left(), r.top() - 2.0), r.max), 4.0, t.tab_active);
-                    ui.painter().rect_stroke(
-                        Rect::from_min_max(pos2(r.left(), r.top() - 2.0), r.max),
-                        4.0,
-                        Stroke::new(1.0, t.ribbon_border),
-                        StrokeKind::Inside,
-                    );
-                } else if resp.hovered() {
-                    ui.painter().rect_filled(r, 4.0, t.hover);
-                }
-                if let Some(c) = color {
-                    let band = Rect::from_min_size(pos2(r.left() + 6.0, r.bottom() - 4.0), vec2(r.width() - 12.0, 3.0));
-                    ui.painter().rect_filled(band, 1.0, theme::color32(c));
-                } else if active {
-                    let band = Rect::from_center_size(pos2(r.center().x, r.bottom() - 3.0), vec2(tw.min(48.0), 2.5));
-                    ui.painter().rect_filled(band, 1.0, t.accent);
-                }
-                if renaming {
-                    let mut text = app.grid.rename_text.clone();
-                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r.shrink2(vec2(6.0, 5.0))));
-                    let ed = child.add(egui::TextEdit::singleline(&mut text).font(theme::ui_font(13.0)).desired_width(r.width() - 12.0));
-                    app.grid.rename_text = text.clone();
-                    if rename_needs_focus(ed.has_focus(), ed.lost_focus()) {
-                        ed.request_focus();
-                    }
-                    if ed.lost_focus() {
-                        if !ui.input(|i| i.key_pressed(egui::Key::Escape)) && text != name {
-                            app.run_or_alert("sheet.rename", json!({"sheet": i, "name": text}));
-                        }
-                        app.grid.renaming_tab = None;
-                    }
+            // Keep worksheet tabs in their own horizontally scrollable
+            // viewport, leaving room for the New Sheet button and grid scrollbar.
+            let tabs_width = (ui.available_width() - 180.0).max(100.0);
+            ui.allocate_ui_with_layout(vec2(tabs_width, 30.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                // Translate vertical wheel movement into horizontal
+                // worksheet-tab scrolling.
+                let wheel_scroll = if ui.rect_contains_pointer(ui.max_rect()) {
+                    ui.input(|i| {
+                        let d = i.smooth_scroll_delta;
+                        if d.x.abs() > d.y.abs() { d.x } else { d.y }
+                    })
                 } else {
-                    ui.painter().text(r.center(), Align2::CENTER_CENTER, &name, font, if active { t.accent } else { t.text });
-                }
-                if resp.clicked() {
-                    if app.editor.as_ref().is_some_and(|e| e.can_point()) {
-                        // Point mode across sheets: switch without committing.
-                        let _ = app.session.run("sheet.activate", json!({"sheet": i}));
-                    } else {
-                        if app.editor.is_some() {
-                            app.commit_edit(0, 0, false, false);
+                    0.0
+                };
+
+                egui::ScrollArea::horizontal()
+                    .id_salt("worksheet_tabs_horizontal")
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .show(ui, |ui| {
+                        if wheel_scroll.abs() > 0.0 {
+                            ui.scroll_with_delta(vec2(wheel_scroll, 0.0));
                         }
-                        app.run_or_alert("sheet.activate", json!({"sheet": i}));
-                    }
-                }
-                if resp.double_clicked() {
-                    app.grid.renaming_tab = Some(i);
-                    app.grid.rename_text = name.clone();
-                }
-                // Drag to reorder.
-                if resp.drag_stopped()
-                    && let Some(p) = ui.input(|inp| inp.pointer.interact_pos())
-                {
-                    let dx = p.x - r.center().x;
-                    let steps = (dx / w).round() as i64;
-                    if steps != 0 {
-                        let to = (i as i64 + steps).max(0) as usize;
-                        app.run_or_alert("sheet.move", json!({"sheet": i, "to": to}));
-                    }
-                }
-                resp.context_menu(|ui| {
-                    ui.set_min_width(180.0);
-                    if ui.button("Insert Sheet").clicked() {
-                        app.run_or_alert("home.insertSheet", json!({"before": i}));
-                    }
-                    if ui.button("Delete").clicked() {
-                        app.run_or_alert("home.deleteSheet", json!({"sheet": i}));
-                    }
-                    if ui.button("Rename").clicked() {
-                        app.grid.renaming_tab = Some(i);
-                        app.grid.rename_text = name.clone();
-                    }
-                    if ui.button("Move or Copy…").clicked() {
-                        app.open_dialog("moveSheet", json!({"sheet": i}));
-                    }
-                    if ui.button("Duplicate").clicked() {
-                        app.run_or_alert("sheet.move", json!({"sheet": i, "to": i + 1, "copy": true}));
-                    }
-                    ui.menu_button("Tab Color", |ui| {
-                        let colors = app.session.active().map(|d| d.wb.theme.colors).unwrap_or_default();
-                        if let Some(c) = crate::widgets::color_palette(ui, &colors, "No Color") {
-                            app.run_or_alert("sheet.tabColor", json!({"sheet": i, "color": c}));
-                            ui.close();
-                        }
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            for (i, name, color, active) in sheets {
+                                let renaming = app.grid.renaming_tab == Some(i);
+                                let font = if active { theme::ui_bold(13.0) } else { theme::ui_font(13.0) };
+                                let tw = ui.painter().layout_no_wrap(name.clone(), font.clone(), t.text).size().x;
+                                let w = (tw + 32.0).max(72.0);
+                                let (r, resp) = ui.allocate_exact_size(vec2(w, 30.0), Sense::click_and_drag());
+                                let r = r.shrink2(vec2(0.0, 1.0));
+                                if active {
+                                    ui.painter().rect_filled(Rect::from_min_max(pos2(r.left(), r.top() - 2.0), r.max), 4.0, t.tab_active);
+                                    ui.painter().rect_stroke(
+                                        Rect::from_min_max(pos2(r.left(), r.top() - 2.0), r.max),
+                                        4.0,
+                                        Stroke::new(1.0, t.ribbon_border),
+                                        StrokeKind::Inside,
+                                    );
+                                } else if resp.hovered() {
+                                    ui.painter().rect_filled(r, 4.0, t.hover);
+                                }
+                                if let Some(c) = color {
+                                    let band = Rect::from_min_size(pos2(r.left() + 6.0, r.bottom() - 4.0), vec2(r.width() - 12.0, 3.0));
+                                    ui.painter().rect_filled(band, 1.0, theme::color32(c));
+                                } else if active {
+                                    let band = Rect::from_center_size(pos2(r.center().x, r.bottom() - 3.0), vec2(tw.min(48.0), 2.5));
+                                    ui.painter().rect_filled(band, 1.0, t.accent);
+                                }
+                                if renaming {
+                                    let mut text = app.grid.rename_text.clone();
+                                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r.shrink2(vec2(6.0, 5.0))));
+                                    let ed =
+                                        child.add(egui::TextEdit::singleline(&mut text).font(theme::ui_font(13.0)).desired_width(r.width() - 12.0));
+                                    app.grid.rename_text = text.clone();
+                                    if rename_needs_focus(ed.has_focus(), ed.lost_focus()) {
+                                        ed.request_focus();
+                                    }
+                                    if ed.lost_focus() {
+                                        if !ui.input(|i| i.key_pressed(egui::Key::Escape)) && text != name {
+                                            app.run_or_alert("sheet.rename", json!({"sheet": i, "name": text}));
+                                        }
+                                        app.grid.renaming_tab = None;
+                                    }
+                                } else {
+                                    ui.painter().text(r.center(), Align2::CENTER_CENTER, &name, font, if active { t.accent } else { t.text });
+                                }
+                                if resp.clicked() {
+                                    if app.editor.as_ref().is_some_and(|e| e.can_point()) {
+                                        // Point mode across sheets: switch without committing.
+                                        let _ = app.session.run("sheet.activate", json!({"sheet": i}));
+                                    } else {
+                                        if app.editor.is_some() {
+                                            app.commit_edit(0, 0, false, false);
+                                        }
+                                        app.run_or_alert("sheet.activate", json!({"sheet": i}));
+                                    }
+                                }
+                                if resp.double_clicked() {
+                                    app.grid.renaming_tab = Some(i);
+                                    app.grid.rename_text = name.clone();
+                                }
+                                // Drag to reorder.
+                                if resp.drag_stopped()
+                                    && let Some(p) = ui.input(|inp| inp.pointer.interact_pos())
+                                {
+                                    let dx = p.x - r.center().x;
+                                    let steps = (dx / w).round() as i64;
+                                    if steps != 0 {
+                                        let to = (i as i64 + steps).max(0) as usize;
+                                        app.run_or_alert("sheet.move", json!({"sheet": i, "to": to}));
+                                    }
+                                }
+                                resp.context_menu(|ui| {
+                                    ui.set_min_width(180.0);
+                                    if ui.button("Insert Sheet").clicked() {
+                                        app.run_or_alert("home.insertSheet", json!({"before": i}));
+                                    }
+                                    if ui.button("Delete").clicked() {
+                                        app.run_or_alert("home.deleteSheet", json!({"sheet": i}));
+                                    }
+                                    if ui.button("Rename").clicked() {
+                                        app.grid.renaming_tab = Some(i);
+                                        app.grid.rename_text = name.clone();
+                                    }
+                                    if ui.button("Move or Copy…").clicked() {
+                                        app.open_dialog("moveSheet", json!({"sheet": i}));
+                                    }
+                                    if ui.button("Duplicate").clicked() {
+                                        app.run_or_alert("sheet.move", json!({"sheet": i, "to": i + 1, "copy": true}));
+                                    }
+                                    ui.menu_button("Tab Color", |ui| {
+                                        let colors = app.session.active().map(|d| d.wb.theme.colors).unwrap_or_default();
+                                        if let Some(c) = crate::widgets::color_palette(ui, &colors, "No Color") {
+                                            app.run_or_alert("sheet.tabColor", json!({"sheet": i, "color": c}));
+                                            ui.close();
+                                        }
+                                    });
+                                    ui.separator();
+                                    if ui.button("Hide").clicked() {
+                                        app.run_or_alert("sheet.hide", json!({"sheet": i}));
+                                    }
+                                    if ui.button("Unhide…").clicked() {
+                                        app.run_or_alert("sheet.unhide", json!({}));
+                                    }
+                                    ui.separator();
+                                    let protected = app.session.active().and_then(|d| d.wb.active().map(|s| s.is_protected())).unwrap_or(false);
+                                    if ui.button(if protected { "Unprotect Sheet…" } else { "Protect Sheet…" }).clicked() {
+                                        app.open_dialog(if protected { "unprotectSheet" } else { "protectSheet" }, json!({}));
+                                    }
+                                    if ui.button("Select All Sheets").clicked() {
+                                        ui.close();
+                                    }
+                                });
+                            }
+                        });
                     });
-                    ui.separator();
-                    if ui.button("Hide").clicked() {
-                        app.run_or_alert("sheet.hide", json!({"sheet": i}));
-                    }
-                    if ui.button("Unhide…").clicked() {
-                        app.run_or_alert("sheet.unhide", json!({}));
-                    }
-                    ui.separator();
-                    if ui.button("Protect Sheet…").clicked() {
-                        app.open_dialog("protectSheet", json!({}));
-                    }
-                    if ui.button("Select All Sheets").clicked() {
-                        ui.close();
-                    }
-                });
-            }
+            });
             ui.add_space(6.0);
             if crate::widgets::icon_button(ui, Icon::Plus, t.text_dim, "New sheet (⇧F11)", vec2(26.0, 26.0)).clicked() {
                 app.run_or_alert("home.insertSheet", json!({}));
@@ -200,6 +230,10 @@ pub fn status_bar(app: &mut SheetApp, ui: &mut Ui) {
                 };
                 ui.label(egui::RichText::new(app.ui.language.tr(mode)).font(theme::ui_font(12.5)).color(t.text_dim));
                 if let Some(d) = app.session.active() {
+                    if d.wb.vba_project.is_some() {
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new("Macros preserved (not executed)").font(theme::ui_font(12.5)).color(t.danger));
+                    }
                     if d.wb.calc.mode == gridcraft_engine::model::CalcMode::Manual {
                         ui.add_space(12.0);
                         ui.label(egui::RichText::new(app.ui.language.tr("Calculate")).font(theme::ui_font(12.5)).color(t.text_dim));
@@ -249,7 +283,7 @@ pub fn status_bar(app: &mut SheetApp, ui: &mut Ui) {
                         (Icon::Normal, "Normal", "normal", "view.normal"),
                     ] {
                         let (r, resp) = ui.allocate_exact_size(vec2(26.0, 20.0), Sense::click());
-                        let cur = if app.session.view_mode.is_empty() { "normal" } else { app.session.view_mode.as_str() };
+                        let cur = app.session.active().and_then(|d| d.wb.active().map(|s| s.view.as_str())).unwrap_or("normal");
                         if cur == mode {
                             ui.painter().rect_filled(r, 3.0, t.pressed);
                         } else if resp.hovered() {

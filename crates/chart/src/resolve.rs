@@ -5,12 +5,14 @@ use gridcraft_core::{CellRef, RangeRef, Value, number_to_text};
 use gridcraft_model::{Chart, ChartKind, Theme, Workbook, style::apply_tint};
 use gridcraft_numfmt::{NumberFormat, format_value};
 
-use crate::{ChartData, Rgba, SeriesData};
+use crate::{ChartData, Rgba, SeriesData, TrendlineData};
 
 /// Cap on points per series (keeps whole-column references from exploding).
 pub(crate) const MAX_POINTS: usize = 100_000;
 /// Cap on series per chart.
 pub(crate) const MAX_SERIES: usize = 255;
+/// Cap on trendlines drawn per series.
+pub(crate) const MAX_TRENDLINES: usize = 16;
 
 /// Tints used for series beyond the six theme accents: lighter, darker, lighter still…
 const CYCLE_TINTS: [f64; 6] = [0.0, 0.4, -0.25, 0.6, -0.5, 0.2];
@@ -46,11 +48,53 @@ fn parse_ref(wb: &Workbook, sheet: usize, formula: &str) -> Option<(usize, Range
     Some((sh, r))
 }
 
-/// Evaluates a series formula to a flat list of values (row-major), capped.
+/// The parts of a union reference `(Sheet1!$A$1:$A$3,Sheet1!$A$5)`, or `None`.
+fn union_parts(f: &str) -> Option<Vec<&str>> {
+    let inner = f.strip_prefix('(')?.strip_suffix(')')?;
+    let mut parts = Vec::new();
+    let (mut depth, mut quoted, mut start) = (0i32, false, 0usize);
+    for (i, c) in inner.char_indices() {
+        match c {
+            '\'' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => depth -= 1,
+            ',' if !quoted && depth == 0 => {
+                parts.push(inner.get(start..i)?);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        if depth < 0 {
+            return None;
+        }
+    }
+    parts.push(inner.get(start..)?);
+    (parts.len() > 1).then_some(parts)
+}
+
+/// Evaluates a series formula to a flat list of values (row-major), capped. A union of
+/// references (`(A1:A3,A5)`, as PivotCharts use) is read part by part.
 fn eval_list(wb: &Workbook, sheet: usize, formula: &str) -> Vec<Value> {
+    eval_list_in(wb, sheet, formula, 0)
+}
+
+fn eval_list_in(wb: &Workbook, sheet: usize, formula: &str, depth: u32) -> Vec<Value> {
     let f = formula.trim();
     if f.is_empty() {
         return vec![];
+    }
+    if depth < 4
+        && let Some(parts) = union_parts(f)
+    {
+        let mut out = Vec::new();
+        for p in parts {
+            if out.len() >= MAX_POINTS {
+                break;
+            }
+            let rest = MAX_POINTS - out.len();
+            out.extend(eval_list_in(wb, sheet, p, depth + 1).into_iter().take(rest));
+        }
+        return out;
     }
     match evaluate(wb, sheet, CellRef::default(), f) {
         Value::Array(a) => a.iter().take(MAX_POINTS).cloned().collect(),
@@ -139,6 +183,11 @@ fn effective_kind(chart_kind: ChartKind, series_kind: Option<ChartKind>, i: usiz
     }
 }
 
+/// The kind series `i` of `chart` is drawn as: its own kind in a combo chart, else the chart's.
+pub fn series_plot_kind(chart: &Chart, i: usize) -> ChartKind {
+    if chart.kind == ChartKind::Combo { effective_kind(chart.kind, chart.series.get(i).and_then(|s| s.kind), i) } else { chart.kind }
+}
+
 /// Evaluates a chart's series formulas: names, values, categories (default "1", "2", …), X
 /// values (scatter/bubble), bubble sizes, number formats and colours (explicit, else the
 /// default palette derived from the workbook theme accents).
@@ -166,6 +215,15 @@ pub fn resolve(wb: &Workbook, sheet: usize, chart: &Chart) -> ChartData {
             }
         }
         let sizes = s.bubble_sizes.as_deref().map(|f| nums(wb, sheet, f));
+        let trendlines = s
+            .trendlines
+            .iter()
+            .take(MAX_TRENDLINES)
+            .map(|t| TrendlineData {
+                spec: t.clone(),
+                color: t.color.as_ref().and_then(|c| c.resolve(&wb.theme)).map(|[r, g, b]| [r, g, b, 0xFF]).unwrap_or(color),
+            })
+            .collect();
         series.push(SeriesData {
             name,
             values,
@@ -175,6 +233,7 @@ pub fn resolve(wb: &Workbook, sheet: usize, chart: &Chart) -> ChartData {
             kind,
             secondary: s.secondary,
             smooth: s.smooth,
+            trendlines,
             number_format: ref_format(wb, sheet, &s.values),
         });
     }

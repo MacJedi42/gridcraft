@@ -87,6 +87,17 @@ fn sum(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     num_val(gridcraft_core::arith::sum_snapped(&numbers(a)?))
 }
 
+/// PERCENTOF(data_subset, data_all) = SUM(data_subset) / SUM(data_all).
+fn percentof(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
+    let part = a.get(..1).ok_or(CellError::Value)?;
+    let all = a.get(1..2).ok_or(CellError::Value)?;
+    let (part, all): (f64, f64) = (numbers(part)?.iter().sum(), numbers(all)?.iter().sum());
+    if all == 0.0 {
+        return Err(CellError::Div0);
+    }
+    num_val(part / all)
+}
+
 fn sumsq(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     num_val(numbers(a)?.iter().map(|x| x * x).sum())
 }
@@ -99,20 +110,24 @@ fn product(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     num_val(v.iter().product())
 }
 
+/// SUMPRODUCT: non-numeric entries of arrays and multi-cell ranges count as 0, but a scalar
+/// argument holding text (a literal or a single-cell reference) is `#VALUE!` (observed:
+/// `SUMPRODUCT(G1330:G1330,I1330:I1330)` with G1330 = the text "4" is `#VALUE!`).
 fn sumproduct(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
-    let arrays: Vec<_> = a.iter().map(|x| as_array(&x.value)).collect();
-    let Some(first) = arrays.first() else { return Err(CellError::Value) };
+    let arrays: Vec<_> = a.iter().map(|x| (as_array(&x.value), !matches!(x.value, Value::Array(_)))).collect();
+    let Some((first, _)) = arrays.first() else { return Err(CellError::Value) };
     let (rows, cols) = (first.rows, first.cols);
-    if arrays.iter().any(|x| x.rows != rows || x.cols != cols) {
+    if arrays.iter().any(|(x, _)| x.rows != rows || x.cols != cols) {
         return Err(CellError::Value);
     }
     let mut total = 0.0;
     for i in 0..rows.saturating_mul(cols) {
         let mut p = 1.0;
-        for arr in &arrays {
+        for (arr, scalar) in &arrays {
             match arr.data.get(i) {
                 Some(Value::Number(n)) => p *= n,
                 Some(Value::Error(e)) => return Err(*e),
+                Some(Value::Text(_)) if *scalar => return Err(CellError::Value),
                 _ => p = 0.0,
             }
         }
@@ -1051,6 +1066,16 @@ fn averageif(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
 pub(crate) fn specs() -> Vec<FnSpec> {
     vec![
         f!("SUM", 1, VAR, MathTrig, A, "SUM(number1, [number2], ...)", "Adds all the numbers in the arguments.", sum),
+        f!(
+            "PERCENTOF",
+            2,
+            2,
+            MathTrig,
+            A,
+            "PERCENTOF(data_subset, data_all)",
+            "The sum of a subset as a fraction of the sum of all the values.",
+            percentof
+        ),
         f!("SUMSQ", 1, VAR, MathTrig, A, "SUMSQ(number1, [number2], ...)", "Adds the squares of the numbers.", sumsq),
         f!(
             "SUMPRODUCT",
@@ -1280,6 +1305,18 @@ mod tests {
     }
 
     #[test]
+    fn percentof() {
+        // SUM(subset) / SUM(all): text, booleans and blanks inside ranges are skipped like SUM.
+        let all = arr(vec![vec![nv(10.0)], vec![nv(30.0)], vec![tv("x")], vec![Value::Empty], vec![nv(60.0)]]);
+        let part = arr(vec![vec![nv(10.0)], vec![nv(30.0)]]);
+        close(ev("PERCENTOF", vec![rf(part), rf(all.clone())]), 0.4);
+        close(ev("PERCENTOF", vec![n(25.0), n(200.0)]), 0.125);
+        is_err(ev("PERCENTOF", vec![n(1.0), rf(arr(vec![vec![nv(5.0), nv(-5.0)]]))]), Div0);
+        is_err(ev("PERCENTOF", vec![rf(arr(vec![vec![Value::Error(NA)]])), rf(all)]), NA);
+        is_err(ev("PERCENTOF", vec![t("abc"), n(1.0)]), CellError::Value);
+    }
+
+    #[test]
     fn sums() {
         close(ev("SUM", vec![n(1.0), n(2.0), t("3"), b(true)]), 7.0);
         let r = arr(vec![vec![nv(1.0), tv("x"), Value::Bool(true), Value::Empty, nv(4.0)]]);
@@ -1302,6 +1339,27 @@ mod tests {
         close(ev("SUMX2PY2", vec![av(x.clone()), av(y.clone())]), 521.0);
         close(ev("SUMXMY2", vec![av(x.clone()), av(y)]), 79.0);
         is_err(ev("SUMXMY2", vec![av(x), av(row(&[1.0]))]), NA);
+    }
+
+    /// SUMPRODUCT cases observed in Excel (FormulaEvalTestData, row "Sumproduct"): scalars and
+    /// single-cell references multiply in, text in a scalar argument is `#VALUE!`, sizes must match.
+    #[test]
+    fn sumproduct_scalar_arguments() {
+        let cases: Vec<(Vec<crate::Arg>, Result<f64, CellError>)> = vec![
+            (vec![n(3.0), rf(nv(534.0)), rf(nv(1.1))], Ok(1762.2)),
+            (vec![rf(nv(1.1)), n(3.0), rf(nv(534.0)), rf(nv(1.1))], Ok(1938.42)),
+            (vec![n(2.0), rf(col(&[1.00001, 2.99999]))], Err(CellError::Value)),
+            (vec![rf(tv("4")), rf(nv(2.0))], Err(CellError::Value)),
+            (vec![t("4"), n(2.0)], Err(CellError::Value)),
+            (vec![rf(nv(3.0)), rf(Value::Error(CellError::Ref))], Err(CellError::Ref)),
+            (vec![av(arr(vec![vec![tv("4")]])), n(2.0)], Ok(0.0)),
+        ];
+        for (args, want) in cases {
+            match want {
+                Ok(x) => close(ev("SUMPRODUCT", args), x),
+                Err(err) => is_err(ev("SUMPRODUCT", args), err),
+            }
+        }
     }
 
     #[test]

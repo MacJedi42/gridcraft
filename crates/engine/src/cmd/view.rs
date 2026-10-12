@@ -28,6 +28,11 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("view.showZeros", "Show Zeros", [], None, "{on?}", has_doc, |s, p| sheet_flag(s, p, "zeros")),
         cmd!("view.rightToLeft", "Sheet Right-to-Left", ["Page Layout", "Sheet Options"], None, "{on?}", has_doc, |s, p| sheet_flag(s, p, "rtl")),
         cmd!("view.zoom", "Zoom", ["View", "Zoom"], None, "{percent: 10..400}", has_doc, zoom),
+        cmd!("view.zoom100", "100%", ["View", "Zoom"], None, "{}", has_doc, |s, _| zoom(s, &json!({"percent": 100}))),
+        cmd!(query "view.formulaBar", "Formula Bar", ["View", "Show"], None, "{on?: bool}", always, |s, p| {
+            s.prefs.formula_bar = bool_param(p, "on").unwrap_or(!s.prefs.formula_bar);
+            Ok(json!({"on": s.prefs.formula_bar}))
+        }),
         cmd!("view.zoomToSelection", "Zoom to Selection", ["View", "Zoom"], None, "{viewWidth?, viewHeight?}", has_doc, zoom_selection),
         cmd!("pageLayout.orientation", "Orientation", ["Page Layout", "Page Setup"], None, "{orientation: portrait|landscape}", has_doc, orientation),
         cmd!("pageLayout.size", "Size", ["Page Layout", "Page Setup"], None, "{paper: Letter|Legal|A4|A3|A5|Tabloid|Executive}", has_doc, paper),
@@ -91,7 +96,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Header & Footer",
             ["Insert", "Text"],
             None,
-            "{header?: \"&C&P\", footer?: \"&CPage &P of &N\"}",
+            "{sheet?, header?: \"&C&P\", footer?: \"&CPage &P of &N\", differentFirst?: bool, differentOddEven?: bool, firstHeader?, firstFooter?, evenHeader?, evenFooter?} or one section: {sheet?, page?: odd|even|first, part: header|footer, section: left|center|right, text: \"Page &[Page] of &[Pages]\"} (field names or codes) → {header, footer, differentFirst, differentOddEven, firstHeader, firstFooter, evenHeader, evenFooter}",
             has_doc,
             header_footer
         ),
@@ -113,7 +118,7 @@ fn freeze_panes(s: &mut Session, p: &Json) -> Result<Json> {
     if sh.freeze.is_some() && p.get("cell").is_none() {
         return set_freeze(s, None);
     }
-    let at = cell_param(p, "cell").unwrap_or(d.selection.active);
+    let at = cell_param(s, p, "cell")?.unwrap_or(d.selection.active);
     let top = sh.view_top_left;
     let rows = at.row.saturating_sub(top.row);
     let cols = at.col.saturating_sub(top.col);
@@ -254,7 +259,7 @@ fn scale_fit(s: &mut Session, p: &Json) -> Result<Json> {
 }
 
 fn breaks(s: &mut Session, p: &Json) -> Result<Json> {
-    let at = cell_param(p, "cell").unwrap_or(s.doc()?.selection.active);
+    let at = cell_param(s, p, "cell")?.unwrap_or(s.doc()?.selection.active);
     let insert = bool_param(p, "insert").unwrap_or(false);
     let remove = bool_param(p, "remove").unwrap_or(false);
     let reset = bool_param(p, "reset").unwrap_or(false);
@@ -281,17 +286,77 @@ fn breaks(s: &mut Session, p: &Json) -> Result<Json> {
     })
 }
 
+/// Excel keeps at most 255 characters per header or footer.
+const MAX_HEADER_FOOTER: usize = 255;
+
 fn header_footer(s: &mut Session, p: &Json) -> Result<Json> {
+    const CMD: &str = "pageLayout.headerFooter";
+    let si = target_sheet(s, p)?;
+    let cap = |t: &str| t.chars().take(MAX_HEADER_FOOTER).collect::<String>();
+    // One section edited in place (Page Layout view).
+    let section = match (str_param(p, "part"), str_param(p, "section")) {
+        (None, None) => None,
+        (part, sec) => {
+            let footer = match part.unwrap_or("header") {
+                "header" => false,
+                "footer" => true,
+                other => return Err(bad(CMD, format!("`part` must be header or footer, not `{other}`"))),
+            };
+            let idx = match sec.unwrap_or("center") {
+                "left" => 0usize,
+                "center" | "centre" => 1,
+                "right" => 2,
+                other => return Err(bad(CMD, format!("`section` must be left, center or right, not `{other}`"))),
+            };
+            let page = match str_param(p, "page") {
+                None => gridcraft_model::HfPage::Odd,
+                Some(id) => gridcraft_model::HfPage::parse(id).ok_or_else(|| bad(CMD, format!("`page` must be odd, even or first, not `{id}`")))?,
+            };
+            Some((page, footer, idx, super::print::fields_to_codes(str_param(p, "text").unwrap_or(""))))
+        }
+    };
     edit(s, |cx| {
-        let si = cx.sheet_index();
         let pr = &mut cx.sheet_mut(si)?.print;
         if let Some(h) = str_param(p, "header") {
-            pr.header = h.to_string();
+            pr.header = cap(h);
         }
         if let Some(f) = str_param(p, "footer") {
-            pr.footer = f.to_string();
+            pr.footer = cap(f);
         }
-        Ok(Json::Null)
+        for (key, slot) in [
+            ("firstHeader", &mut pr.first_header),
+            ("firstFooter", &mut pr.first_footer),
+            ("evenHeader", &mut pr.even_header),
+            ("evenFooter", &mut pr.even_footer),
+        ] {
+            if let Some(t) = str_param(p, key) {
+                *slot = cap(t);
+            }
+        }
+        if let Some(on) = bool_param(p, "differentFirst") {
+            pr.different_first = on;
+        }
+        if let Some(on) = bool_param(p, "differentOddEven") {
+            pr.different_odd_even = on;
+        }
+        if let Some((page, footer, idx, text)) = &section {
+            let spec = pr.hf_mut(*page, *footer);
+            let mut parts = super::print::split_header_footer(spec);
+            if let Some(slot) = parts.get_mut(*idx) {
+                *slot = text.clone();
+            }
+            *spec = cap(&super::print::join_header_footer(&parts));
+        }
+        Ok(json!({
+            "header": pr.header,
+            "footer": pr.footer,
+            "differentFirst": pr.different_first,
+            "differentOddEven": pr.different_odd_even,
+            "firstHeader": pr.first_header,
+            "firstFooter": pr.first_footer,
+            "evenHeader": pr.even_header,
+            "evenFooter": pr.even_footer,
+        }))
     })
 }
 
@@ -336,3 +401,28 @@ fn theme(s: &mut Session, p: &Json) -> Result<Json> {
 
 #[allow(dead_code)]
 fn unused(_: CellRef) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zoom_100_resets_the_active_sheet_zoom() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("view.zoom", json!({"percent": 150})).unwrap();
+        assert_eq!(s.execute("view.zoom100", json!({})).unwrap()["zoom"], 100);
+        assert_eq!(s.doc().unwrap().wb.active().unwrap().zoom, 100);
+    }
+
+    #[test]
+    fn formula_bar_toggles_without_a_workbook_and_defaults_to_shown() {
+        let mut s = Session::new();
+        assert!(s.prefs.formula_bar);
+        assert_eq!(s.execute("view.formulaBar", json!({})).unwrap()["on"], false);
+        assert_eq!(s.execute("view.formulaBar", json!({"on": true})).unwrap()["on"], true);
+        // A prefs.json saved before the option existed keeps the formula bar shown.
+        let old: crate::Prefs = serde_json::from_str(r#"{"userName": "Ann"}"#).unwrap();
+        assert!(old.formula_bar);
+    }
+}

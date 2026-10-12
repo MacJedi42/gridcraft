@@ -78,6 +78,34 @@ fn mode_sngl(v: &[f64]) -> R<f64> {
     modes(v).first().copied().ok_or(CellError::NA)
 }
 
+/// Numbers for MODE / MODE.SNGL / MODE.MULT. Inside multi-cell ranges and arrays only numbers
+/// count, like [`numbers`]. Scalar arguments are stricter than in SUM: Excel answers `#VALUE!`
+/// for direct text (even numeric text such as `"1"`) and for a single-cell reference to text or
+/// a blank cell (observed: `MODE(B8,"1",2,3)` and `MODE(B9,2,D7)` with D7 blank are `#VALUE!`).
+/// Arguments are processed left to right, so the first error wins.
+fn mode_numbers(args: &[Arg]) -> R<Vec<f64>> {
+    let mut out = Vec::new();
+    for a in args {
+        match &a.value {
+            Value::Array(arr) => {
+                for v in arr.iter() {
+                    match v {
+                        Value::Number(n) => out.push(*n),
+                        Value::Error(e) => return Err(*e),
+                        _ => {}
+                    }
+                }
+            }
+            Value::Number(n) => out.push(*n),
+            Value::Error(e) => return Err(*e),
+            Value::Text(_) | Value::Empty => return Err(CellError::Value),
+            Value::Bool(_) if a.from_ref => {}
+            v => out.push(v.to_number()?),
+        }
+    }
+    Ok(out)
+}
+
 fn product(v: &[f64]) -> f64 {
     if v.is_empty() { 0.0 } else { v.iter().product() }
 }
@@ -277,7 +305,7 @@ fn countblank(a: &[Arg], _: C) -> R<Value> {
 }
 
 fn mode_mult(a: &[Arg], _: C) -> R<Value> {
-    let v = numbers(a)?;
+    let v = mode_numbers(a)?;
     let m = modes(&v);
     if m.is_empty() {
         return Err(CellError::NA);
@@ -1566,10 +1594,10 @@ pub(crate) fn specs() -> Vec<FnSpec> {
             numbers(a)?
         )?)),
         f!("MODE", 1, VAR, Compatibility, A, "MODE(number1, [number2], ...)", "Most frequently occurring number.", |a: &[Arg], _c: C| num_val(
-            mode_sngl(&numbers(a)?)?
+            mode_sngl(&mode_numbers(a)?)?
         )),
         f!("MODE.SNGL", 1, VAR, Statistical, A, "MODE.SNGL(number1, [number2], ...)", "Most frequently occurring number.", |a: &[Arg], _c: C| {
-            num_val(mode_sngl(&numbers(a)?)?)
+            num_val(mode_sngl(&mode_numbers(a)?)?)
         }),
         f!("MODE.MULT", 1, VAR, Statistical, A, "MODE.MULT(number1, [number2], ...)", "Vertical array of all the most frequent numbers.", mode_mult),
         f!("STDEV", 1, VAR, Compatibility, A, "STDEV(number1, [number2], ...)", "Sample standard deviation.", |a: &[Arg], _c: C| num_val(
@@ -2249,6 +2277,35 @@ mod tests {
         close(ev("MODE", vec![c(&[1.0, 2.0, 2.0, 1.0])]), 1.0);
         is_err(ev("MODE", vec![c(&[1.0, 2.0, 3.0])]), CellError::NA);
         assert_eq!(rows_of(&ev("MODE.MULT", vec![c(&[1.0, 2.0, 3.0, 4.0, 3.0, 2.0, 1.0, 2.0, 3.0])])), vec![vec![nv(2.0)], vec![nv(3.0)]]);
+    }
+
+    /// MODE argument semantics observed in Excel (FormulaEvalTestData, row "Mode"): multi-cell
+    /// ranges skip text and blanks, but direct text and single-cell references to text or blank
+    /// cells are `#VALUE!`; the first error from the left wins.
+    #[test]
+    fn mode_scalar_arguments() {
+        let data = arr(vec![vec![tv(""), nv(0.0), nv(1.0)], vec![tv("x"), nv(1.0), nv(1.001)], vec![tv("y"), nv(9e9), nv(2.3456)]]);
+        let cases: Vec<(Vec<crate::Arg>, Result<f64, CellError>)> = vec![
+            (vec![n(1.0), n(1.0), n(2.0), n(3.0)], Ok(1.0)),
+            (vec![rf(data)], Ok(1.0)),
+            (vec![rf(arr(vec![vec![nv(-1.1), Value::Empty, tv("1.1")]])), n(-1.1)], Ok(-1.1)),
+            // MODE(C9,E16,"1",B8): E16 holds the text "1.1".
+            (vec![rf(nv(1.1)), rf(tv("1.1")), t("1"), rf(nv(1.0))], Err(CellError::Value)),
+            (vec![rf(nv(1.0)), t("1"), n(2.0), n(3.0)], Err(CellError::Value)),
+            (vec![t("1"), n(1.0), e(CellError::Div0), n(2.0), n(3.0)], Err(CellError::Value)),
+            // MODE(B9,2,D7) with D7 blank.
+            (vec![rf(nv(2.0)), n(2.0), rf(Value::Empty)], Err(CellError::Value)),
+            (vec![n(1.0), n(1.0), e(CellError::Div0), t("1")], Err(CellError::Div0)),
+        ];
+        for name in ["MODE", "MODE.SNGL"] {
+            for (args, want) in &cases {
+                match want {
+                    Ok(x) => close(ev(name, args.clone()), *x),
+                    Err(err) => is_err(ev(name, args.clone()), *err),
+                }
+            }
+        }
+        is_err(ev("MODE.MULT", vec![rf(nv(1.0)), t("1"), n(1.0)]), CellError::Value);
     }
 
     #[test]

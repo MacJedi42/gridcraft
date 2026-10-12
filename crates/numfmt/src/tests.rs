@@ -122,6 +122,82 @@ fn fractions() {
     assert_eq!(f("# ???/???", 0.5), "   1/2  ");
 }
 
+/// Fraction sections with literal text, as Excel renders them (observed `TEXT()` results).
+#[test]
+fn fractions_with_literals() {
+    let cases: &[(&str, f64, &str)] = &[
+        // Literals between the parts and around the bar.
+        (r"|#\:#/#|", 23.75, "|23:3/4|"),
+        (r"|#\:#=/=#|", 23.75, "|23:3=/=4|"),
+        (r"|#\:#=/=#|", -23.75, "-|23:3=/=4|"),
+        (r"|#\:? ?=/=#|", 23.75, "|2:3 3=/=4|"),
+        (r"|#-#-#\:#/#|", 23.75, "|-2-3:3/4|"),
+        // A whole part without digits drops its separator (spaces next to a `?`).
+        (r"|#\:#/#|", 0.75, "|3/4|"),
+        (r"|#\:#/#|", -0.75, "-|3/4|"),
+        (r"|#-#-#\:#/#|", 0.75, "|--3/4|"),
+        (r"|#\:#=/=#|", 0.75, "|3=/=4|"),
+        (r"|#\:0=/=?|", 0.75, "|3=/=4|"),
+        (r"|#\:?=/=#|", 0.75, "| 3=/=4|"),
+        (r"|?\:#=/=#|", 0.75, "|  3=/=4|"),
+        (r"|?\:0=/=0|", -0.75, "-|  3=/=4|"),
+        (r"|?\:?0=/=#|", 0.75, "|   3=/=4|"),
+        (r"|0\:#=/=#|", 0.75, "|0:3=/=4|"),
+        // A zero fraction hides separator, numerator, bar and denominator (spaces if any `?`).
+        (r"|#\:#/#|", 0.0, "|0|"),
+        (r"|#\:#/#|", 1.0, "|1|"),
+        (r"|#\:#/#|", -1.0, "-|1|"),
+        (r"|#-#-#\:#/#|", 0.0, "|--0|"),
+        (r"|#-#-#\:#/#|", 1.0, "|--1|"),
+        (r"|#\:#=/=0|", 0.0, "|0|"),
+        (r"|0\:#=/=#|", 1.0, "|1|"),
+        (r"|#\:#=/=?|", 0.0, "|0      |"),
+        (r"|#\:?=/=0|", 1.0, "|1      |"),
+        (r"|?\:#=/=#|", 0.0, "|0      |"),
+        (r"|?\:#=/=#|", -1.0, "-|1      |"),
+        (r"|#\:? ?=/=#|", 0.0, "|:0      |"),
+        (r"|#\:? ?=/=?|", 1.0, "|:1      |"),
+        // ... unless the numerator has a `0` placeholder: then it shows 0/1.
+        (r"|#\:0=/=#|", 0.0, "|0=/=1|"),
+        (r"|?\:0=/=?|", 0.0, "|0:0=/=1|"),
+        (r"|0\:0=/=0|", 0.0, "|0:0=/=1|"),
+        (r"|#\:0=/=#|", 1.0, "|1:0=/=1|"),
+        (r"|?\:0=/=#|", -1.0, "-|1:0=/=1|"),
+        (r"|#\:? ?0#/000", 0.0, "|:0  00/001"),
+        (r"|#\:? ?0#/000", 1.0, "|:1  00/001"),
+        // `0` denominator placeholders zero pad on the left.
+        (r"|#\:? ?0#/000", 23.75, "|2:3  03/004"),
+        (r"|#\:? ?#/#|", 23.75, "|2:3  3/4|"),
+        // Literal text before the bar: still an improper fraction.
+        (r"|#_#/#|", 3.75, "|15 /4|"),
+        (r"|#_#/#|", -0.75, "-|3 /4|"),
+        (r"|#_#/#|", 0.0, "|0 /1|"),
+        (r"|#_#/#|", -1.0, "-|1 /1|"),
+        (r"|#_#=/=?|", 3.75, "|15 =/=4|"),
+        (r"|#_?=/=0|", 0.0, "|0 =/=1|"),
+        (r"|#_?=/=?|", 1.0, "|1 =/=1|"),
+    ];
+    for &(code, v, want) in cases {
+        assert_eq!(f(code, v), want, "{code} with {v}");
+    }
+}
+
+#[test]
+fn question_mark_pads_thousands_separator() {
+    let cases: &[(&str, f64, &str)] = &[
+        ("?,???????", 1234567.0, " 1,234,567"),
+        ("?,????????", 1234567.0, "  1,234,567"),
+        ("?,?????????", 1234567.0, "    1,234,567"),
+        ("?,?????????", -1234567.0, "-    1,234,567"),
+        ("?,??????", 1234567.0, "1,234,567"),
+        ("?,????", 12345.0, "12,345"),
+        ("0,000000000", 1234567.0, "0,001,234,567"),
+    ];
+    for &(code, v, want) in cases {
+        assert_eq!(f(code, v), want, "{code} with {v}");
+    }
+}
+
 #[test]
 fn literals_and_fill() {
     assert_eq!(f("\"$\"#,##0.00", 3.0), "$3.00");
@@ -264,6 +340,21 @@ fn text_fn() {
     assert_eq!(text_function(&Value::Number(5.0), "", S), Ok("".into()));
     assert_eq!(text_function(&Value::Number(-1.0), "m/d/yyyy", S), Err(CellError::Value));
     assert_eq!(text_function(&Value::Bool(true), "0", S), Ok("TRUE".into()));
+    // Booleans go through the text section as TRUE/FALSE (observed Excel results).
+    let cases: &[(bool, &str, &str)] = &[
+        (true, ";;;@", "TRUE"),
+        (true, ";;;\"hi\"", "hi"),
+        (true, ";;;\"h\"\"I\"", "hI"),
+        (false, ";;;\\h\\i", "hi"),
+        (true, ";;;\\@@\\@", "@TRUE@"),
+        (false, ";;;-@-", "-FALSE-"),
+        (true, ";;;@-", "TRUE-"),
+        (false, ";;;-@-@-", "-FALSE-FALSE-"),
+        (true, "0.00", "TRUE"),
+    ];
+    for &(b, code, want) in cases {
+        assert_eq!(text_function(&Value::Bool(b), code, S), Ok(want.into()), "{code} with {b}");
+    }
 }
 
 /// Deterministic xorshift for fuzzing.
@@ -420,4 +511,74 @@ fn fuzz_no_panic() {
             }
         }
     }
+}
+
+// ---- 15 significant digits: an exact tie at the 16th digit goes toward zero ----
+// Windows Excel 16.0.20430 TEXT() over the exact doubles below. An odd 15th digit is where
+// round-half-even and toward-zero differ; an even one is where they agree.
+
+#[test]
+fn an_exact_tie_at_the_sixteenth_digit_goes_toward_zero() {
+    for (v, whole) in [
+        (1234567890123405.0, "1234567890123400"),
+        (1234567890123415.0, "1234567890123410"),
+        (1234567890123425.0, "1234567890123420"),
+        (1234567890123435.0, "1234567890123430"),
+        (1234567890123455.0, "1234567890123450"),
+        (1234567890123475.0, "1234567890123470"),
+        (1234567890123495.0, "1234567890123490"),
+        (6631679258820775.0, "6631679258820770"),
+        (8052991635850695.0, "8052991635850690"),
+    ] {
+        assert_eq!(f("0", v), whole, "0 over {v}");
+        assert_eq!(f("0.00", v), format!("{whole}.00"), "0.00 over {v}");
+        assert_eq!(f("0", -v), format!("-{whole}"), "0 over -{v}");
+    }
+    assert_eq!(f("#,##0", 1234567890123455.0), "1,234,567,890,123,450");
+    assert_eq!(f("#,##0", -3267527853107975.0), "-3,267,527,853,107,970");
+    // A fraction is a tie as well, when it is exact in binary.
+    assert_eq!(f("0", 123456789012345.5), "123456789012345");
+    assert_eq!(f("0.00", 123456789012345.5), "123456789012345.00");
+    // Excel observed: no carry after fifteen 9s.
+    assert_eq!(f("0", 999999999999999.5), "999999999999999");
+    assert_eq!(f("0", -999999999999999.5), "-999999999999999");
+    assert_eq!(f("0", 4999999999999995.0), "4999999999999990");
+    assert_eq!(f("#,##0", -4999999999999995.0), "-4,999,999,999,999,990");
+}
+
+#[test]
+fn only_exact_ties_go_toward_zero() {
+    // Just above and just below a tie round to the nearer 15-digit value (Excel observed).
+    assert_eq!(f("0", 1234567890123455.0 + 0.25), "1234567890123460");
+    assert_eq!(f("0", 1234567890123455.5), "1234567890123460");
+    assert_eq!(f("0", 1234567890123455.0 - 0.25), "1234567890123450");
+    // 16 digits that are not a tie, and the ordinary decimal cases, are untouched.
+    assert_eq!(f("0", 1234567890123456.0), "1234567890123460");
+    assert_eq!(f("0", 1234567890123454.0), "1234567890123450");
+    assert_eq!(f("0.00", 2.675), "2.68");
+    assert_eq!(f("0.00", 1.005), "1.01");
+    assert_eq!(f("0.0", 0.285), "0.3");
+    assert_eq!(f("0.0", 99999999999999.95), "100000000000000.0");
+    // Ten digits and a half are not a 16th-digit tie.
+    assert_eq!(f("0", 0.5), "1");
+    assert_eq!(f("0", 2.5), "3");
+}
+
+#[test]
+fn decimal_digits_keeps_fifteen_digits_and_truncates_a_tie() {
+    use crate::decimal::decimal_digits;
+    let (d, e) = decimal_digits(1234567890123455.0);
+    assert_eq!((d, e), ([1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5], 15));
+    let (d, e) = decimal_digits(1234567890123456.0);
+    assert_eq!((d, e), ([1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 6], 15));
+    let (d, e) = decimal_digits(123456789012345.5);
+    assert_eq!((d, e), ([1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5], 14));
+    // Excel observed: a tie after fifteen 9s does not carry (999999999999999.5 shows 999999999999999).
+    let (d, e) = decimal_digits(999999999999999.5);
+    assert_eq!((d, e), ([9; 15], 14));
+    let (d, e) = decimal_digits(4999999999999995.0);
+    assert_eq!((d, e), ([4, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9], 15));
+    // A 16th digit above 5 carries as usual.
+    let (d, e) = decimal_digits(999999999999999.6);
+    assert_eq!((d, e), ([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 15));
 }

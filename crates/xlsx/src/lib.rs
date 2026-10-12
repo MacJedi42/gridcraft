@@ -1,4 +1,5 @@
-//! GridCraft file formats: XLSX (transitional and strict) and CSV import/export, plus XLSB and ODS data import.
+//! GridCraft file formats: XLSX (transitional and strict) and CSV import/export, plus XLSB and ODS data import
+//! and legacy Excel 97-2003 `.xls` (BIFF8) import, and password-encrypted workbooks (Agile and Standard encryption).
 //!
 //! Clean-room implementation from ECMA-376 / ISO/IEC 29500 and observed behaviour. All entry
 //! points work on byte slices (no file system access), so the crate builds for WebAssembly.
@@ -14,11 +15,14 @@ mod array_formula;
 mod cfb;
 mod chart;
 mod chartex;
+mod crypto;
 mod csv;
 mod drawing;
+mod feature_bags;
 mod fmla;
 mod ods;
 mod package;
+mod passthrough;
 mod pivot;
 mod read;
 mod richdata;
@@ -26,8 +30,11 @@ mod sheet_read;
 mod sheet_write;
 mod styles;
 mod tables;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 mod theme;
 mod write;
+mod xls;
 mod xlsb;
 mod xml;
 
@@ -37,8 +44,10 @@ mod tests;
 use gridcraft_core::DateSystem;
 use gridcraft_model::Workbook;
 
+pub use crypto::{DecryptError, check_encryption, decrypt};
 pub use csv::{read_csv, write_csv};
 pub use ods::read_ods;
+pub use xls::read_xls;
 pub use xlsb::read_xlsb;
 
 /// Errors from reading or writing files.
@@ -69,14 +78,63 @@ impl ReadReport {
     }
 }
 
-/// Reads an `.xlsx` / `.xlsm` package.
+/// Reads an `.xlsx` / `.xlsm` / `.xltx` / `.xltm` package (the workbook part is found through the
+/// package relationships, so every main-part content type is accepted).
 pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
     read::read_xlsx(bytes)
 }
 
-/// Writes a workbook as an `.xlsx` package.
+/// Which member of the SpreadsheetML family a package is saved as. Only the content type of the
+/// workbook part differs (ECMA-376 Part 1 Workbook part; MS-OI29500 adds the macro-enabled types).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum XlsxKind {
+    /// `.xlsx`
+    #[default]
+    Workbook,
+    /// `.xlsm`
+    MacroWorkbook,
+    /// `.xltx`
+    Template,
+    /// `.xltm`
+    MacroTemplate,
+}
+
+impl XlsxKind {
+    /// The kind a file name's extension asks for; anything else is a plain workbook.
+    pub fn from_path(path: &str) -> XlsxKind {
+        let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+        match ext.as_str() {
+            "xlsm" => XlsxKind::MacroWorkbook,
+            "xltx" => XlsxKind::Template,
+            "xltm" => XlsxKind::MacroTemplate,
+            _ => XlsxKind::Workbook,
+        }
+    }
+
+    /// Content type of `/xl/workbook.xml`.
+    pub fn main_content_type(self) -> &'static str {
+        match self {
+            XlsxKind::Workbook => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+            XlsxKind::MacroWorkbook => "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+            XlsxKind::Template => "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml",
+            XlsxKind::MacroTemplate => "application/vnd.ms-excel.template.macroEnabled.main+xml",
+        }
+    }
+
+    /// Whether this kind may carry a VBA project (`.xlsm`, `.xltm`).
+    pub fn is_macro_enabled(self) -> bool {
+        matches!(self, XlsxKind::MacroWorkbook | XlsxKind::MacroTemplate)
+    }
+}
+
+/// Writes a workbook as an `.xlsx` package, or as an `.xlsm` one when it holds a VBA project.
 pub fn write_xlsx(wb: &Workbook) -> Result<Vec<u8>, IoError> {
-    write::write_xlsx(wb)
+    write::write_xlsx(wb, if wb.vba_project.is_some() { XlsxKind::MacroWorkbook } else { XlsxKind::Workbook })
+}
+
+/// Writes a workbook as the given member of the `.xlsx` family.
+pub fn write_xlsx_as(wb: &Workbook, kind: XlsxKind) -> Result<Vec<u8>, IoError> {
+    write::write_xlsx(wb, kind)
 }
 
 /// CSV import options.
@@ -105,7 +163,9 @@ pub enum Format {
     Csv,
     /// A password-protected (encrypted) workbook: a compound file with an `EncryptedPackage`.
     Encrypted,
-    /// Another compound (CFB/OLE2) file: an Excel 97-2003 `.xls` or other legacy Office binary.
+    /// An Excel 97-2003 `.xls` workbook: a compound file with a `Workbook` (or BIFF5 `Book`) stream.
+    Xls,
+    /// Another compound (CFB/OLE2) file: a legacy Office binary that isn't an Excel workbook.
     LegacyBinary,
     Unknown,
 }
@@ -122,9 +182,16 @@ pub fn sniff(bytes: &[u8]) -> Format {
         };
     }
     // CFB/OLE2 compound file: a password-protected workbook when it holds an encryption
-    // stream, otherwise a legacy binary (.xls, .doc…).
+    // stream, an Excel 97-2003 workbook when it holds a workbook stream, otherwise another
+    // legacy binary (.doc…).
     if bytes.starts_with(&cfb::SIGNATURE) {
-        return if cfb::is_encrypted(bytes) { Format::Encrypted } else { Format::LegacyBinary };
+        return if cfb::is_encrypted(bytes) {
+            Format::Encrypted
+        } else if xls::is_xls(bytes) {
+            Format::Xls
+        } else {
+            Format::LegacyBinary
+        };
     }
     if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) || bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         return Format::Csv;

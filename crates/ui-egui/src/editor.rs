@@ -213,7 +213,7 @@ pub fn formula_refs(text: &str) -> Vec<(usize, usize, RangeRef, Option<String>, 
         {
             let mut end = toks[j].end;
             let mut range = RangeRef::cell(c);
-            if let (Some(Tok::Colon), Some(Tok::Word(w2))) = (toks.get(j + 1).map(|t| &t.tok), toks.get(j + 2).map(|t| &t.tok))
+            if let (Some(Tok::Colon | Tok::Trim(_)), Some(Tok::Word(w2))) = (toks.get(j + 1).map(|t| &t.tok), toks.get(j + 2).map(|t| &t.tok))
                 && let Some(c2) = CellRef::parse(w2)
             {
                 range = RangeRef::new(c, c2);

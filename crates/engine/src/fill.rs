@@ -13,6 +13,9 @@ use crate::cmd::Ctx;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FillMode {
     Series,
+    /// The Ctrl+drag fill: the opposite of a plain drag. A lone number fills a
+    /// series stepping by 1; anything a plain drag would extend is copied.
+    Alternate,
     Copy,
     Formats,
     ValuesOnly,
@@ -62,13 +65,14 @@ pub fn fill(cx: &mut Ctx, sheet: usize, src: RangeRef, target: RangeRef, mode: F
                 if forward { (src.end.col + 1..=target.end.col).collect() } else { (target.start.col..src.start.col).rev().collect() };
             cols.into_iter().map(|c| CellRef::new(lane, c)).collect()
         };
-        let pattern = if mode == FillMode::Series {
-            Pattern::detect(
+        let pattern = if matches!(mode, FillMode::Series | FillMode::Alternate) {
+            let detected = Pattern::detect(
                 &src_cells,
                 &custom,
                 cx.wb.date_system,
                 cx.wb.styles.get(src_cells.first().and_then(|c| c.1.as_ref()).map(|c| c.style).unwrap_or_default()).num_fmt.as_str(),
-            )
+            );
+            if mode == FillMode::Alternate { detected.alternate(&src_cells) } else { detected }
         } else {
             Pattern::Copy
         };
@@ -84,7 +88,7 @@ pub fn fill(cx: &mut Ctx, sheet: usize, src: RangeRef, target: RangeRef, mode: F
                     writes.push((*t, Some(existing)));
                     continue;
                 }
-                FillMode::ValuesOnly | FillMode::Series | FillMode::Copy => {
+                FillMode::ValuesOnly | FillMode::Series | FillMode::Alternate | FillMode::Copy => {
                     let style = if mode == FillMode::ValuesOnly { sh.cell(*t).map(|c| c.style).unwrap_or_default() } else { cell.style };
                     if let Some(f) = &cell.formula {
                         if let Some(e) = f.expr() {
@@ -229,6 +233,19 @@ impl Pattern {
             }
         }
         Pattern::Copy
+    }
+
+    /// The pattern of a Ctrl+drag, which swaps copying and extending: a single
+    /// number (which a plain drag copies) counts up by 1, and every series a
+    /// plain drag would extend (numbers, dates, lists, `Item 1`) is copied.
+    fn alternate(self, cells: &[(CellRef, Option<Cell>)]) -> Pattern {
+        match (self, cells) {
+            (Pattern::Copy, [(_, Some(cell))]) if cell.formula.is_none() => match cell.value.as_f64() {
+                Some(n) if cell.value.is_number() => Pattern::Linear { last: n, first: n, step: 1.0 },
+                _ => Pattern::Copy,
+            },
+            _ => Pattern::Copy,
+        }
     }
 
     /// The value `k` steps beyond the source (forward) or before it (backward).

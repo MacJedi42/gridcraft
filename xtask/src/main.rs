@@ -7,6 +7,7 @@
 
 mod assets;
 mod ico;
+mod keytips;
 mod layers;
 #[cfg_attr(not(feature = "engine"), allow(dead_code))]
 mod parity;
@@ -27,6 +28,8 @@ commands:
   wasm            cargo check --target wasm32-unknown-unknown for the L0-L5 crates (+ gridcraft-web)
   parity [--check] [--out PATH]
                   write docs/parity-checklist.md from gridcraft_engine::catalog (implemented vs missing ids)
+  keytips [--check]
+                  regenerate crates/ui-egui/src/keytips/generated.rs from keytips.json (--check: fail if stale)
   version [set X.Y.Z[-pre]]
                   print or set the workspace version ([workspace.package] in Cargo.toml)
   stats [--exact] count tests and lines per crate (--exact: ask the test harness via `-- --list`)
@@ -44,6 +47,7 @@ fn main() -> ExitCode {
         Some("ci") => cmd_ci(),
         Some("stats") => stats::run(&root(), rest.contains(&"--exact")),
         Some("parity") => parity::run(&root(), &rest),
+        Some("keytips") => keytips::run(&root(), &rest),
         Some("ico") => ico::run(&rest),
         Some("version") => version::run(&root(), &rest),
         Some("-h" | "--help" | "help") | None => {
@@ -194,6 +198,7 @@ fn cmd_ci() -> Result<(), String> {
                 }
             }),
         ),
+        ("keytips", Box::new(|| keytips::run(&root(), &["--check"]))),
     ];
     let mut done = Vec::new();
     for (name, f) in &steps {

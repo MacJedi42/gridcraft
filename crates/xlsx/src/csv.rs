@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use gridcraft_core::parse::parse_input;
-use gridcraft_core::{CellRef, MAX_COLS, MAX_ROWS, Value, number_to_text};
+use gridcraft_core::{CellRef, MAX_COLS, MAX_ROWS, Value};
 use gridcraft_model::{Cell, NumFmt, Sheet, StyleId, Workbook};
 
 use crate::{CsvOptions, IoError};
@@ -139,6 +139,7 @@ pub fn read_csv(bytes: &[u8], opts: &CsvOptions) -> Result<Workbook, IoError> {
     }
     let mut wb = Workbook::new();
     wb.date_system = opts.date_system;
+    wb.csv_delimiter = u8::try_from(delim).ok();
     let mut sheet = Sheet::new("Sheet1");
     let mut styles = std::mem::take(&mut wb.styles);
     let mut fmt_cache: Vec<(&'static str, StyleId)> = vec![];
@@ -183,20 +184,10 @@ pub fn read_csv(bytes: &[u8], opts: &CsvOptions) -> Result<Workbook, IoError> {
     Ok(wb)
 }
 
-fn field_text(v: &Value) -> String {
-    match v {
-        Value::Empty => String::new(),
-        Value::Number(n) => number_to_text(*n),
-        Value::Text(t) => t.to_string(),
-        Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.into(),
-        Value::Error(e) => e.as_str().into(),
-        Value::Array(a) => a.get(0, 0).map(field_text).unwrap_or_default(),
-    }
-}
-
-/// Writes the sheet's used range as CSV (raw values, CRLF line ends, UTF-8 without BOM).
-pub fn write_csv(sheet: &Sheet, wb: &Workbook, delimiter: u8) -> Vec<u8> {
-    let _ = wb;
+/// Writes the sheet's used range as CSV (CRLF line ends, UTF-8 without BOM). `cell_text` gives
+/// each cell's field text: the caller decides how values look (Save As CSV writes them as
+/// displayed, number formats applied); quoting is done here.
+pub fn write_csv(sheet: &Sheet, delimiter: u8, mut cell_text: impl FnMut(CellRef) -> String) -> Vec<u8> {
     let delim = if delimiter == 0 { ',' } else { delimiter as char };
     let mut out = String::new();
     let Some(r) = sheet.used_range() else { return Vec::new() };
@@ -205,7 +196,7 @@ pub fn write_csv(sheet: &Sheet, wb: &Workbook, delimiter: u8) -> Vec<u8> {
             if col > r.start.col {
                 out.push(delim);
             }
-            let t = field_text(&sheet.value(CellRef::new(row, col)));
+            let t = cell_text(CellRef::new(row, col));
             if t.contains(delim) || t.contains('"') || t.contains('\n') || t.contains('\r') {
                 out.push('"');
                 out.push_str(&t.replace('"', "\"\""));

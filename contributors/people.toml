@@ -28,3 +28,36 @@ sync_github_name = false
 
 [people.edurbs]
 sync_github_name = true
+
+[people.arcanii]
+real_name = "Bryan Mark"
+display_name = "Arcanii"
+sync_github_name = false
+
+[people.vangel76]
+real_name = "Valentin Klein"
+sync_github_name = true
+
+[people.MacJedi42]
+sync_github_name = true
+
+[people.alexanderalber]
+real_name = "Alexander Alber"
+
+[people.webdevtodayjason]
+display_name = "Jason Brashear"
+sync_github_name = false
+
+[people.Losminek]
+sync_github_name = true
+
+[people.GhostMitra]
+sync_github_name = true
+
+[people.shrshk]
+real_name = "Shirish Veerabattini"
+sync_github_name = true
+[people.jsymes21-byte]
+real_name = "James Symes"
+sync_github_name = true
+

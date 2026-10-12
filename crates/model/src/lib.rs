@@ -8,6 +8,8 @@ mod b64;
 pub mod cell;
 mod cellmap;
 pub mod features;
+pub mod password;
+pub mod preserved;
 pub mod sheet;
 pub mod store;
 pub mod style;
@@ -15,7 +17,9 @@ pub mod workbook;
 
 pub use cell::{Cell, CellPicture, Formula};
 pub use features::*;
-pub use sheet::{DEFAULT_COL_WIDTH, DEFAULT_ROW_HEIGHT, LineIndex, Sheet, Visibility};
+pub use password::PasswordHash;
+pub use preserved::{Preserved, PreservedPart, PreservedRel, PreservedXml};
+pub use sheet::{DEFAULT_COL_WIDTH, DEFAULT_ROW_HEIGHT, LineIndex, Sheet, SheetViewMode, Visibility};
 pub use store::CellStore;
 pub use style::{
     Alignment, BorderLine, BorderStyle, Borders, Color, Fill, Font, HAlign, NumFmt, PatternType, Style, StyleId, StyleTable, Theme, Underline,

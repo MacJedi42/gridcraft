@@ -5,11 +5,11 @@ use std::fmt::Write as _;
 
 use gridcraft_core::RangeRef;
 use gridcraft_formula::quote_sheet;
-use gridcraft_model::{CalcMode, Style, Visibility, Workbook};
+use gridcraft_model::{CalcMode, CalcSettings, Style, Visibility, Workbook};
 
-use crate::IoError;
 use crate::package::ZipOut;
 use crate::xml::{esc, esc_attr};
+use crate::{IoError, XlsxKind};
 
 pub const NS_MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 pub const NS_REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
@@ -20,6 +20,13 @@ pub const CT_DRAWING: &str = "application/vnd.openxmlformats-officedocument.draw
 pub const CT_CHART: &str = "application/vnd.openxmlformats-officedocument.drawingml.chart+xml";
 pub const CT_TABLE: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml";
 pub const CT_COMMENTS: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml";
+pub const CT_VBA: &str = "application/vnd.ms-office.vbaProject";
+pub const CT_THREADED_COMMENTS: &str = "application/vnd.ms-excel.threadedcomments+xml";
+pub const CT_PERSONS: &str = "application/vnd.ms-excel.person+xml";
+pub const REL_THREADED_COMMENT: &str = "http://schemas.microsoft.com/office/2017/10/relationships/threadedComment";
+pub const REL_PERSON: &str = "http://schemas.microsoft.com/office/2017/10/relationships/person";
+/// Namespace of the threaded comments and persons parts ([MS-XLSX]).
+pub const NS_THREADED: &str = "http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments";
 
 /// A part's relationships.
 #[derive(Default)]
@@ -33,6 +40,9 @@ impl Rels {
         let id = format!("rId{}", self.items.len() + 1);
         let ty = match kind {
             "core-properties" => "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties".to_string(),
+            // The VBA project relationship lives in the Microsoft-documented namespace, not the
+            // OpenXML one; Excel rejects the file if this type is wrong.
+            "vbaProject" => "http://schemas.microsoft.com/office/2006/relationships/vbaProject".to_string(),
             k => format!("{NS_REL}/{k}"),
         };
         self.items.push((id.clone(), ty, target.to_string(), false));
@@ -47,6 +57,12 @@ impl Rels {
     pub fn add_uri(&mut self, ty: &str, target: &str) -> String {
         let id = format!("rId{}", self.items.len() + 1);
         self.items.push((id.clone(), ty.to_string(), target.to_string(), false));
+        id
+    }
+    /// Adds a relationship with its complete type URI, internal or external (kept content).
+    pub fn add_raw(&mut self, ty: &str, target: &str, external: bool) -> String {
+        let id = format!("rId{}", self.items.len() + 1);
+        self.items.push((id.clone(), crate::xml::esc_attr(ty), target.to_string(), external));
         id
     }
     pub fn is_empty(&self) -> bool {
@@ -102,10 +118,14 @@ pub struct Out {
     pub drawings: u32,
     pub tables: u32,
     pub comments: u32,
+    /// Authors of threaded comments, in first-use order; written to `xl/persons/person.xml`.
+    pub persons: Vec<String>,
     pub table_id: u32,
     pub dynamic_arrays: bool,
     pub needs_calc: bool,
     pub cell_pictures: crate::richdata::PicturesOut,
+    /// Kept (pass-through) parts written so far.
+    pub kept: crate::passthrough::KeptOut,
 }
 
 impl Out {
@@ -118,6 +138,12 @@ impl Out {
     pub fn default_type(&mut self, ext: &str, ct: &str) {
         self.defaults.entry(ext.to_string()).or_insert_with(|| ct.to_string());
     }
+}
+
+/// Id of the i-th person of `xl/persons/person.xml`: a GUID-shaped, deterministic id (the
+/// file only needs ids that are unique within it).
+pub fn person_guid(i: usize) -> String {
+    format!("{{00000000-0000-4000-8002-{:012X}}}", i as u64 & 0xFFFF_FFFF_FFFF)
 }
 
 /// `$A$1:$D$20` (or `$1:$3` / `$A:$C`).
@@ -135,7 +161,7 @@ pub fn abs_range(r: &RangeRef) -> String {
     format!("${}${}:${}${}", c(r.start.col), r.start.row + 1, c(r.end.col), r.end.row + 1)
 }
 
-pub fn write_xlsx(wb: &Workbook) -> Result<Vec<u8>, IoError> {
+pub fn write_xlsx(wb: &Workbook, kind: XlsxKind) -> Result<Vec<u8>, IoError> {
     if wb.sheets.is_empty() {
         return Err(IoError::Format("a workbook needs at least one sheet".into()));
     }
@@ -154,10 +180,12 @@ pub fn write_xlsx(wb: &Workbook) -> Result<Vec<u8>, IoError> {
         drawings: 0,
         tables: 0,
         comments: 0,
+        persons: vec![],
         table_id: 0,
         dynamic_arrays: false,
         needs_calc: false,
         cell_pictures: Default::default(),
+        kept: Default::default(),
     };
     out.default_type("rels", "application/vnd.openxmlformats-package.relationships+xml");
     out.default_type("xml", "application/xml");
@@ -244,9 +272,11 @@ pub fn write_xlsx(wb: &Workbook) -> Result<Vec<u8>, IoError> {
     let mut w = format!("{XML_DECL}<workbook xmlns=\"{NS_MAIN}\" xmlns:r=\"{NS_REL}\">");
     w.push_str(if wb.date_system == gridcraft_core::DateSystem::D1904 { "<workbookPr date1904=\"1\"/>" } else { "<workbookPr/>" });
     if wb.protected_structure {
-        w.push_str("<workbookProtection lockStructure=\"1\"/>");
+        let pw = wb.structure_password.as_ref().map(|h| crate::sheet_write::password_attrs(h, "workbook")).unwrap_or_default();
+        let _ = write!(w, "<workbookProtection{pw} lockStructure=\"1\"/>");
     }
     let _ = write!(w, "<bookViews><workbookView activeTab=\"{active}\"/></bookViews><sheets>{sheets_xml}</sheets>");
+    w.push_str(&crate::passthrough::write_workbook(wb, &mut wb_rels, &mut out));
     if !names.is_empty() {
         let _ = write!(w, "<definedNames>{names}</definedNames>");
     }
@@ -256,8 +286,17 @@ pub fn write_xlsx(wb: &Workbook) -> Result<Vec<u8>, IoError> {
         CalcMode::Manual => w.push_str(" calcMode=\"manual\""),
         CalcMode::AutomaticExceptTables => w.push_str(" calcMode=\"autoNoTable\""),
     }
-    if wb.calc.iterative {
-        let _ = write!(w, " iterate=\"1\" iterateCount=\"{}\" iterateDelta=\"{}\"", wb.calc.max_iterations, crate::xml::num(wb.calc.max_change));
+    // CT_CalcPr defaults: iterate off, 100 iterations, 0.001 maximum change. The limits are kept
+    // while iteration is off, as Options keeps them.
+    let calc = &wb.calc;
+    if calc.iterative {
+        w.push_str(" iterate=\"1\"");
+    }
+    if calc.iterative || calc.max_iterations != CalcSettings::DEFAULT_ITERATIONS {
+        let _ = write!(w, " iterateCount=\"{}\"", calc.max_iterations);
+    }
+    if calc.iterative || calc.max_change != CalcSettings::DEFAULT_CHANGE {
+        let _ = write!(w, " iterateDelta=\"{}\"", crate::xml::num(calc.max_change));
     }
     if wb.calc.precision_as_displayed {
         w.push_str(" fullPrecision=\"0\"");
@@ -274,6 +313,11 @@ pub fn write_xlsx(wb: &Workbook) -> Result<Vec<u8>, IoError> {
     pivots.finish(wb, &mut out, &|code: &str| crate::tables::builtin_id(code).or_else(|| fmt_ids.get(code).copied()));
     out.part("xl/styles.xml", Some("application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"), styles.into_bytes());
     wb_rels.add("styles", "styles.xml");
+    if wb.styles.iter().any(|(_, st)| st.num_fmt.as_str() == "checkbox") {
+        use crate::feature_bags as fpb;
+        out.part(fpb::PART, Some(fpb::CONTENT_TYPE), fpb::checkbox_part().into_bytes());
+        wb_rels.add_uri(fpb::REL, "featurePropertyBag/featurePropertyBag.xml");
+    }
     out.part(
         "xl/theme/theme1.xml",
         Some("application/vnd.openxmlformats-officedocument.theme+xml"),
@@ -297,7 +341,22 @@ pub fn write_xlsx(wb: &Workbook) -> Result<Vec<u8>, IoError> {
         );
         wb_rels.add("sheetMetadata", "metadata.xml");
     }
-    out.part("xl/workbook.xml", Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"), w.into_bytes());
+    if !out.persons.is_empty() {
+        let mut x = format!("{XML_DECL}<personList xmlns=\"{NS_THREADED}\" xmlns:x=\"{NS_MAIN}\">");
+        for (i, name) in out.persons.iter().enumerate() {
+            let n = esc_attr(name);
+            let _ = write!(x, "<person displayName=\"{n}\" id=\"{}\" userId=\"{n}\" providerId=\"None\"/>", person_guid(i));
+        }
+        x.push_str("</personList>");
+        out.part("xl/persons/person.xml", Some(CT_PERSONS), x.into_bytes());
+        wb_rels.add_uri(REL_PERSON, "persons/person.xml");
+    }
+    out.part("xl/workbook.xml", Some(kind.main_content_type()), w.into_bytes());
+    // A macro-free package can't hold a VBA project (Excel refuses such a file).
+    if let Some(data) = wb.vba_project.as_ref().filter(|_| kind.is_macro_enabled()) {
+        wb_rels.add("vbaProject", "vbaProject.bin");
+        out.part("xl/vbaProject.bin", Some(CT_VBA), data.clone());
+    }
     out.part("xl/_rels/workbook.xml.rels", None, wb_rels.xml().into_bytes());
 
     // Document properties.
@@ -329,15 +388,17 @@ pub fn write_xlsx(wb: &Workbook) -> Result<Vec<u8>, IoError> {
     root.add("officeDocument", "xl/workbook.xml");
     root.add("core-properties", "docProps/core.xml");
     root.add("extended-properties", "docProps/app.xml");
+    crate::passthrough::write_package_rels(&mut root, &mut out);
     out.part("_rels/.rels", None, root.xml().into_bytes());
 
     // Content types first, then the parts in creation order.
     let mut ct = format!("{XML_DECL}<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">");
     for (ext, t) in &out.defaults {
-        let _ = write!(ct, "<Default Extension=\"{ext}\" ContentType=\"{t}\"/>");
+        // Kept parts bring their content types (and extensions) from the input file: escape them.
+        let _ = write!(ct, "<Default Extension=\"{}\" ContentType=\"{}\"/>", esc_attr(ext), esc_attr(t));
     }
     for (part, t) in &out.overrides {
-        let _ = write!(ct, "<Override PartName=\"{}\" ContentType=\"{t}\"/>", esc_attr(part));
+        let _ = write!(ct, "<Override PartName=\"{}\" ContentType=\"{}\"/>", esc_attr(part), esc_attr(t));
     }
     ct.push_str("</Types>");
     let mut zip = ZipOut::new();

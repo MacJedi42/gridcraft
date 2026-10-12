@@ -9,17 +9,70 @@ pub(crate) const MAX_DECIMALS: usize = 400;
 
 /// The 15 significant digits of a positive finite number and the power of ten of the first
 /// digit: `a ≈ d0.d1d2… × 10^exp`.
+///
+/// The value is rounded to the nearest 15-digit decimal. An exact tie at the 16th digit (the exact
+/// decimal expansion is 15 digits, a 5, then only zeros, as for 1234567890123455 or
+/// 123456789012345.5) goes toward zero, as Excel does: `1234567890123455` shows `1234567890123450`,
+/// not `…460`. Excel observed (Windows 16.0.20430, TEXT()).
 pub(crate) fn decimal_digits(a: f64) -> ([u8; 15], i32) {
     let mut digits = [0u8; 15];
     if !a.is_finite() || a <= 0.0 {
         return (digits, 0);
     }
-    let s = format!("{:.14e}", a);
-    let (mant, exp) = s.split_once('e').unwrap_or((s.as_str(), "0"));
-    for (slot, b) in digits.iter_mut().zip(mant.bytes().filter(u8::is_ascii_digit)) {
-        *slot = b - b'0';
+    // 16 digits, rounded. Unless the 16th is a 5 it decides the 15th exactly (4 or less rounds
+    // down, 6 or more up), so one format serves almost every number.
+    let (d16, exp) = significant_digits(a, 16);
+    for (slot, d) in digits.iter_mut().zip(&d16) {
+        *slot = *d;
     }
-    (digits, exp.parse().unwrap_or(0))
+    match d16.get(15).copied().unwrap_or(0) {
+        0..=4 => (digits, exp),
+        5 if is_exact_tie(a) => (digits, exp),
+        5 => {
+            // Not a tie: round the exact value (the 16-digit rounding above may be a double rounding).
+            let (d15, exp15) = significant_digits(a, 15);
+            let mut out = [0u8; 15];
+            for (slot, d) in out.iter_mut().zip(&d15) {
+                *slot = *d;
+            }
+            (out, exp15)
+        }
+        _ => {
+            let mut exp = exp;
+            let mut carry = true;
+            for d in digits.iter_mut().rev() {
+                if *d == 9 {
+                    *d = 0;
+                } else {
+                    *d += 1;
+                    carry = false;
+                    break;
+                }
+            }
+            if carry {
+                digits = [0; 15];
+                digits[0] = 1;
+                exp += 1;
+            }
+            (digits, exp)
+        }
+    }
+}
+
+/// `n` significant digits of `a` (rounded half to even on the exact binary value) and the power of
+/// ten of the first.
+fn significant_digits(a: f64, n: usize) -> (Vec<u8>, i32) {
+    let s = format!("{:.*e}", n.saturating_sub(1), a);
+    let (mant, exp) = s.split_once('e').unwrap_or((s.as_str(), "0"));
+    (mant.bytes().filter(u8::is_ascii_digit).map(|b| b - b'0').collect(), exp.parse().unwrap_or(0))
+}
+
+/// True when `a`'s exact decimal expansion has a 5 as its 16th significant digit and only zeros after.
+fn is_exact_tie(a: f64) -> bool {
+    let is_tie = |ds: &[u8]| ds.get(15) == Some(&5) && ds.get(16..).is_some_and(|t| t.iter().all(|&d| d == 0));
+    // A cheap screen first (30 digits), then the exact expansion: a double has at most 767
+    // significant digits and Rust prints every one of them.
+    is_tie(&significant_digits(a, 30).0) && is_tie(&significant_digits(a, 800).0)
 }
 
 /// Rounds the number `digits × 10^exp` (see [`decimal_digits`]) to `decimals` places, half away

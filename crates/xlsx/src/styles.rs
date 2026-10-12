@@ -274,7 +274,7 @@ fn num_fmt_code(id: u32, custom: &HashMap<u32, String>) -> NumFmt {
     NumFmt::new(builtin_format(id).unwrap_or("General"))
 }
 
-fn read_xf(xf: &El, fonts: &[Font], fills: &[Fill], borders: &[Borders], fmts: &HashMap<u32, String>) -> Style {
+fn read_xf(xf: &El, fonts: &[Font], fills: &[Fill], borders: &[Borders], fmts: &HashMap<u32, String>, checkboxes: &[bool]) -> Style {
     let mut s = Style::default();
     if let Some(f) = xf.attr_u32("fontId").and_then(|i| fonts.get(i as usize)) {
         s.font = f.clone();
@@ -288,6 +288,10 @@ fn read_xf(xf: &El, fonts: &[Font], fills: &[Fill], borders: &[Borders], fmts: &
         s.borders = *b;
     }
     s.num_fmt = num_fmt_code(xf.attr_u32("numFmtId").unwrap_or(0), fmts);
+    // A checkbox cell control (Insert › Checkbox) is a feature-property-bag complement on the xf.
+    if crate::feature_bags::xf_is_checkbox(xf, checkboxes) {
+        s.num_fmt = NumFmt::new("checkbox");
+    }
     if let Some(a) = xf.child("alignment") {
         s.align = read_alignment(a);
     }
@@ -297,7 +301,9 @@ fn read_xf(xf: &El, fonts: &[Font], fills: &[Fill], borders: &[Borders], fmts: &
     s
 }
 
-pub fn read_styles(root: &El) -> StylesIn {
+/// `checkboxes`: for each `xfComplement` index, whether it is a checkbox (see
+/// [`crate::feature_bags::checkbox_complements`]); empty when the file has no feature property bags.
+pub fn read_styles(root: &El, checkboxes: &[bool]) -> StylesIn {
     let mut palette: Vec<u32> = INDEXED.to_vec();
     if let Some(ix) = root.path(&["colors", "indexedColors"]) {
         let custom: Vec<u32> = ix
@@ -322,9 +328,10 @@ pub fn read_styles(root: &El) -> StylesIn {
     let fonts: Vec<Font> = root.child("fonts").map(|f| f.kids("font").map(|e| read_font(e, &palette)).collect()).unwrap_or_default();
     let fills: Vec<Fill> = root.child("fills").map(|f| f.kids("fill").map(|e| read_fill(e, &palette, false)).collect()).unwrap_or_default();
     let borders: Vec<Borders> = root.child("borders").map(|f| f.kids("border").map(|e| read_border(e, &palette)).collect()).unwrap_or_default();
-    let xfs = root.child("cellXfs").map(|x| x.kids("xf").map(|xf| read_xf(xf, &fonts, &fills, &borders, &fmts)).collect()).unwrap_or_default();
+    let xfs =
+        root.child("cellXfs").map(|x| x.kids("xf").map(|xf| read_xf(xf, &fonts, &fills, &borders, &fmts, checkboxes)).collect()).unwrap_or_default();
     let style_xfs: Vec<Style> =
-        root.child("cellStyleXfs").map(|x| x.kids("xf").map(|xf| read_xf(xf, &fonts, &fills, &borders, &fmts)).collect()).unwrap_or_default();
+        root.child("cellStyleXfs").map(|x| x.kids("xf").map(|xf| read_xf(xf, &fonts, &fills, &borders, &fmts, &[])).collect()).unwrap_or_default();
     let mut named = Vec::new();
     if let Some(cs) = root.child("cellStyles") {
         for c in cs.kids("cellStyle") {
@@ -587,7 +594,9 @@ pub fn write_styles(wb: &Workbook, dxfs: &[Style], extra_fmts: &[String]) -> (St
         let font = intern(&mut fonts, &mut font_map, &st.font);
         let fill = intern(&mut fills, &mut fill_map, &st.fill);
         let border = intern(&mut borders, &mut border_map, &st.borders);
-        let fmt = nf.id(st.num_fmt.as_str());
+        // A checkbox is General plus the feature-property-bag complement (see `feature_bags`).
+        let checkbox = st.num_fmt.as_str() == "checkbox";
+        let fmt = if checkbox { 0 } else { nf.id(st.num_fmt.as_str()) };
         let _ = write!(xfs, "<xf numFmtId=\"{fmt}\" fontId=\"{font}\" fillId=\"{fill}\" borderId=\"{border}\" xfId=\"0\"");
         if fmt != 0 {
             xfs.push_str(" applyNumberFormat=\"1\"");
@@ -609,12 +618,15 @@ pub fn write_styles(wb: &Workbook, dxfs: &[Style], extra_fmts: &[String]) -> (St
         if pr.is_some() {
             xfs.push_str(" applyProtection=\"1\"");
         }
-        if al.is_none() && pr.is_none() {
+        if al.is_none() && pr.is_none() && !checkbox {
             xfs.push_str("/>");
         } else {
             xfs.push('>');
             xfs.push_str(&al.unwrap_or_default());
             xfs.push_str(&pr.unwrap_or_default());
+            if checkbox {
+                xfs.push_str(&crate::feature_bags::checkbox_xf_ext());
+            }
             xfs.push_str("</xf>");
         }
         count += 1;

@@ -176,8 +176,15 @@ pub(crate) fn sync_headers(cx: &mut crate::cmd::Ctx) {
         let Some(t) = sh.tables.get(ti) else { continue };
         let col = (c.col - t.range.start.col) as usize;
         let Some(old) = t.columns.get(col).map(|x| x.name.clone()) else { continue };
-        let text = crate::display::cell_text(&cx.wb, sh, c);
-        let is_text = sh.value(c).is_text();
+        // A text header names its column as it is: a number format only changes how it looks (an
+        // accounting format pads text with spaces), and the file writes the name into the cell.
+        let value = sh.value(c);
+        let text = match value.as_text() {
+            Some(t) => t.to_string(),
+            None => crate::display::cell_text(&cx.wb, sh, c),
+        };
+        // Headers hold constant text: a formula (or a spilled value) there becomes its text.
+        let is_text = value.is_text() && sh.cell(c).is_some_and(|x| x.formula.is_none());
         if text == old && is_text {
             continue;
         }

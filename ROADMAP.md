@@ -2,7 +2,7 @@
 
 **Stage: alpha** · next: beta, ~25 points of "ready for real work" and ~160–240 h away
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** major (full re-measure against Excel for Mac 16.113.4; restructured to the craftrules progress-docs standard) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-11 · **Change:** minor (password-encrypted workbooks open, #11) · **Target:** Microsoft Excel (Microsoft 365)
 
 GridCraft aims at full Microsoft Excel parity, and at being better in places: faster, open (XLSX
 is the native format), fully scriptable by agents (MCP, control channel, CLI), and on the web.
@@ -21,7 +21,7 @@ This page is the summary. The detail is in:
 
 | Number | Value | Kind |
 |---|---|---|
-| **Feature breadth** (weighted) | **~75%** | estimated, anchored on two measurements: ribbon catalog 258 / 290 (89.0%), worksheet functions 501 / 523 (95.8%; 492 working, 94.1%) |
+| **Feature breadth** (weighted) | **~75%** | estimated, anchored on two measurements: ribbon catalog 274 / 290 (94.5%), worksheet functions 513 / 523 (98.1%; 504 working, 96.4%) |
 | **Ready for real work** | **~50%** | estimated from written weights (51.6); [target-app-parity.md](docs/target-app-parity.md) |
 | **Mainstream practitioner** | **~50%** | estimated: typical analyst/finance user, weekly features, × 0.90 interaction × 0.92 stability × 0.88 file exchange; [method](docs/target-app-parity.md#mainstream-practitioner) |
 | **Essentials user** | **~63%** | estimated: core features only, × 0.92 launch/stability × 0.95 clarity × 0.90 opening sent files; [method](docs/target-app-parity.md#essentials-user) |
@@ -32,7 +32,7 @@ This page is the summary. The detail is in:
 |---|---|---|---|
 | Full target (ready for real work) | ~50% | ~650–1,050 | Get & Transform and the data model, localization (twelve languages), charts depth, file fidelity (`.xls`, corpus, pass-through), PivotTables, collaboration, mobile |
 | Mainstream practitioner | ~50% | ~200–310 | File exchange with Excel users (corpus and Excel verification, pass-through, large files, `.xls`, encryption: 63–97 h), common-chart depth (30–45 h), PivotTables (20–30 h), keyboard and interaction (18–28 h), calc correctness and functions (20–33 h) |
-| Essentials user | ~63% | ~60–100 | Opening files people send (`.xls` and encrypted import 28–42 h; macOS Finder open 2–4 h), launch stability (6–10 h), basic chart resize and polish (6–10 h), print and Page Layout (8–12 h), small editing and UI fixes (10–16 h) |
+| Essentials user | ~63% | ~60–100 | Opening files people send (`.xls` import and saving with a password 24–36 h; macOS Finder open 2–4 h), launch stability (6–10 h), basic chart resize and polish (6–10 h), print and Page Layout (8–12 h), small editing and UI fixes (10–16 h) |
 
 Each tier is a subset of the one above, so its hours are too. Calibrated as in [Effort and
 calibration](docs/target-app-parity.md#effort-and-calibration) (~6–10 h per readiness point for the remaining, verification-heavy
@@ -62,7 +62,7 @@ collaboration, mobile, AI).
 | File formats | ~50% | 80–120 | [file-format-parity.md](docs/file-format-parity.md) |
 | Performance | ~35% | 35–55 | [target-app-parity.md](docs/target-app-parity.md#performance) |
 | Stability | ~60% | 15–25 | [gaps.md](docs/gaps.md) |
-| Localization | ~10% (ribbon in 5 languages) | 100–165 | [localization-parity.md](docs/localization-parity.md) |
+| Localization | ~10% (ribbon in 6 languages) | 100–165 | [localization-parity.md](docs/localization-parity.md) |
 | Hardware (multi-core calc, GPU, pen, multi-window) | ~40% | 25–40 | [hardware-parity.md](docs/hardware-parity.md) |
 | Platforms | ~80% (no iOS/Android; ahead on Linux, BSD, RISC-V) | 30–60 | [target-app-parity.md](docs/target-app-parity.md#platforms) |
 | Ecosystem / add-ins | ~10% (VBA out of scope; own scripts, MCP, CLI) | 25–40 | [target-app-parity.md](docs/target-app-parity.md#ecosystem-and-ai) |
@@ -74,7 +74,7 @@ collaboration, mobile, AI).
 | Area | Breadth | Ready | Hours | Doc |
 |---|---|---|---|---|
 | Formula language and calculation | ~92% | ~72% | 20–30 | [target-app-parity.md](docs/target-app-parity.md#feature-areas) |
-| Worksheet functions | 95.8% measured | ~82% | 18–30 | [function-parity.md](docs/function-parity.md) |
+| Worksheet functions | 96.6% measured | ~82% | 16–26 | [function-parity.md](docs/function-parity.md) |
 | Editing, navigation, clipboard, fill | ~90% | ~70% | 15–25 | [ui-parity.md](docs/ui-parity.md) |
 | Cell formatting, styles, conditional formatting | ~95% | ~80% | 8–14 | [target-app-parity.md](docs/target-app-parity.md#feature-areas) |
 | Sort, filter, tables, validation, outline | ~82% | ~70% | 10–16 | [target-app-parity.md](docs/target-app-parity.md#feature-areas) |
@@ -89,11 +89,12 @@ collaboration, mobile, AI).
 
 ## Languages
 
-The ribbon is translated into Japanese, Simplified Chinese, Korean, Brazilian Portuguese and
-Russian (266–268 labels each, ~12% of ~2,200 strings; merged 10-10 in #31, #104, #82), the
+The ribbon is translated into Japanese, Simplified Chinese, Korean, Brazilian Portuguese, Russian
+and German (266–268 labels each, ~12% of ~2,200 strings; merged 10-10 in #31, #104, #82, German
+added 10-11), the
 interface follows the system language, and CJK, Thai and Hebrew text falls back to system fonts
-(#38). Dialogs, menus and messages are English; formulas and number formats are en-US only. German
-is in PR #163. Detail: [localization-parity.md](docs/localization-parity.md).
+(#38). Dialogs, menus and messages are English; formulas and number formats are en-US only.
+Localized German formulas and numbers are in PR #163. Detail: [localization-parity.md](docs/localization-parity.md).
 
 | Language | Code | Status | UI strings |
 |---|---|---|---|
@@ -106,11 +107,11 @@ is in PR #163. Detail: [localization-parity.md](docs/localization-parity.md).
 | Portuguese | pt-BR | menus only | ~12% |
 | Indonesian | id | none | 0% |
 | Japanese | ja | menus only | ~12% |
-| German | de | none (PR #163 open) | 0% |
+| German | de | menus only | ~12% |
 | Korean | ko | menus only | ~12% |
 | Vietnamese | vi | none | 0% |
 
-Other shipped languages: 1 (Russian, menus only, ~12%).
+Other shipped languages: 2 (Russian and German, menus only, ~12%).
 
 ## Upcoming
 
@@ -131,6 +132,40 @@ Ranked; estimates in Opus 5.5 agent-hours. Detail and the full beta-gate list in
 
 | Date | What landed |
 |---|---|
+| 2026-10-11 | Command-sequence fuzzing: random command sequences checked against undo/redo, XLSX round-trip and full recalculation; fixes for the table, legacy-array, spill, AutoSum, Watch Window and sheet-copy bugs it found |
+| 2026-10-11 | Password-protected workbooks open: GridCraft asks for the password and decrypts Agile and Standard encryption (#11) |
+| 2026-10-11 | Text boxes keep their formatting: run size, bold, italic, typeface, text colour and outline, alignment, vertical anchor and "no outline" (#377) |
+| 2026-10-11 | Desktop printing opens the print PDF in the system viewer; Save As offers CSV, web page and PDF; macOS File › Properties opens File › Info (#370, #343) |
+| 2026-10-11 | Windows: DirectX 12 shaders compile with FXC, so a missing or stray `dxcompiler.dll` no longer stops the app at start (#339, #354) |
+| 2026-10-11 | Merged cells draw their whole outline: right and bottom edges come from the last column's and last row's cells (#376) |
+| 2026-10-11 | Shrink to fit draws too-wide text and numbers in a smaller font inside the cell or merged area (#375) |
+| 2026-10-11 | Shift+Space and Ctrl+Space select the row / column without starting an edit; Control+Space on Mac (#338) |
+| 2026-10-11 | Workbooks reopen at their saved scroll position (`topLeftCell`, also with frozen panes) and save the current one back (#378) |
+| 2026-10-11 | Protect Sheet passwords use Excel-compatible hashes and round-trip in XLSX `sheetProtection` (imported passwords verify instead of being dropped) |
+| 2026-10-11 | Review › Protect Workbook opens a dialog with an optional password (Excel-compatible hash, kept in XLSX `workbookProtection`); unprotecting verifies it (#345) |
+| 2026-10-11 | Formula bar, name box and dialogs fall back to the cell font: Hebrew (and any script cells can show) no longer turns into boxes there (#349) |
+| 2026-10-11 | Headers and footers: first-page and odd/even variants are read, kept, printed and edited in Page Layout view; Insert › Header & Footer edits the header in place (#344) |
+| 2026-10-11 | Legacy Excel 97-2003 `.xls` (BIFF8) import with formulas, number formats, merges, sizes and names (#121) |
+| 2026-10-11 | XLSX pass-through: custom XML, external links, connections, query tables, printer settings, form/ActiveX controls and OLE objects are kept on save (#330, #324) |
+| 2026-10-11 | Data › Forecast › Forecast Sheet: a new sheet with the history, FORECAST.ETS forecast, confidence bounds, statistics and a chart (#322) |
+| 2026-10-11 | Startup no longer panics on a system font egui can't parse: fonts are validated and skipped (#226) |
+| 2026-10-11 | Ctrl+drag on the fill handle swaps copying and extending a series (#264) |
+| 2026-10-11 | Odd-period bond functions ODDFPRICE, ODDFYIELD, ODDLPRICE, ODDLYIELD: Financial 55 / 55 (#275) |
+| 2026-10-11 | PERCENTOF and EUROCONVERT worksheet functions (#279) |
+| 2026-10-11 | BAHTTEXT: amounts in Thai words with Baht and Satang (#291) |
+| 2026-10-11 | TRIMRANGE: ranges and arrays without blank outer rows and columns (#296) |
+| 2026-10-11 | Selected charts, pictures and shapes can be deleted from the keyboard (#213) |
+| 2026-10-11 | Ribbon translated into German (266 labels; `de`, `de-DE`, `de-AT`, `de-CH` locale tags resolve to German) |
+| 2026-10-11 | View › Interface size: a saved 75–200 % scale for the whole window (#230) |
+| 2026-10-11 | View › Formula Bar and Zoom 100% reachable from the CLI and MCP (#289) |
+| 2026-10-11 | Freeze panes by dragging the freeze handles on the header edges (#195) |
+| 2026-10-11 | XLSX: threaded comments (replies, resolved, timestamps) and note visibility survive a save (#300) |
+| 2026-10-11 | Cell checkboxes: Insert › Checkbox on the ribbon, Excel's Delete and value rules, XLSX round trip as Excel cell controls (#196) |
+| 2026-10-11 | Review › Allow Edit Ranges with Excel-compatible password hashes, kept in XLSX (#307) |
+| 2026-10-11 | PivotTable calculated fields (`pivot.calculatedField`), evaluated on sums like Excel, with XLSX round-trip (#304) |
+| 2026-10-11 | PivotCharts (`insert.pivotChart`): charts bound to a PivotTable's report, following refreshes and layout changes (#311) |
+| 2026-10-11 | FORECAST.ETS, FORECAST.ETS.CONFINT, FORECAST.ETS.SEASONALITY, FORECAST.ETS.STAT: AAA exponential smoothing forecasts (#314) |
+| 2026-10-11 | File tab Backstage view (Home, New, Open, Info, Save As, Print preview, Export, Options) and `file.options` (#174) |
 | 2026-10-10 | Ribbon translated into Japanese, Chinese, Korean, Brazilian Portuguese and Russian with system-language default (#31, #104, #82); CJK/Thai/Hebrew font fallback (#38); clear messages for encrypted and `.xls` files (#17); smooth line charts (#62). Progress docs restructured to the craftrules standard; full re-measure (this page). Initial ribbon key tips (#43), in-place text box editing (#84), copy as HTML table (#36). ODS and XLSB data import (#100, #101); recalc linear in the number of range formulas (#66); RISC-V Linux build; Flatpak repository on Pages; web cell-commit trap fixed |
 | 2026-10-09 | Community fixes: spill range operator `A1#`, sheet-scoped names, protection refuses locked-cell edits, Insert/Delete Cells adjust references, `DATE(1900,2,29)`, SUMIF sizing, `ROUND` at 15 digits, `_xlpm.` LAMBDA parameters in XLSX, vertical scrollbar, system appearance, border previews; v0.4.0 |
 | 2026-10-08 | v0.2.0 and v0.3.0 releases; Flatpak, AppImage zsync, branded DMG; desktop log file; DirectX 12 default on Windows |
@@ -142,6 +177,18 @@ Ranked; estimates in Opus 5.5 agent-hours. Detail and the full beta-gate list in
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-11 | minor | Password-encrypted workbooks open (#11); progress log row |
+| 2026-10-11 | minor | Forecast Sheet (#322); progress log row |
+| 2026-10-11 | minor | Worksheet functions 505 / 523 (ODD* bond functions); progress log row |
+| 2026-10-11 | minor | Worksheet functions 503 / 523 (PERCENTOF, EUROCONVERT); progress log row |
+| 2026-10-11 | minor | Worksheet functions 502 / 523 (BAHTTEXT); progress log row |
+| 2026-10-11 | minor | Worksheet functions 502 / 523 (TRIMRANGE); progress log row |
+| 2026-10-11 | minor | Selected objects can be deleted from the keyboard (#213) |
+| 2026-10-11 | minor | Catalog 258 → 260 / 290: View › Formula Bar and Zoom 100% (#289) |
+| 2026-10-11 | minor | Progress log: XLSX threaded comments round trip (#300) |
+| 2026-10-11 | minor | Catalog 258 → 259 / 290: Allow Edit Ranges (#307) |
+| 2026-10-11 | minor | Worksheet functions 505 / 523 (FORECAST.ETS family); progress log row |
+| 2026-10-11 | minor | Czech (cs) listed under other shipped languages: ribbon only, ~12% |
 | 2026-10-10 | minor | Readiness-by-audience table with hours to ~95% per audience; full number unchanged (additive weighted sum) |
 | 2026-10-10 | minor | Added Mainstream practitioner (~50%) and Essentials user (~63%); languages updated for the 10-10 merges (ribbon in ja, zh, ko, pt-BR, ru); localization 5%→10%; full number re-checked (51.6, unchanged) |
 | 2026-10-10 | minor | Checked against the alpha gate (six core workflows pass): stays alpha |

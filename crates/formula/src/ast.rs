@@ -91,6 +91,38 @@ pub enum UnOp {
     /// Spill range operator `A1#`: the whole spill range of the dynamic array anchored at the
     /// cell (`ANCHORARRAY` in files).
     Spill,
+    /// Trim reference `A1.:E10` / `A1:.E10` / `A1.:.E10` around a range: the range without its
+    /// blank leading, trailing or outer rows and columns (`TRIMRANGE` with both trim codes set).
+    Trim(TrimMode),
+}
+
+/// Which blank edges a trim reference drops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TrimMode {
+    /// `.:` — leading blank rows and columns.
+    Leading,
+    /// `:.` — trailing blank rows and columns.
+    Trailing,
+    /// `.:.` — both.
+    All,
+}
+
+impl TrimMode {
+    pub fn symbol(self) -> &'static str {
+        match self {
+            TrimMode::Leading => ".:",
+            TrimMode::Trailing => ":.",
+            TrimMode::All => ".:.",
+        }
+    }
+    /// The equivalent `TRIMRANGE` trim_rows / trim_cols code.
+    pub fn code(self) -> u8 {
+        match self {
+            TrimMode::Leading => 1,
+            TrimMode::Trailing => 2,
+            TrimMode::All => 3,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

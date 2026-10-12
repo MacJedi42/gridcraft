@@ -76,8 +76,19 @@ fn expr_to_file(e: Expr) -> String {
             Some(n) => Expr::Call(n, args),
             None => Expr::Call(name, args),
         },
-        // Files have no `#` operator: Excel writes `A1#` as `_xlfn.ANCHORARRAY(A1)`.
+        // Files have no `#` operator: Excel writes `A1#` as `_xlfn.ANCHORARRAY(A1)`, and a spill
+        // reference that became `#REF!` (its cell was deleted) as plain `#REF!`.
+        Expr::Unary(gridcraft_formula::UnOp::Spill, r) if matches!(*r, Expr::Error(_)) => *r,
         Expr::Unary(gridcraft_formula::UnOp::Spill, r) => Expr::Call("_xlfn.ANCHORARRAY".into(), vec![*r]),
+        // Nor an `@` operator: Excel writes `@x` as `_xlfn.SINGLE(x)`.
+        Expr::Unary(gridcraft_formula::UnOp::At, x) => Expr::Call("_xlfn.SINGLE".into(), vec![*x]),
+        // Nor trim-reference operators: written as the equivalent `TRIMRANGE(range,n,n)`, which
+        // every Excel with trim references reads. (Excel's own file spelling of `A1:.E10` is
+        // not publicly documented; the `_xlfn._TRO_*` call forms are accepted on read.)
+        Expr::Unary(gridcraft_formula::UnOp::Trim(mode), x) => {
+            let code = Expr::Number(f64::from(mode.code()));
+            Expr::Call("_xlfn.TRIMRANGE".into(), vec![*x, code.clone(), code])
+        }
         other => other,
     });
     gridcraft_formula::print(&e)
@@ -113,6 +124,32 @@ mod tests {
         assert_eq!(to_file(&Formula::new("SUM(Sheet1!$D$1#)+B2#")), "SUM(_xlfn.ANCHORARRAY(Sheet1!$D$1))+_xlfn.ANCHORARRAY(B2)");
         assert_eq!(text_to_file("=Sheet1!$D$1#"), "_xlfn.ANCHORARRAY(Sheet1!$D$1)");
         assert_eq!(from_file("SUM(_xlfn.ANCHORARRAY(Sheet1!$D$1))+_xlfn.ANCHORARRAY(B2)"), "SUM(Sheet1!$D$1#)+B2#");
+        // Found by the command-sequence fuzzer: deleting the anchor of `H5#` left `=#REF!` in
+        // the workbook but `ANCHORARRAY(#REF!)` in the file, which read back differently.
+        let deleted = Formula::from_expr(Expr::Unary(gridcraft_formula::UnOp::Spill, Box::new(Expr::Error(gridcraft_core::CellError::Ref))));
+        assert_eq!(deleted.text, "#REF!");
+        assert_eq!(to_file(&deleted), "#REF!");
+    }
+
+    #[test]
+    fn implicit_intersection() {
+        assert_eq!(to_file(&Formula::new("SUM(@A1:A3*B1:B3)")), "SUM(_xlfn.SINGLE(A1:A3)*B1:B3)");
+        assert_eq!(to_file(&Formula::new("@A1:A3*2")), "_xlfn.SINGLE(A1:A3)*2");
+        assert_eq!(text_to_file("=@Sheet1!$A$1:$A$3"), "_xlfn.SINGLE(Sheet1!$A$1:$A$3)");
+        assert_eq!(from_file("_xlfn.SINGLE(A1:A3)*2"), "@A1:A3*2");
+        assert_eq!(from_file("SUM(_xlfn.SINGLE(A1:A3)*B1:B3)"), "SUM(@A1:A3*B1:B3)");
+    }
+
+    #[test]
+    fn trim_references() {
+        assert_eq!(to_file(&Formula::new("SUM(A1:.E10)+SUM(Data!A.:A)")), "SUM(_xlfn.TRIMRANGE(A1:E10,2,2))+SUM(_xlfn.TRIMRANGE(Data!A:A,1,1))");
+        assert_eq!(text_to_file("=ROWS(1.:.5)"), "ROWS(_xlfn.TRIMRANGE(1:5,3,3))");
+        assert_eq!(from_file("SUM(_xlfn._TRO_TRAILING(A1:E10))+_xlfn._TRO_ALL($A:$B)"), "SUM(A1:.E10)+$A.:.$B");
+    }
+
+    #[test]
+    fn unbracketed_this_row_column() {
+        assert_eq!(from_file("Sales[[#This Row],Units]*[[#This Row],Price]"), "Sales[@Units]*[@Price]");
     }
 
     #[test]
@@ -121,6 +158,8 @@ mod tests {
         assert_eq!(to_file(&Formula::new("FILTER(A1:A3,B1:B3)")), "_xlfn._xlws.FILTER(A1:A3,B1:B3)");
         assert_eq!(from_file("_xlfn.XLOOKUP(1,A:A,B:B)"), "XLOOKUP(1,A:A,B:B)");
         assert_eq!(text_to_file("=IFS(A1>0,1)"), "_xlfn.IFS(A1>0,1)");
+        assert_eq!(to_file(&Formula::new("REGEXTEST(A1,\"x\")&ENCODEURL(B1)")), "_xlfn.REGEXTEST(A1,\"x\")&_xlfn.ENCODEURL(B1)");
+        assert_eq!(to_file(&Formula::new("GROUPBY(A1:A3,B1:B3,\"SUM\")")), "_xlfn.GROUPBY(A1:A3,B1:B3,\"SUM\")");
     }
 
     #[test]

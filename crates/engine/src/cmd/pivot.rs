@@ -43,6 +43,24 @@ pub fn specs() -> Vec<CommandSpec> {
             has_doc,
             summarize_table
         ),
+        cmd!(
+            "pivot.calculatedField",
+            "Calculated Field",
+            ["PivotTable Analyze", "Calculations"],
+            None,
+            "{pivot?, name, formula?: \"=Sales*0.1\" (fields bare or 'quoted'; evaluated on each cell's sums), delete?: bool, values?: bool (add a new field to Values, default true)} adds, changes or deletes a calculated field; without `name` opens the dialog → {name, formula, calculatedFields}",
+            has_doc,
+            calculated_field
+        ),
+        cmd!(
+            "insert.pivotChart",
+            "PivotChart",
+            ["Insert", "Charts"],
+            None,
+            "{pivot?: name | id | a cell of the report (\"Sheet2!B5\"; default: the PivotTable at the active cell), type?: column|bar|line|pie|area|… (default column), subtype?, title?, at?: \"H2\", width?, height?} adds a chart bound to the PivotTable's report: categories are the innermost row items, series the column items × value fields; it follows refreshes and layout changes → {chart, pivot, series}",
+            has_doc,
+            insert_pivot_chart
+        ),
         cmd!(query "pivot.fields", "PivotTable Fields", [], None, "{pivot?} → source fields (name, numeric, date, samples, areas) and the current layout", has_doc, fields),
         cmd!(query "pivot.fieldList", "Field List", ["PivotTable Analyze", "Show"], None, "{pivot?} (same as pivot.fields)", has_doc, fields),
         cmd!(query "pivot.list", "PivotTables", [], None, "{} → every PivotTable in the workbook", has_doc, list),
@@ -320,6 +338,19 @@ fn canonical(cmd: &str, src: &pv::Source, field: &str) -> Result<String> {
     src.col(field).and_then(|c| src.headers.get(c).cloned()).ok_or_else(|| bad(cmd, format!("no field `{field}` in the source data")))
 }
 
+/// The calculated field named `field`, if any.
+fn calc_field<'a>(pt: &'a PivotTable, field: &str) -> Option<&'a PivotCalcField> {
+    pt.calculated_fields.iter().find(|c| c.name.eq_ignore_ascii_case(field.trim()))
+}
+
+/// The canonical name of a source or calculated field.
+fn canonical_any(cmd: &str, pt: &PivotTable, src: &pv::Source, field: &str) -> Result<String> {
+    match calc_field(pt, field) {
+        Some(c) if src.col(field).is_none() => Ok(c.name.clone()),
+        _ => canonical(cmd, src, field),
+    }
+}
+
 fn unique_value_name(pt: &PivotTable, base: &str, except: Option<usize>) -> String {
     let taken = |n: &str| pt.values.iter().enumerate().any(|(i, v)| Some(i) != except && v.name.eq_ignore_ascii_case(n));
     if !taken(base) {
@@ -343,7 +374,11 @@ fn add_to_area(
     name: Option<&str>,
     position: Option<usize>,
 ) -> Result<()> {
-    let field = canonical(cmd, src, field)?;
+    let is_calc = src.col(field).is_none() && calc_field(pt, field).is_some();
+    if is_calc && area != "values" {
+        return Err(other("A calculated field can only be placed in the Values area."));
+    }
+    let field = canonical_any(cmd, pt, src, field)?;
     match area {
         "rows" | "columns" => {
             if pt.rows.len() + pt.columns.len() >= pv::MAX_AXIS_FIELDS && !in_axes(pt, &field) {
@@ -369,7 +404,7 @@ fn add_to_area(
             if pt.values.len() >= pv::MAX_VALUE_FIELDS {
                 return Err(other(format!("A PivotTable can have at most {} value fields.", pv::MAX_VALUE_FIELDS)));
             }
-            let numeric = src.col(&field).and_then(|c| src.numeric.get(c).copied()).unwrap_or(false);
+            let numeric = is_calc || src.col(&field).and_then(|c| src.numeric.get(c).copied()).unwrap_or(false);
             let f = func.unwrap_or(if numeric { PivotFunc::Sum } else { PivotFunc::Count });
             let base = match name {
                 Some(n) if !n.trim().is_empty() => {
@@ -663,6 +698,7 @@ fn pivot_json(wb: &Workbook, si: usize, pt: &PivotTable) -> Json {
         "subtotals": if !pt.subtotals { "none" } else if pt.subtotals_top { "top" } else { "bottom" },
         "style": pt.style,
         "showHeaders": pt.show_headers,
+        "calculatedFields": pt.calculated_fields.iter().map(|c| json!({"name": c.name, "formula": c.formula})).collect::<Vec<_>>(),
     })
 }
 
@@ -702,6 +738,11 @@ fn fields(s: &mut Session, p: &Json) -> Result<Json> {
             .collect(),
         Err(_) => vec![],
     };
+    let mut list = list;
+    for c in &pt.calculated_fields {
+        let areas: Vec<&str> = if pt.values.iter().any(|v| v.source_col.eq_ignore_ascii_case(&c.name)) { vec!["values"] } else { vec![] };
+        list.push(json!({"name": c.name, "numeric": true, "date": false, "samples": [], "areas": areas, "calculated": true, "formula": c.formula}));
+    }
     if let Some(m) = out.as_object_mut() {
         m.insert("fields".into(), Json::Array(list));
         if let Ok(src) = &src {
@@ -743,7 +784,76 @@ fn add_field(s: &mut Session, p: &Json) -> Result<Json> {
     let pos = position_param(p);
     update(s, p, |pt, src, _| {
         add_to_area(C, pt, src, &field, area, func, name.as_deref(), pos)?;
-        Ok(json!({"field": canonical(C, src, &field)?, "area": area}))
+        Ok(json!({"field": canonical_any(C, pt, src, &field)?, "area": area}))
+    })
+}
+
+fn calculated_field(s: &mut Session, p: &Json) -> Result<Json> {
+    const C: &str = "pivot.calculatedField";
+    let Some(name) = str_param(p, "name").map(|n| n.trim().to_string()) else {
+        // Menu-style call: the Insert Calculated Field dialog.
+        let (si, pi) = find_pivot(s, p)?;
+        let d = s.doc()?;
+        let pt = d.wb.sheet(si).and_then(|sh| sh.pivots.get(pi)).ok_or_else(|| other("There's no such PivotTable."))?;
+        let n = (1..).map(|k| format!("Field{k}")).find(|n| calc_field(pt, n).is_none()).unwrap_or_else(|| "Field1".into());
+        let pivot = pt.name.clone();
+        s.ui_requests.push(crate::UiRequest::Dialog("pivotCalculatedField".into(), json!({"pivot": pivot, "name": n, "formula": "= 0"})));
+        return ok();
+    };
+    if name.is_empty() || name.chars().count() > 255 {
+        return Err(bad(C, "`name` must be 1 to 255 characters"));
+    }
+    let delete = bool_param(p, "delete").unwrap_or(false);
+    let formula = str_param(p, "formula").map(|f| {
+        let f = f.trim();
+        if f.starts_with('=') { f.to_string() } else { format!("={f}") }
+    });
+    let to_values = bool_param(p, "values").unwrap_or(true);
+    if !delete && formula.is_none() {
+        return Err(bad(C, "missing `formula`"));
+    }
+    update(s, p, |pt, src, _| {
+        let existing = pt.calculated_fields.iter().position(|c| c.name.eq_ignore_ascii_case(&name));
+        if delete {
+            let i = existing.ok_or_else(|| bad(C, format!("no calculated field `{name}`")))?;
+            let gone = pt.calculated_fields.remove(i);
+            pt.values.retain(|v| !v.source_col.eq_ignore_ascii_case(&gone.name));
+            return Ok(json!({"name": gone.name, "deleted": true}));
+        }
+        let formula = formula.clone().unwrap_or_default();
+        if src.col(&name).is_some() {
+            return Err(other("PivotTable field name already exists."));
+        }
+        let canon = match existing {
+            Some(i) => {
+                let c = pt.calculated_fields.get_mut(i).ok_or_else(|| other("There's no such calculated field."))?;
+                c.formula = formula.clone();
+                c.name.clone()
+            }
+            None => {
+                if pt.calculated_fields.len() >= crate::pivot_calc::MAX_CALC_FIELDS {
+                    return Err(other(format!("A PivotTable can have at most {} calculated fields.", crate::pivot_calc::MAX_CALC_FIELDS)));
+                }
+                pt.calculated_fields.push(PivotCalcField { name: name.clone(), formula: formula.clone() });
+                name.clone()
+            }
+        };
+        let set = crate::pivot_calc::CalcSet::new(pt, &src.headers);
+        let i = set.index(&canon).ok_or_else(|| other("There's no such calculated field."))?;
+        if let Some(e) = set.error(i) {
+            return Err(bad(C, e.to_string()));
+        }
+        if set.is_cyclic(i) {
+            return Err(bad(C, format!("`{canon}` refers to itself through its formula")));
+        }
+        if existing.is_none() && to_values && !pt.values.iter().any(|v| v.source_col.eq_ignore_ascii_case(&canon)) {
+            add_to_area(C, pt, src, &canon, "values", Some(PivotFunc::Sum), None, None)?;
+        }
+        Ok(json!({
+            "name": canon,
+            "formula": formula,
+            "calculatedFields": pt.calculated_fields.iter().map(|c| json!({"name": c.name, "formula": c.formula})).collect::<Vec<_>>(),
+        }))
     })
 }
 
@@ -1171,6 +1281,18 @@ fn change_source(s: &mut Session, p: &Json) -> Result<Json> {
 fn delete(s: &mut Session, p: &Json) -> Result<Json> {
     let (si, pi) = find_pivot(s, p)?;
     edit(s, |cx| {
+        // Its PivotCharts become ordinary charts.
+        let link = cx.wb.sheet(si).and_then(|sh| sh.pivots.get(pi).map(|pt| (sh.name.clone(), pt.name.clone())));
+        if let Some((sheet, name)) = link {
+            for i in 0..cx.wb.sheets.len() {
+                let linked = |c: &Chart| c.pivot.as_deref().is_some_and(|l| pv::links_to(l, &sheet, &name));
+                if cx.wb.sheet(i).is_some_and(|sh| sh.charts.iter().any(linked)) {
+                    for c in cx.sheet_mut(i)?.charts.iter_mut().filter(|c| linked(c)) {
+                        c.pivot = None;
+                    }
+                }
+            }
+        }
         pv::clear_output(&mut cx.wb, si, pi);
         let sh = cx.sheet_mut(si)?;
         if pi < sh.pivots.len() {
@@ -1178,6 +1300,81 @@ fn delete(s: &mut Session, p: &Json) -> Result<Json> {
         }
         cx.structural = true;
         Ok(json!({}))
+    })
+}
+
+// ---------------------------------------------------------------- PivotChart
+
+/// The PivotTable a PivotChart call targets: `pivot` may also be a cell of its report.
+fn chart_pivot(s: &Session, p: &Json) -> Result<(usize, usize)> {
+    if let Some(t) = str_param(p, "pivot") {
+        let d = s.doc()?;
+        let (sheet, addr) = match t.rsplit_once('!') {
+            Some((sh, a)) => {
+                let sh = sh.trim();
+                let sh = sh.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')).map(|x| x.replace("''", "'")).unwrap_or_else(|| sh.to_string());
+                (d.wb.sheet_index(&sh), a)
+            }
+            None => (Some(d.wb.active_sheet), t),
+        };
+        if let (Some(si), Some(c)) = (sheet, CellRef::parse(addr.trim().replace('$', "").as_str())) {
+            let hit = d.wb.sheet(si).and_then(|sh| sh.pivots.iter().position(|pt| pt.last_range.is_some_and(|r| r.contains(c)) || pt.anchor == c));
+            return hit.map(|pi| (si, pi)).ok_or_else(|| bad("insert.pivotChart", format!("{t} is not in a PivotTable")));
+        }
+    }
+    find_pivot(s, p)
+}
+
+fn insert_pivot_chart(s: &mut Session, p: &Json) -> Result<Json> {
+    let (si, pi) = chart_pivot(s, p)?;
+    let d = s.doc()?;
+    let sh = d.wb.sheet(si).ok_or(EngineError::NoDocument)?;
+    let pt = sh.pivots.get(pi).ok_or_else(|| other("There's no such PivotTable."))?;
+    let area = pt.last_range.ok_or_else(|| other("Refresh the PivotTable before adding a PivotChart."))?;
+    let out = pv::compute(&d.wb, pt, si).map_err(other)?;
+    if out.chart_rows.is_empty() || out.chart_cols.is_empty() {
+        return Err(other("Add a field to the Values area and one to Rows or Columns before creating a PivotChart."));
+    }
+    let series = pv::chart_series(&sh.name, area.start, &out);
+    let t = str_param(p, "type").unwrap_or("column");
+    let kind = super::insert::chart_kind(t, str_param(p, "subtype").unwrap_or(""));
+    let at =
+        cell_param(s, p, "at")?.unwrap_or_else(|| CellRef::new(area.start.row, area.end.col.saturating_add(2).min(gridcraft_core::MAX_COLS - 1)));
+    let title = match p.get("title") {
+        Some(Json::String(t)) => Some(t.clone()),
+        Some(Json::Null) => None,
+        _ => Some(if series.len() == 1 { "Total".to_string() } else { "Chart Title".to_string() }),
+    };
+    let id = d.wb.next_object_id();
+    let link = pv::chart_link(&sh.name, &pt.name);
+    let pivot_name = pt.name.clone();
+    let n = series.len();
+    let chart = Chart {
+        id,
+        kind,
+        anchor: Anchor {
+            cell: at,
+            dx: 0.0,
+            dy: 0.0,
+            width: f64_param(p, "width").unwrap_or(480.0).clamp(10.0, 10_000.0) as f32,
+            height: f64_param(p, "height").unwrap_or(288.0).clamp(10.0, 10_000.0) as f32,
+            mode: anchor_mode_param(p).unwrap_or_default(),
+        },
+        title,
+        series,
+        legend: if matches!(kind, ChartKind::Pie | ChartKind::Doughnut) { LegendPos::Right } else { LegendPos::Bottom },
+        data_labels: false,
+        gridlines: !matches!(kind, ChartKind::Pie | ChartKind::Doughnut | ChartKind::Treemap | ChartKind::Sunburst | ChartKind::Funnel),
+        style: 1,
+        x_title: None,
+        y_title: None,
+        source: None,
+        by_rows: false,
+        pivot: Some(link),
+    };
+    edit(s, |cx| {
+        cx.sheet_mut(si)?.charts.push(chart);
+        Ok(json!({"chart": id, "pivot": pivot_name, "series": n}))
     })
 }
 
@@ -1280,8 +1477,8 @@ fn recommended(s: &mut Session, p: &Json) -> Result<Json> {
 
 #[cfg(test)]
 mod tests {
-    use gridcraft_core::{CellRef, Value};
-    use serde_json::json;
+    use gridcraft_core::{CellError, CellRef, Value};
+    use serde_json::{Value as Json, json};
 
     use crate::Session;
 
@@ -1548,6 +1745,133 @@ mod tests {
         // Old rows were cleared.
         assert_eq!(sh.value(CellRef::parse("A7").unwrap()), Value::Empty);
         s.execute("pivot.refresh", json!({"pivot": "PivotTable1"})).unwrap();
+    }
+
+    fn pivot_chart(s: &Session) -> gridcraft_model::Chart {
+        s.doc().unwrap().wb.active().unwrap().charts.last().unwrap().clone()
+    }
+    fn plotted(s: &Session) -> Vec<Vec<Option<f64>>> {
+        let d = s.doc().unwrap();
+        let data = gridcraft_chart::resolve(&d.wb, d.wb.active_sheet, &pivot_chart(s));
+        data.series.into_iter().map(|x| x.values).collect()
+    }
+
+    #[test]
+    fn pivot_chart_follows_the_report() {
+        let mut s = sales();
+        s.execute("insert.pivotTable", json!({"rows": ["Region"], "values": ["Sales"]})).unwrap();
+        // Any cell of the report picks the PivotTable.
+        let r = s.execute("insert.pivotChart", json!({"pivot": "B5"})).unwrap();
+        assert_eq!(r["series"], 1);
+        let ch = pivot_chart(&s);
+        assert_eq!(ch.pivot.as_deref(), Some("Sheet2!PivotTable1"));
+        assert_eq!(ch.title.as_deref(), Some("Total"));
+        assert_eq!(ch.series[0].values, "Sheet2!$B$4:$B$6");
+        assert_eq!(ch.series[0].categories.as_deref(), Some("Sheet2!$A$4:$A$6"));
+        assert_eq!(plotted(&s), vec![vec![Some(415.0), Some(135.0), Some(285.0)]]);
+        // A column field: one series per item, rebound by the layout change.
+        s.execute("pivot.addField", json!({"field": "Product", "area": "columns"})).unwrap();
+        let ch = pivot_chart(&s);
+        let names: Vec<_> = ch.series.iter().map(|x| x.name.clone().unwrap_or_default()).collect();
+        assert_eq!(names, vec!["\"Apples\"", "\"Pears\"", "\"Plums\""]);
+        assert_eq!(plotted(&s)[0], vec![Some(160.0), Some(90.0), Some(170.0)]);
+        // Nested row fields: the innermost items only, as a union around the parent rows.
+        s.execute("pivot.moveField", json!({"field": "Product", "from": "columns", "to": "rows"})).unwrap();
+        let ch = pivot_chart(&s);
+        assert!(ch.series[0].values.starts_with('('), "{}", ch.series[0].values);
+        let pts = plotted(&s);
+        assert_eq!(pts[0].len(), 9);
+        assert_eq!(pts[0].iter().flatten().sum::<f64>(), TOTAL);
+        // Survives an XLSX round trip as a PivotChart.
+        let wb = (*s.doc().unwrap().wb).clone();
+        let (back, _) = gridcraft_xlsx::read_xlsx(&gridcraft_xlsx::write_xlsx(&wb).unwrap()).unwrap();
+        let si = back.sheet_index("Sheet2").unwrap();
+        assert_eq!(back.sheet(si).unwrap().charts.first().and_then(|c| c.pivot.clone()).as_deref(), Some("Sheet2!PivotTable1"));
+        // Renaming the sheet keeps the link; a refresh still rebinds.
+        s.execute("sheet.rename", json!({"name": "Report"})).unwrap();
+        assert_eq!(pivot_chart(&s).pivot.as_deref(), Some("Report!PivotTable1"));
+        s.execute("pivot.moveField", json!({"field": "Region", "from": "rows", "to": "columns"})).unwrap();
+        assert_eq!(pivot_chart(&s).series.len(), 3);
+        // Deleting the PivotTable leaves an ordinary chart.
+        s.execute("pivot.delete", json!({})).unwrap();
+        assert_eq!(pivot_chart(&s).pivot, None);
+    }
+
+    #[test]
+    fn pivot_chart_errors() {
+        let mut s = sales();
+        // No PivotTable yet.
+        assert!(s.execute("insert.pivotChart", json!({})).is_err());
+        s.execute("insert.pivotTable", json!({"rows": ["Region"]})).unwrap();
+        // Not in the report; no values.
+        assert!(s.execute("insert.pivotChart", json!({"pivot": "Z99"})).is_err());
+        assert!(s.execute("insert.pivotChart", json!({})).unwrap_err().to_string().contains("Values"));
+        s.execute("pivot.addField", json!({"field": "Units", "area": "values"})).unwrap();
+        let r = s.execute("insert.pivotChart", json!({"pivot": "PivotTable1", "type": "line", "title": null})).unwrap();
+        assert_eq!(r["series"], 1);
+        let ch = pivot_chart(&s);
+        assert_eq!(ch.kind, gridcraft_model::ChartKind::Line);
+        assert_eq!(ch.title, None);
+        // One undo step.
+        s.execute("edit.undo", json!({})).unwrap();
+        assert!(s.doc().unwrap().wb.active().unwrap().charts.is_empty());
+    }
+
+    #[test]
+    fn calculated_field_on_sums() {
+        let mut s = sales();
+        s.execute("insert.pivotTable", json!({"rows": ["Region"], "values": ["Sales"]})).unwrap();
+        let r = s.execute("pivot.calculatedField", json!({"name": "Price", "formula": "Sales / Units"})).unwrap();
+        assert_eq!(r["formula"], "=Sales / Units");
+        assert_eq!(text(&s, "C3"), "Sum of Price");
+        assert_eq!(text(&s, "A4"), "East");
+        // East: 415 sales over 33 units, from the sums.
+        let east = val(&s, "C4").as_f64().unwrap();
+        assert!((east - 415.0 / 33.0).abs() < 1e-12, "{east}");
+        // The grand total applies the formula to the totals, not the sum of the rows.
+        assert_eq!(text(&s, "A7"), "Grand Total");
+        let total = val(&s, "C7").as_f64().unwrap();
+        assert!((total - TOTAL / 72.0).abs() < 1e-12, "{total}");
+        // Quoted names, functions, and another calculated field.
+        s.execute("pivot.calculatedField", json!({"name": "Rounded", "formula": "=ROUND('Price'*2,1)"})).unwrap();
+        assert_eq!(val(&s, "D4"), Value::Number(25.2));
+        // Division by zero shows #DIV/0! cells.
+        s.execute("pivot.calculatedField", json!({"name": "Zero", "formula": "=Sales/(Units-Units)"})).unwrap();
+        assert_eq!(val(&s, "E4"), Value::Error(CellError::Div0));
+        // Change and delete.
+        s.execute("pivot.calculatedField", json!({"name": "zero", "formula": "=Units*2"})).unwrap();
+        assert_eq!(val(&s, "E4"), Value::Number(66.0));
+        s.execute("pivot.calculatedField", json!({"name": "Zero", "delete": true})).unwrap();
+        assert_eq!(pt(&s).values.len(), 3);
+        assert_eq!(pt(&s).calculated_fields.len(), 2);
+        // The field list shows calculated fields.
+        let f = s.execute("pivot.fields", json!({})).unwrap();
+        assert!(f["fields"].as_array().unwrap().iter().any(|x| x["name"] == "Price" && x["calculated"] == true));
+    }
+
+    #[test]
+    fn calculated_field_errors() {
+        let mut s = sales();
+        s.execute("insert.pivotTable", json!({"rows": ["Region"], "values": ["Sales"]})).unwrap();
+        let mut e = |p: Json| s.execute("pivot.calculatedField", p).unwrap_err().to_string();
+        assert!(e(json!({"name": "Bad", "formula": "=Sales*Bogus"})).contains("Bogus"));
+        assert!(e(json!({"name": "Bad", "formula": "=A1*2"})).contains("cells"));
+        assert!(e(json!({"name": "Bad", "formula": "=Sales*("})).contains("error"));
+        assert!(e(json!({"name": "Sales", "formula": "=1"})).contains("already exists"));
+        assert!(e(json!({"name": "Bad"})).contains("formula"));
+        assert!(e(json!({"name": "Gone", "delete": true})).contains("Gone"));
+        // A cycle is refused.
+        s.execute("pivot.calculatedField", json!({"name": "X", "formula": "=Sales"})).unwrap();
+        s.execute("pivot.calculatedField", json!({"name": "Y", "formula": "=X*2"})).unwrap();
+        let err = s.execute("pivot.calculatedField", json!({"name": "X", "formula": "=Y"})).unwrap_err().to_string();
+        assert!(err.contains("itself"), "{err}");
+        // Calculated fields only go to Values; nothing changed after the failures.
+        assert!(s.execute("pivot.addField", json!({"field": "Y", "area": "rows"})).is_err());
+        assert_eq!(pt(&s).calculated_fields.len(), 2);
+        // Without a name the dialog opens (menu-style call).
+        s.ui_requests.clear();
+        s.execute("pivot.calculatedField", json!({})).unwrap();
+        assert!(matches!(s.ui_requests.last(), Some(crate::UiRequest::Dialog(n, _)) if n == "pivotCalculatedField"));
     }
 
     #[test]

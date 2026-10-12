@@ -127,9 +127,9 @@ impl Criterion {
             },
             Operand::Text(pat) => match self.op {
                 Op::Eq | Op::Ne => {
+                    // Blank cells hold no text: `"*"` skips them and `"<>*"` counts them.
                     let cell_text = match &v {
                         Value::Text(t) => Some(t.to_string()),
-                        Value::Empty => Some(String::new()),
                         _ => None,
                     };
                     let m = cell_text.is_some_and(|t| wildcard_match(pat, &t));
@@ -298,6 +298,13 @@ mod tests {
         assert!(lookup_equal(&Value::Number(0.3), &Value::Number(0.1 + 0.2), false));
         assert!(m("<>a*", Value::from("bcd")));
         assert!(m(">1/1/2020", Value::Number(44000.0)));
+        // Text patterns never match blank cells, but an empty string is text.
+        assert!(!m("*", Value::Empty));
+        assert!(m("*", Value::from("")));
+        assert!(m("<>*", Value::Empty));
+        assert!(!m("<>*", Value::from("")));
+        assert!(!m("?*", Value::Empty));
+        assert!(m("<>a*", Value::Empty));
     }
 
     #[test]

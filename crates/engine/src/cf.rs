@@ -90,10 +90,7 @@ fn lerp(a: [u8; 3], b: [u8; 3], t: f64) -> [u8; 3] {
     ]
 }
 
-/// Number of icons in a set name like `3TrafficLights1`, `5Quarters`.
-pub fn icon_count(set: &str) -> usize {
-    set.chars().next().and_then(|c| c.to_digit(10)).unwrap_or(3) as usize
-}
+pub use gridcraft_model::icon_count;
 
 impl CfCache {
     pub fn new() -> Self {
@@ -144,7 +141,8 @@ impl CfCache {
                         CfOperator::GreaterOrEqual => compare(&v, &av) != std::cmp::Ordering::Less,
                         CfOperator::LessOrEqual => compare(&v, &av) != std::cmp::Ordering::Greater,
                     };
-                    (ok && !v.is_empty()).then_some(style.as_ref())
+                    // As in Excel, a blank cell compares as 0 (or ""), and an error never matches.
+                    (ok && !v.is_error()).then_some(style.as_ref())
                 }
                 CfRule::Expression { formula, style } => {
                     gridcraft_calc::evaluate(wb, sheet, c, &relative(formula, first, c)).to_bool().unwrap_or(false).then_some(style.as_ref())
@@ -154,7 +152,7 @@ impl CfCache {
                 CfRule::BeginsWith { text: t, style } => text.to_lowercase().starts_with(&t.to_lowercase()).then_some(style.as_ref()),
                 CfRule::EndsWith { text: t, style } => text.to_lowercase().ends_with(&t.to_lowercase()).then_some(style.as_ref()),
                 CfRule::Blanks { style } => (v.is_empty() || text.trim().is_empty()).then_some(style.as_ref()),
-                CfRule::NoBlanks { style } => (!v.is_empty()).then_some(style.as_ref()),
+                CfRule::NoBlanks { style } => (!v.is_empty() && !text.trim().is_empty()).then_some(style.as_ref()),
                 CfRule::Errors { style } => v.is_error().then_some(style.as_ref()),
                 CfRule::NoErrors { style } => (!v.is_error()).then_some(style.as_ref()),
                 CfRule::Duplicate { style } => {
@@ -261,11 +259,18 @@ impl CfCache {
                 CfRule::IconSet { set, thresholds, reverse, show_value } => {
                     if let Some(n) = v.as_f64() {
                         let k = icon_count(set);
-                        let cuts: Vec<f64> = if thresholds.len() + 1 == k {
-                            thresholds.iter().map(|t| threshold(wb, sheet, c, &st, t)).collect()
-                        } else {
-                            (1..k).map(|i| percentile(&st.sorted, i as f64 * 100.0 / k as f64)).collect()
+                        // One threshold per icon, the first being the lower bound (as in the file);
+                        // also accept the lower bound left out, else Excel's defaults.
+                        let defaults;
+                        let lower = match thresholds.len() {
+                            n if n == k => thresholds.get(1..).unwrap_or_default(),
+                            n if n + 1 == k => thresholds.as_slice(),
+                            _ => {
+                                defaults = default_icon_thresholds(set);
+                                defaults.get(1..).unwrap_or_default()
+                            }
                         };
+                        let cuts: Vec<f64> = lower.iter().map(|t| threshold(wb, sheet, c, &st, t)).collect();
                         let mut idx = cuts.iter().filter(|cut| n >= **cut).count();
                         if *reverse {
                             idx = k - 1 - idx.min(k - 1);
@@ -281,16 +286,51 @@ impl CfCache {
             };
             if let Some(st) = matched_style {
                 any = true;
-                out.style = Some(match out.style.take() {
-                    None => st.clone(),
-                    Some(prev) => prev,
-                });
+                // Every matching rule applies; where two set the same part, the rule with the
+                // higher priority (seen first) wins.
+                match &mut out.style {
+                    None => out.style = Some(st.clone()),
+                    Some(prev) => layer_under(prev, st),
+                }
                 if cf.stop_if_true {
                     break;
                 }
             }
         }
         any.then_some(out)
+    }
+}
+
+/// Adds the parts `lower` sets that `style` leaves unset (differential styles: default parts
+/// are unset).
+fn layer_under(style: &mut Style, lower: &Style) {
+    if style.fill.pattern == PatternType::None {
+        style.fill = lower.fill;
+    }
+    if style.font.color == Color::Auto {
+        style.font.color = lower.font.color;
+    }
+    style.font.bold |= lower.font.bold;
+    style.font.italic |= lower.font.italic;
+    style.font.strike |= lower.font.strike;
+    if style.font.underline == Underline::None {
+        style.font.underline = lower.font.underline;
+    }
+    let b = &mut style.borders;
+    for (dst, src) in [
+        (&mut b.left, lower.borders.left),
+        (&mut b.right, lower.borders.right),
+        (&mut b.top, lower.borders.top),
+        (&mut b.bottom, lower.borders.bottom),
+        (&mut b.diag_down, lower.borders.diag_down),
+        (&mut b.diag_up, lower.borders.diag_up),
+    ] {
+        if dst.is_none() {
+            *dst = src;
+        }
+    }
+    if style.num_fmt.as_str() == "General" {
+        style.num_fmt = lower.num_fmt.clone();
     }
 }
 
@@ -304,5 +344,70 @@ fn relative(f: &str, first: CellRef, c: CellRef) -> String {
             gridcraft_formula::print(&gridcraft_formula::adjust::shift_relative(e, c.row as i64 - first.row as i64, c.col as i64 - first.col as i64))
         }
         Err(_) => f.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn every_matching_rule_applies() {
+        let mut s = crate::Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [[200], [400], [510]]})).unwrap();
+        let rule = |op: &str, value: &str, preset: &str| json!({"range": "A1:A3", "rule": {"type": "cellIs", "operator": op, "value": value, "preset": preset}});
+        s.execute("home.conditionalFormat", rule("greaterThan", "300", "lightRedFill")).unwrap();
+        s.execute("home.conditionalFormat", rule("greaterThan", "500", "redBorder")).unwrap();
+        let d = s.doc().unwrap();
+        let mut cache = CfCache::new();
+        let mut look = |a: &str| cache.look(&d.wb, 0, CellRef::parse(a).unwrap()).and_then(|l| l.style);
+        assert!(look("A1").is_none());
+        let only_fill = look("A2").unwrap();
+        assert_eq!(only_fill.fill.pattern, PatternType::Solid);
+        assert!(only_fill.borders.top.is_none());
+        let both = look("A3").unwrap();
+        assert_eq!(both.fill, only_fill.fill);
+        assert!(!both.borders.top.is_none());
+    }
+
+    #[test]
+    fn cell_value_rules_on_blanks_and_errors() {
+        let mut s = crate::Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [[3, "=NA()"], [null, 7], ["=NA()", null], [" ", null], [7, null]]})).unwrap();
+        let rule = |range: &str, r: serde_json::Value| json!({"range": range, "rule": r});
+        s.execute("home.conditionalFormat", rule("A1:A5", json!({"type": "cellIs", "operator": "less", "value": "5", "preset": "lightRedFill"})))
+            .unwrap();
+        s.execute("home.conditionalFormat", rule("A1:A5", json!({"type": "noBlanks", "preset": "redBorder"}))).unwrap();
+        s.execute("home.conditionalFormat", rule("B1:B2", json!({"type": "cellIs", "operator": "greater", "value": "5", "preset": "lightRedFill"})))
+            .unwrap();
+        let d = s.doc().unwrap();
+        let mut cache = CfCache::new();
+        let mut look = |a: &str| cache.look(&d.wb, 0, CellRef::parse(a).unwrap()).and_then(|l| l.style);
+        let fill = |st: Option<Style>| st.is_some_and(|st| st.fill.pattern == PatternType::Solid);
+        let border = |st: Option<Style>| st.is_some_and(|st| !st.borders.top.is_none());
+        // Less than 5: 3 and the blank cell (as 0), not #N/A.
+        assert_eq!([look("A1"), look("A2"), look("A3"), look("A5")].map(fill), [true, true, false, false]);
+        // Greater than 5: 7, not #N/A.
+        assert_eq!([look("B1"), look("B2")].map(fill), [false, true]);
+        // No blanks: neither the empty cell nor the one holding a space.
+        assert_eq!([look("A1"), look("A2"), look("A4")].map(border), [true, false, false]);
+    }
+
+    #[test]
+    fn cell_value_operator_names() {
+        let mut s = crate::Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [[3], [7]]})).unwrap();
+        let rule = |op: &str| json!({"range": "A1:A2", "rule": {"type": "cellIs", "operator": op, "value": "5", "preset": "lightRedFill"}});
+        s.execute("home.conditionalFormat", rule("lessThan")).unwrap();
+        assert!(s.execute("home.conditionalFormat", rule("smaller")).is_err());
+        let d = s.doc().unwrap();
+        let mut cache = CfCache::new();
+        let mut look = |a: &str| cache.look(&d.wb, 0, CellRef::parse(a).unwrap()).and_then(|l| l.style).is_some();
+        assert_eq!([look("A1"), look("A2")], [true, false]);
     }
 }

@@ -121,3 +121,75 @@ fn zip_bomb_is_rejected() {
     assert!(bytes.len() < 10 << 20);
     assert!(matches!(read_xlsx(&bytes), Err(IoError::TooLarge(_))));
 }
+
+/// Threaded comments, persons and note VML from a hostile file: odd links and values are dropped,
+/// broken parts are skipped, nothing panics.
+#[test]
+fn hostile_threaded_comments_persons_and_note_vml() {
+    use gridcraft_core::CellRef;
+    use gridcraft_model::{Comment, Workbook};
+    let mut wb = Workbook::new();
+    let s = std::sync::Arc::make_mut(&mut wb.sheets[0]);
+    let c = |threaded| Comment { author: "A".into(), text: "t".into(), replies: vec![], threaded, resolved: false, visible: false, dates: vec![] };
+    s.comments.insert(CellRef::new(0, 0), c(true));
+    s.comments.insert(CellRef::new(1, 1), c(false));
+    let good = write_xlsx(&wb).unwrap();
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(good)).unwrap();
+    let mut parts: Vec<(String, Vec<u8>)> = vec![];
+    for i in 0..z.len() {
+        let mut f = z.by_index(i).unwrap();
+        let mut d = vec![];
+        std::io::Read::read_to_end(&mut f, &mut d).unwrap();
+        parts.push((f.name().to_string(), d));
+    }
+    let ns = r#"xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments""#;
+    let deep = "<v:group>".repeat(300) + &"</v:group>".repeat(300);
+    let threaded = format!(
+        r#"<ThreadedComments {ns}><threadedComment ref="A1" dT="not a date" personId="{{nobody}}" id="{{T}}"><text>root</text></threadedComment><threadedComment ref="A1" personId="x" id="{{R}}" parentId="{{missing}}"><text>orphan</text></threadedComment><threadedComment ref="A1" personId="x" id="{{RR}}" parentId="{{R}}"><text>reply to orphan</text></threadedComment><threadedComment ref="ZZZZZ99999999" personId="x" id="{{B}}"><text>off sheet</text></threadedComment><threadedComment personId="x" id="{{N}}"><text>no ref</text></threadedComment></ThreadedComments>"#
+    );
+    let vml = format!(
+        r#"<xml xmlns:v="urn:schemas-microsoft-com:vml" xmlns:x="urn:schemas-microsoft-com:office:excel"><v:shape><x:ClientData ObjectType="Note"><x:Row>4294967295</x:Row><x:Column>-1</x:Column><x:Visible/></x:ClientData></v:shape><v:shape><x:ClientData ObjectType="Note"><x:Row>1</x:Row><x:Column>1</x:Column><x:Visible/></x:ClientData></v:shape>{deep}</xml>"#
+    );
+    for (name, bytes) in &mut parts {
+        if name.starts_with("xl/threadedComments/") {
+            *bytes = threaded.clone().into_bytes();
+        } else if name.starts_with("xl/drawings/vmlDrawing") {
+            *bytes = vml.clone().into_bytes();
+        } else if name == "xl/persons/person.xml" {
+            *bytes = b"<personList><person".to_vec();
+        }
+    }
+    let refs: Vec<(&str, &[u8])> = parts.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+    let (back, _) = read_xlsx(&super::make_zip(&refs)).unwrap();
+    let sheet = &back.sheets[0];
+    let a1 = &sheet.comments[&CellRef::new(0, 0)];
+    assert!(a1.threaded && a1.replies.is_empty() && a1.author.is_empty());
+    assert_eq!(a1.text, "root");
+    assert_eq!(sheet.comments.len(), 2);
+    // Too deep for the parser: the VML is skipped, so the note keeps its default.
+    assert!(!sheet.comments[&CellRef::new(1, 1)].visible);
+    // A VML that parses shows the note.
+    for (name, bytes) in &mut parts {
+        if name.starts_with("xl/drawings/vmlDrawing") {
+            *bytes = vml.replace(&deep, "").into_bytes();
+        }
+    }
+    let refs: Vec<(&str, &[u8])> = parts.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+    let (back, _) = read_xlsx(&super::make_zip(&refs)).unwrap();
+    assert!(back.sheets[0].comments[&CellRef::new(1, 1)].visible);
+}
+
+/// Allow Edit Ranges from a hostile file: bad references are dropped and a password that can't be
+/// read keeps the range locked instead of opening it.
+#[test]
+fn hostile_protected_ranges_stay_locked() {
+    let body = r#"<sheetData/><protectedRanges><protectedRange name="bad ref" sqref="ZZZZZ1 A0"/><protectedRange name="hex" sqref="A1" password="XYZ"/><protectedRange name="spin" sqref="B1" algorithmName="SHA-512" hashValue="AAAA" saltValue="AAAA" spinCount="4294967295"/><protectedRange name="half" sqref="C1" hashValue="AAAA"/><protectedRange name="md5" sqref="D1" algorithmName="MD5" hashValue="AAAA" saltValue="AAAA" spinCount="1"/></protectedRanges>"#;
+    let (wb, _) = read_xlsx(&minimal(body, &[], "", "")).unwrap();
+    let ranges = &wb.sheets[0].edit_ranges;
+    assert_eq!(ranges.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(), ["hex", "spin", "half", "md5"]);
+    for r in ranges {
+        let h = r.password.as_ref().unwrap();
+        assert!(!matches!(h.verify(""), Ok(true)), "{}", r.title);
+        assert!(!matches!(h.verify("password"), Ok(true)), "{}", r.title);
+    }
+}

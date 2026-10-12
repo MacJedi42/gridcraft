@@ -70,6 +70,7 @@ fn workbook() -> Workbook {
         first_col: false,
         last_col: false,
         filter_button: true,
+        filter: vec![],
     });
     wb.names.push(DefinedName { name: "SalesData".into(), scope: None, formula: "Data!$A$1:$F$9".into(), comment: String::new(), hidden: false });
 
@@ -107,6 +108,7 @@ fn workbook() -> Workbook {
         style: "PivotStyleMedium9".into(),
         show_headers: false,
         last_range: Some(rr("A2:H12")),
+        calculated_fields: vec![],
     };
     // Pivot 2: table source, date grouping on two levels, show-values-as, multi-select page
     // filter and a hidden-items filter on a column field.
@@ -163,6 +165,7 @@ fn workbook() -> Workbook {
         style: "PivotStyleDark3".into(),
         show_headers: true,
         last_range: Some(rr("K2:Z30")),
+        calculated_fields: vec![],
     };
     // Pivot 3: defaults, defined-name source, compact.
     let p3 = PivotTable {
@@ -478,4 +481,30 @@ fn cache_found_by_workbook_cache_id() {
     assert_eq!(pts[0].name, "ById");
     assert_eq!(pts[0].values[0].func, PivotFunc::Average);
     assert_eq!(pts[0].rows[0].source_col, "K");
+}
+
+#[test]
+fn calculated_fields_round_trip() {
+    let mut wb = workbook();
+    {
+        let p = wb.sheet_mut(1).unwrap().pivots.get_mut(0).unwrap();
+        p.calculated_fields.push(PivotCalcField { name: "Price".into(), formula: "=Sales/Units".into() });
+        p.calculated_fields.push(PivotCalcField { name: "Unit Bonus".into(), formula: "='Price'*0.1".into() });
+        p.values.push(PivotValue { source_col: "Price".into(), name: "Sum of Price".into(), ..PivotValue::default() });
+    }
+    let bytes = write_xlsx(&wb).unwrap();
+    let parts = unzip(&bytes);
+    let c1 = String::from_utf8(parts.get("xl/pivotCache/pivotCacheDefinition1.xml").unwrap().clone()).unwrap();
+    assert!(c1.contains("<cacheField name=\"Price\" numFmtId=\"0\" formula=\"Sales/Units\" databaseField=\"0\">"), "{c1}");
+    assert!(c1.contains("formula=\"&apos;Price&apos;*0.1\"") || c1.contains("formula=\"'Price'*0.1\""), "{c1}");
+    let t1 = String::from_utf8(parts.get("xl/pivotTables/pivotTable1.xml").unwrap().clone()).unwrap();
+    assert!(t1.contains("<dataField name=\"Sum of Price\" fld=\"6\""), "{t1}");
+    assert!(t1.contains("dataField=\"1\" dragToRow=\"0\""), "{t1}");
+    let (back, report) = read_xlsx(&bytes).unwrap();
+    assert!(report.warnings.iter().all(|w| !w.to_lowercase().contains("pivot")), "{:?}", report.warnings);
+    let orig = &wb.sheet(1).unwrap().pivots;
+    let read = &back.sheet(1).unwrap().pivots;
+    for (a, b) in orig.iter().zip(read.iter()) {
+        assert_eq!(a, b, "pivot {} differs", a.name);
+    }
 }

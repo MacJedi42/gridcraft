@@ -138,7 +138,8 @@ pub(crate) fn render_date(sec: &Section, v: f64, sys: DateSystem) -> Option<Out>
 }
 
 /// Assigns integer digits right-to-left to the placeholders at `idxs`; the leftmost placeholder
-/// takes all remaining digits.
+/// takes all remaining digits. `force_zero` shows `0` in the units placeholder when there are no
+/// digits. A blank `?` pads with a space, and so does the thousands separator it would carry.
 fn fill_int(toks: &[Tok], idxs: &[usize], digits: &str, thousands: bool, force_zero: bool, pieces: &mut [String]) {
     let ds: Vec<char> = digits.chars().collect();
     let mut rem = ds.len();
@@ -162,8 +163,14 @@ fn fill_int(toks: &[Tok], idxs: &[usize], digits: &str, thousands: bool, force_z
         if take == 0 {
             match ph {
                 '0' => push_digit('0', &mut rev, &mut pos),
-                _ if force_zero && leftmost && pos == 0 => push_digit('0', &mut rev, &mut pos),
-                '?' => rev.push(' '),
+                _ if force_zero && k == 0 => push_digit('0', &mut rev, &mut pos),
+                '?' => {
+                    if thousands && pos > 0 && pos.is_multiple_of(3) {
+                        rev.push(' ');
+                    }
+                    rev.push(' ');
+                    pos += 1;
+                }
                 _ => {}
             }
         } else {
@@ -235,11 +242,14 @@ pub(crate) fn render_number(sec: &Section, v: f64) -> Out {
     }
     let toks = &sec.toks;
     let n = toks.len();
-    // Pieces replace the token's own output; `before` is inserted ahead of a token.
+    // Pieces replace the token's own output; `before` is inserted ahead of a token; `lits`
+    // replaces a literal's text (fractions blank the literals of a hidden part).
     let mut pieces: Vec<String> = vec![String::new(); n];
     let mut before: Vec<String> = vec![String::new(); n + 1];
+    let mut lits: Vec<Option<String>> = Vec::new();
     if sec.fraction {
-        render_fraction(sec, x, &mut pieces);
+        lits = vec![None; n];
+        render_fraction(sec, x, &mut pieces, &mut lits);
     } else {
         let point = toks.iter().position(|t| matches!(t, Tok::Point));
         let exp = toks.iter().position(|t| matches!(t, Tok::Exp { .. }));
@@ -321,7 +331,7 @@ pub(crate) fn render_number(sec: &Section, v: f64) -> Out {
             out.push(b);
         }
         match t {
-            Tok::Lit(s) => out.push(s),
+            Tok::Lit(s) => out.push(lits.get(i).and_then(Option::as_deref).unwrap_or(s)),
             Tok::Percent => out.push("%"),
             Tok::Fill(c) => out.fill(*c),
             Tok::At | Tok::General | Tok::Date(_) | Tok::Comma => {}
@@ -370,29 +380,77 @@ fn approximate(x: f64, max_den: u64) -> (u64, u64) {
     if err_b < err_a { (pb, qb) } else { (p1, q1) }
 }
 
-fn render_fraction(sec: &Section, x: f64, pieces: &mut [String]) {
+/// Display width of a token in a fraction section, for blanking a hidden part with spaces.
+fn shown_width(t: &Tok) -> usize {
+    match t {
+        Tok::Lit(s) | Tok::FixedDenom(s) => s.chars().count(),
+        Tok::Digit(_) | Tok::Slash => 1,
+        _ => 0,
+    }
+}
+
+/// Replaces the literals in `range` with spaces (`spaces`) or nothing; placeholders and the bar
+/// in it get the same treatment through `pieces`.
+fn blank_range(toks: &[Tok], range: std::ops::Range<usize>, spaces: bool, pieces: &mut [String], lits: &mut [Option<String>]) {
+    for i in range {
+        let Some(t) = toks.get(i) else { break };
+        let s = if spaces { " ".repeat(shown_width(t)) } else { String::new() };
+        match t {
+            Tok::Lit(_) => {
+                if let Some(l) = lits.get_mut(i) {
+                    *l = Some(s);
+                }
+            }
+            Tok::Digit(_) | Tok::Slash | Tok::FixedDenom(_) => {
+                if let Some(p) = pieces.get_mut(i) {
+                    *p = s;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A fraction section is `[whole] [sep] num [lit] / [lit] den`: the numerator is the run of
+/// placeholders ending at the last one before the bar, the whole part is every placeholder
+/// before it (literals between them stay), `sep` the literals between the two parts.
+///
+/// Observed Excel behaviour: when the whole part shows no digit its separator disappears (or
+/// becomes spaces when the whole part or the numerator has a `?`); when the fraction is zero and
+/// the numerator has no `0` placeholder, the separator, numerator, bar and denominator disappear
+/// (or become spaces when any part has a `?`) and the whole part shows at least `0`.
+fn render_fraction(sec: &Section, x: f64, pieces: &mut [String], lits: &mut [Option<String>]) {
     let toks = &sec.toks;
+    let is_digit = |i: usize| matches!(toks.get(i), Some(Tok::Digit(_)));
     let Some(slash) = toks.iter().position(|t| matches!(t, Tok::Slash)) else { return };
-    let mut num_start = slash;
-    while num_start > 0 && matches!(toks.get(num_start - 1), Some(Tok::Digit(_))) {
+    let Some(num_last) = (0..slash).rev().find(|&i| is_digit(i)) else { return };
+    let mut num_start = num_last;
+    while num_start > 0 && is_digit(num_start - 1) {
         num_start -= 1;
     }
     let whole_idx = digit_indices(toks, 0..num_start);
-    let num_idx = digit_indices(toks, num_start..slash);
-    let mut den_end = slash + 1;
-    let fixed_den: Option<u64> = match toks.get(slash + 1) {
-        Some(Tok::FixedDenom(s)) => {
-            den_end += 1;
-            Some(s.parse::<u64>().unwrap_or(u64::MAX).clamp(1, 1_000_000_000))
+    let num_idx = digit_indices(toks, num_start..num_last + 1);
+    let sep_start = whole_idx.last().map_or(num_start, |&w| w + 1);
+    let (fixed_den, den_start): (Option<u64>, usize) = match toks.get(slash + 1) {
+        Some(Tok::FixedDenom(s)) => (Some(s.parse::<u64>().unwrap_or(u64::MAX).clamp(1, 1_000_000_000)), slash + 1),
+        _ => {
+            let mut i = slash + 1;
+            while matches!(toks.get(i), Some(Tok::Lit(_))) {
+                i += 1;
+            }
+            (None, i)
         }
-        _ => None,
     };
-    if fixed_den.is_none() {
-        while matches!(toks.get(den_end), Some(Tok::Digit(_))) {
+    let mut den_end = den_start;
+    if fixed_den.is_some() {
+        den_end += 1;
+    } else {
+        while is_digit(den_end) {
             den_end += 1;
         }
     }
-    let den_idx = digit_indices(toks, slash + 1..den_end);
+    let den_idx = digit_indices(toks, den_start..den_end);
+    let has_q = |idx: &[usize]| idx.iter().any(|&i| toks.get(i) == Some(&Tok::Digit('?')));
     let has_whole = !whole_idx.is_empty();
     let (mut whole, f) = if has_whole { (x.floor(), x - x.floor()) } else { (0.0, x) };
     let (mut num, den) = match fixed_den {
@@ -407,39 +465,39 @@ fn render_fraction(sec: &Section, x: f64, pieces: &mut [String]) {
         num %= den;
     }
     let whole_s = if whole >= 1.0 { fixed(whole, 0).0 } else { String::new() };
-    let blank = has_whole && num == 0;
-    fill_int(toks, &whole_idx, &whole_s, sec.thousands, blank, pieces);
-    let num_s = num.to_string();
-    let den_s = den.to_string();
-    if blank {
-        let width = |idx: &[usize]| idx.len();
-        let nw = width(&num_idx).max(1);
-        if let Some(&first) = num_idx.first()
-            && let Some(p) = pieces.get_mut(first)
-        {
-            *p = " ".repeat(nw);
-        }
-        if let Some(p) = pieces.get_mut(slash) {
-            *p = " ".into();
-        }
-        let dw = if fixed_den.is_some() { den_s.len() } else { den_idx.len() };
-        if let Some(p) = pieces.get_mut(slash + 1) {
-            *p = " ".repeat(dw);
-        }
-        // Literals between the whole part and the numerator stay as they are.
+    let num_zero_ph = num_idx.iter().any(|&i| toks.get(i) == Some(&Tok::Digit('0')));
+    if has_whole && num == 0 && !num_zero_ph {
+        fill_int(toks, &whole_idx, &whole_s, sec.thousands, true, pieces);
+        let spaces = has_q(&whole_idx) || has_q(&num_idx) || has_q(&den_idx);
+        blank_range(toks, sep_start..den_end, spaces, pieces, lits);
         return;
     }
-    fill_int(toks, &num_idx, &num_s, false, true, pieces);
+    if has_whole {
+        // A zero value shows `0` in a `?` or `0` units place, nothing in a `#` one.
+        let units_hash = whole_idx.last().is_some_and(|&i| toks.get(i) == Some(&Tok::Digit('#')));
+        let force = whole_s.is_empty() && num == 0 && !units_hash;
+        fill_int(toks, &whole_idx, &whole_s, sec.thousands, force, pieces);
+        let whole_shown = whole_idx.iter().any(|&i| pieces.get(i).is_some_and(|p| p.chars().any(|c| c.is_ascii_digit())));
+        if !whole_shown {
+            let spaces = has_q(&whole_idx) || has_q(&num_idx);
+            blank_range(toks, sep_start..num_start, spaces, pieces, lits);
+        }
+    }
+    fill_int(toks, &num_idx, &num.to_string(), false, true, pieces);
     if let Some(p) = pieces.get_mut(slash) {
         *p = "/".into();
     }
+    let den_s = den.to_string();
     if fixed_den.is_some() {
-        if let Some(p) = pieces.get_mut(slash + 1) {
+        if let Some(p) = pieces.get_mut(den_start) {
             *p = den_s;
         }
     } else {
-        // Denominator digits are left aligned; `?` pads with spaces after them.
-        let dc: Vec<char> = den_s.chars().collect();
+        // Denominator digits are zero padded to the `0` placeholders, then left aligned; `?`
+        // pads with spaces after them.
+        let zeros = den_idx.iter().filter(|&&i| toks.get(i) == Some(&Tok::Digit('0'))).count();
+        let padded = format!("{den_s:0>zeros$}");
+        let dc: Vec<char> = padded.chars().collect();
         let count = den_idx.len();
         for (k, &ti) in den_idx.iter().enumerate() {
             let s = if k + 1 == count {

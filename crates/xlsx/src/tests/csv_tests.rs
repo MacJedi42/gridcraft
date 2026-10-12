@@ -80,6 +80,11 @@ fn delimiter_sniffing() {
     assert_eq!(sniff_delimiter("a;b\r\n\r\nc;d\r\n", '"'), b';');
     let wb = read_csv(b"x;y\n1,5;2", &CsvOptions { delimiter: 0, ..Default::default() }).unwrap();
     assert_eq!(v(&wb, 1, 1), Value::Number(2.0));
+    // The workbook remembers the separator it was read with, sniffed or given.
+    assert_eq!(wb.csv_delimiter, Some(b';'));
+    assert_eq!(read_csv(b"a\tb", &CsvOptions { delimiter: 0, ..Default::default() }).unwrap().csv_delimiter, Some(b'\t'));
+    assert_eq!(read_csv(b"a;b", &CsvOptions::default()).unwrap().csv_delimiter, Some(b','));
+    assert_eq!(Workbook::new().csv_delimiter, None);
     assert!(read_csv(b"a", &CsvOptions { delimiter: b'"', ..Default::default() }).is_err());
 }
 
@@ -94,11 +99,21 @@ fn writing() {
     s.set_value(CellRef::new(3, 3), Value::text("x\ny"));
     s.set_value(CellRef::new(3, 1), Value::Error(gridcraft_core::CellError::Div0));
     wb.sheets = vec![std::sync::Arc::new(s)];
-    let out = String::from_utf8(write_csv(wb.sheet(0).unwrap(), &wb, b',')).unwrap();
+    // The caller supplies each field's text; quoting and line ends are the writer's.
+    let sh = wb.sheet(0).unwrap();
+    let raw = |c: CellRef| match sh.value(c) {
+        Value::Empty => String::new(),
+        Value::Number(n) => gridcraft_core::number_to_text(n),
+        Value::Text(t) => t.to_string(),
+        Value::Bool(b) => if b { "TRUE" } else { "FALSE" }.into(),
+        Value::Error(e) => e.as_str().into(),
+        Value::Array(_) => String::new(),
+    };
+    let out = String::from_utf8(write_csv(sh, b',', raw)).unwrap();
     assert_eq!(out, "\"a,b\",\"q\"\"t\",\r\n0.1,FALSE,\r\n#DIV/0!,,\"x\ny\"\r\n");
-    let semi = String::from_utf8(write_csv(wb.sheet(0).unwrap(), &wb, b';')).unwrap();
+    let semi = String::from_utf8(write_csv(sh, b';', raw)).unwrap();
     assert!(semi.starts_with("a,b;"));
-    assert!(write_csv(&Sheet::new("E"), &wb, b',').is_empty());
+    assert!(write_csv(&Sheet::new("E"), b',', raw).is_empty());
     // Round trip.
     let back = read_csv(out.as_bytes(), &CsvOptions::default()).unwrap();
     assert_eq!(v(&back, 0, 0), Value::text("a,b"));

@@ -29,6 +29,21 @@ impl gridcraft_chart::Measure for EguiMeasure<'_> {
     }
 }
 
+/// Paints `chart` (not necessarily on the sheet: the Recommended Charts preview) scaled to fit
+/// `rect`.
+pub fn paint_chart(p: &Painter, rect: Rect, wb: &Workbook, sheet: usize, chart: &gridcraft_engine::model::Chart) {
+    let (w, h) = (chart.anchor.width.max(1.0), chart.anchor.height.max(1.0));
+    let z = (rect.width() / w).min(rect.height() / h);
+    if !(z.is_finite() && z > 0.0) {
+        return;
+    }
+    let origin = rect.center() - vec2(w * z, h * z) / 2.0;
+    let data = gridcraft_chart::resolve(wb, sheet, chart);
+    let m = EguiMeasure { painter: p, z };
+    let prims = gridcraft_chart::render(chart, &data, w, h, &m);
+    paint_prims(&p.with_clip_rect(rect.intersect(p.clip_rect())), origin, &prims, z);
+}
+
 /// Paints chart primitives at `origin`, scaled by `z`.
 pub fn paint_prims(p: &Painter, origin: Pos2, prims: &[Prim], z: f32) {
     let pt = |x: f32, y: f32| pos2(origin.x + x * z, origin.y + y * z);
@@ -180,6 +195,54 @@ fn area_mesh(v: &[Pos2], col: Color32) -> egui::Mesh {
     mesh
 }
 
+/// A shape's text with its formatting: size, bold/italic, typeface, colour, outline, horizontal
+/// alignment and vertical anchor. Shapes other than text boxes default to white text centred in
+/// the shape; text boxes to black text at the top left.
+fn paint_shape_text(p: &Painter, wb: &Workbook, sp: &gridcraft_engine::model::Shape, r: Rect, z: f32) {
+    use gridcraft_engine::model::{ShapeTextAlign, ShapeTextAnchor};
+    let f = &sp.format;
+    let text_box = sp.kind == ShapeKind::TextBox;
+    let align = f.align.unwrap_or(if text_box { ShapeTextAlign::Left } else { ShapeTextAlign::Center });
+    let anchor = f.anchor.unwrap_or(if text_box { ShapeTextAnchor::Top } else { ShapeTextAnchor::Middle });
+    let default_color = if text_box { Color32::BLACK } else { Color32::WHITE };
+    let color = f.text_color.and_then(|c| c.resolve(&wb.theme)).map(theme::color32).unwrap_or(default_color);
+    // Default 14 px (as before); a set size is in points.
+    let size = f.font_size.map_or(14.0, |pt| pt * 96.0 / 72.0).clamp(1.0, 2000.0) * z;
+    let family = theme::cell_family(f.font.as_deref().unwrap_or(""), f.bold, f.italic);
+    let inset = 4.0;
+    let width = (r.width() - 2.0 * inset).max(1.0);
+    let mut job = egui::text::LayoutJob::simple(sp.text.clone(), FontId::new(size, family), color, width);
+    job.halign = match align {
+        ShapeTextAlign::Left => egui::Align::LEFT,
+        ShapeTextAlign::Center => egui::Align::Center,
+        ShapeTextAlign::Right => egui::Align::RIGHT,
+    };
+    let g = p.layout_job(job);
+    let x = match align {
+        ShapeTextAlign::Left => r.left() + inset,
+        ShapeTextAlign::Center => r.center().x,
+        ShapeTextAlign::Right => r.right() - inset,
+    };
+    let y = match anchor {
+        ShapeTextAnchor::Top => r.top() + inset,
+        ShapeTextAnchor::Middle => r.center().y - g.size().y / 2.0,
+        ShapeTextAnchor::Bottom => r.bottom() - inset - g.size().y,
+    };
+    let pos = pos2(x, y);
+    let clip = p.with_clip_rect(r.intersect(p.clip_rect()));
+    // egui has no stroked text: the outline is the text drawn in the outline colour, offset in
+    // eight directions by the outline width, under the filled text.
+    if let Some((c, w)) = f.text_outline
+        && let Some(oc) = c.resolve(&wb.theme).map(theme::color32)
+    {
+        let d = (w * 96.0 / 72.0 * z / 2.0).clamp(0.5, 20.0);
+        for (dx, dy) in [(-1.0, -1.0), (0.0, -1.0), (1.0, -1.0), (-1.0, 0.0), (1.0, 0.0), (-1.0, 1.0), (0.0, 1.0), (1.0, 1.0)] {
+            clip.galley_with_override_text_color(pos + vec2(dx * d, dy * d), g.clone(), oc);
+        }
+    }
+    clip.galley(pos, g, color);
+}
+
 pub(crate) fn anchor_rect(geo: &Geo, sh: &Sheet, a: &Anchor) -> Rect {
     let x = geo.x(sh, a.cell.col) + a.dx * geo.z;
     let y = geo.y(sh, a.cell.row) + a.dy * geo.z;
@@ -188,14 +251,26 @@ pub(crate) fn anchor_rect(geo: &Geo, sh: &Sheet, a: &Anchor) -> Rect {
 
 static TEXTURES: std::sync::LazyLock<Mutex<HashMap<(u32, usize), egui::TextureHandle>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
-pub fn paint_objects(app: &SheetApp, p: &Painter, geo: &Geo, wb: &Workbook, si: usize, sh: &Sheet) {
+/// The shapes one floating object painted (indices into the painter's layer) and its logical
+/// rectangle, so a right-to-left sheet can move it as a whole instead of mirroring it.
+pub(crate) struct PaintedObject {
+    pub shapes: std::ops::Range<usize>,
+    pub rect: Rect,
+}
+
+pub(crate) fn paint_objects(app: &SheetApp, p: &Painter, geo: &Geo, wb: &Workbook, si: usize, sh: &Sheet) -> Vec<PaintedObject> {
+    let mut painted = Vec::new();
+    let mut done = |start: egui::layers::ShapeIdx, rect: Rect| painted.push(PaintedObject { shapes: start.0..p.add(egui::Shape::Noop).0, rect });
     for sp in &sh.shapes {
         let r = anchor_rect(geo, sh, &sp.anchor);
         if !r.intersects(p.clip_rect()) {
             continue;
         }
+        let start = p.add(egui::Shape::Noop);
+        let mut label = true;
         let fill = sp.fill.resolve(&wb.theme).map(theme::color32).unwrap_or(Color32::TRANSPARENT);
-        let line = sp.line.resolve(&wb.theme).map(theme::color32).unwrap_or(Color32::DARK_GRAY);
+        let line =
+            if sp.format.no_line { Color32::TRANSPARENT } else { sp.line.resolve(&wb.theme).map(theme::color32).unwrap_or(Color32::DARK_GRAY) };
         match sp.kind {
             ShapeKind::Rectangle | ShapeKind::TextBox => {
                 p.rect_filled(r, 0.0, fill);
@@ -225,13 +300,13 @@ pub fn paint_objects(app: &SheetApp, p: &Painter, geo: &Geo, wb: &Workbook, si: 
                     let col = if w > 8.0 { line.gamma_multiply(0.45) } else { line };
                     p.add(PathShape::line(pts, PathStroke::new(w, col)));
                 }
-                continue;
+                label = false;
             }
             ShapeKind::Icon => {
                 if let Some(icon) = crate::icons::from_name(&sp.text) {
                     crate::icons::paint(p, r, icon, if fill == Color32::TRANSPARENT { Color32::BLACK } else { fill });
                 }
-                continue;
+                label = false;
             }
             ShapeKind::Line | ShapeKind::Arrow => {
                 p.line_segment([r.left_top(), r.right_bottom()], Stroke::new(2.0, line));
@@ -243,26 +318,20 @@ pub fn paint_objects(app: &SheetApp, p: &Painter, geo: &Geo, wb: &Workbook, si: 
                 }
             }
         }
-        if !sp.text.is_empty() && !app.editing_text_box(sp.id) {
-            let job = egui::text::LayoutJob::simple(
-                sp.text.clone(),
-                FontId::new(14.0 * geo.z, egui::FontFamily::Name(theme::CELL.into())),
-                if sp.kind == ShapeKind::TextBox { Color32::BLACK } else { Color32::WHITE },
-                r.width() - 8.0,
-            );
-            let g = p.layout_job(job);
-            let pos = if sp.kind == ShapeKind::TextBox { r.min + vec2(4.0, 4.0) } else { r.center() - g.size() / 2.0 };
-            p.galley(pos, g, Color32::BLACK);
+        if label && !sp.text.is_empty() && !app.editing_text_box(sp.id) {
+            paint_shape_text(p, wb, sp, r, geo.z);
         }
-        if sp.kind == ShapeKind::TextBox && app.selected_chart == Some(sp.id) {
+        if label && sp.kind == ShapeKind::TextBox && app.selected_chart == Some(sp.id) {
             selection_frame(p, r);
         }
+        done(start, r);
     }
     for im in &sh.images {
         let r = anchor_rect(geo, sh, &im.anchor);
         if !r.intersects(p.clip_rect()) {
             continue;
         }
+        let start = p.add(egui::Shape::Noop);
         let key = (im.id, im.data.len());
         let mut cache = TEXTURES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if !cache.contains_key(&key)
@@ -282,12 +351,14 @@ pub fn paint_objects(app: &SheetApp, p: &Painter, geo: &Geo, wb: &Workbook, si: 
         if app.selected_chart == Some(im.id) {
             selection_frame(p, r);
         }
+        done(start, r);
     }
     for ch in &sh.charts {
         let r = anchor_rect(geo, sh, &ch.anchor);
         if !r.intersects(p.clip_rect()) {
             continue;
         }
+        let start = p.add(egui::Shape::Noop);
         // Soft shadow + white card.
         p.rect_filled(r.translate(vec2(0.0, 1.5)), 2.0, Color32::from_black_alpha(18));
         p.rect_filled(r, 0.0, Color32::WHITE);
@@ -297,17 +368,131 @@ pub fn paint_objects(app: &SheetApp, p: &Painter, geo: &Geo, wb: &Workbook, si: 
         paint_prims(&p.with_clip_rect(r.intersect(p.clip_rect())), r.min, &prims, geo.z);
         if app.selected_chart == Some(ch.id) {
             selection_frame(p, r);
+        }
+        // The source-data highlight below is in cell space: mirrored with the cells.
+        done(start, r);
+        if app.selected_chart == Some(ch.id) {
             // Highlight the source data like Excel does.
             for s in &ch.series {
                 if let Ok(gridcraft_engine::formula::Expr::Ref(rf)) = gridcraft_engine::formula::parse(&s.values)
                     && rf.sheet_name().is_none_or(|n| n.eq_ignore_ascii_case(&sh.name))
                 {
                     let rr = geo.range_rect(sh, rf.range());
-                    p.rect_stroke(rr, 0.0, Stroke::new(1.5, Color32::from_rgb(0x2E, 0x6F, 0xD8)), StrokeKind::Inside);
+                    for pane in geo.range_panes(rf.range()) {
+                        let pp = p.with_clip_rect(pane.intersect(p.clip_rect()));
+                        pp.rect_stroke(rr, 0.0, Stroke::new(1.5, Color32::from_rgb(0x2E, 0x6F, 0xD8)), StrokeKind::Inside);
+                    }
                 }
             }
         }
     }
+    paint_slicers(app, p, geo, wb, si, sh);
+    painted
+}
+
+/// Geometry of a slicer's parts within its screen rect.
+pub struct SlicerLayout {
+    pub header: Rect,
+    /// Clear-filter button in the header.
+    pub clear: Rect,
+    /// One rect per value tile, in order.
+    pub tiles: Vec<Rect>,
+}
+
+pub fn slicer_layout(rect: Rect, z: f32, n: usize, columns: u32) -> SlicerLayout {
+    let header_h = 26.0 * z;
+    let pad = 6.0 * z;
+    let gap = 3.0 * z;
+    let tile_h = 22.0 * z;
+    let header = Rect::from_min_size(rect.min, vec2(rect.width(), header_h));
+    let cb = 16.0 * z;
+    let clear = Rect::from_min_size(pos2(header.right() - pad - cb, header.top() + (header_h - cb) / 2.0), vec2(cb, cb));
+    let cols = columns.max(1) as f32;
+    let inner_left = rect.left() + pad;
+    let inner_top = header.bottom() + pad;
+    let inner_w = (rect.width() - 2.0 * pad).max(1.0);
+    let tile_w = ((inner_w - (cols - 1.0) * gap) / cols).max(1.0);
+    let mut tiles = Vec::with_capacity(n);
+    for i in 0..n {
+        let col = (i as f32) % cols;
+        let row = (i as f32 / cols).floor();
+        let x = inner_left + col * (tile_w + gap);
+        let y = inner_top + row * (tile_h + gap);
+        tiles.push(Rect::from_min_size(pos2(x, y), vec2(tile_w, tile_h)));
+    }
+    SlicerLayout { header, clear, tiles }
+}
+
+fn paint_slicers(app: &SheetApp, p: &Painter, geo: &Geo, wb: &Workbook, si: usize, sh: &Sheet) {
+    let tk = theme::Tokens::get(p.ctx());
+    for sl in &sh.slicers {
+        let r = anchor_rect(geo, sh, &sl.anchor);
+        if !r.intersects(p.clip_rect()) {
+            continue;
+        }
+        let items = gridcraft_engine::cmd::slicer::slicer_items(wb, si, sl);
+        let lay = slicer_layout(r, geo.z, items.len(), sl.columns);
+        let radius = 4.0 * geo.z;
+        // Card + soft shadow.
+        p.rect_filled(r.translate(vec2(0.0, 1.5)), radius, Color32::from_black_alpha(18));
+        p.rect_filled(r, radius, tk.window);
+        p.rect_stroke(r, radius, Stroke::new(1.0, tk.separator), StrokeKind::Inside);
+        // Header.
+        p.rect_filled(lay.header, radius, tk.accent_soft);
+        p.rect_filled(Rect::from_min_max(pos2(lay.header.left(), lay.header.bottom() - radius), lay.header.max), 0.0, tk.accent_soft);
+        let cap = if sl.caption.is_empty() { sl.column.clone() } else { sl.caption.clone() };
+        p.text(lay.header.left_center() + vec2(8.0 * geo.z, 0.0), Align2::LEFT_CENTER, cap, theme::ui_bold(12.5 * geo.z), tk.accent_dark);
+        // Clear-filter button (tinted when a filter is active).
+        let filtered = sl.selected.is_some();
+        if let Some(icon) = crate::icons::from_name("filter") {
+            crate::icons::paint(p, lay.clear, icon, if filtered { tk.accent } else { tk.text_dim });
+        }
+        // Value tiles.
+        for ((val, on), tr) in items.iter().zip(&lay.tiles) {
+            if !r.contains(tr.left_top()) {
+                continue; // overflowed the card; skip (no scroll yet)
+            }
+            let (fill, fg) = if *on { (tk.accent, Color32::WHITE) } else { (tk.hover, tk.text_dim) };
+            p.rect_filled(*tr, 3.0 * geo.z, fill);
+            let cp = p.with_clip_rect(tr.intersect(p.clip_rect()));
+            cp.text(tr.left_center() + vec2(6.0 * geo.z, 0.0), Align2::LEFT_CENTER, val, theme::ui_font(12.0 * geo.z), fg);
+        }
+        if app.selected_chart == Some(sl.id) {
+            selection_frame(p, r);
+        }
+    }
+}
+
+/// What a click inside a slicer hit.
+pub enum SlicerAction {
+    Toggle(String),
+    Clear,
+}
+
+/// A click on a slicer's value tile or clear button, if any. A click elsewhere in a slicer returns
+/// `None` so the caller can treat it as a select/drag on the object.
+pub fn slicer_click(geo: &Geo, sh: &Sheet, wb: &Workbook, si: usize, p: Pos2) -> Option<(u32, SlicerAction)> {
+    if !geo.cells.contains(p) {
+        return None;
+    }
+    for sl in sh.slicers.iter().rev() {
+        let r = anchor_rect(geo, sh, &sl.anchor);
+        if !r.contains(p) {
+            continue;
+        }
+        let items = gridcraft_engine::cmd::slicer::slicer_items(wb, si, sl);
+        let lay = slicer_layout(r, geo.z, items.len(), sl.columns);
+        if lay.clear.contains(p) {
+            return Some((sl.id, SlicerAction::Clear));
+        }
+        for ((val, _on), tr) in items.iter().zip(&lay.tiles) {
+            if r.contains(tr.left_top()) && tr.contains(p) {
+                return Some((sl.id, SlicerAction::Toggle(val.clone())));
+            }
+        }
+        return None; // inside this (topmost) slicer, but on its header/background → select/drag
+    }
+    None
 }
 
 fn selection_frame(p: &Painter, r: Rect) {
@@ -322,6 +507,12 @@ fn selection_frame(p: &Painter, r: Rect) {
 /// The topmost object under `p`: (kind, id, rect).
 pub fn hit(app: &SheetApp, geo: &Geo, sh: &Sheet, p: Pos2) -> Option<(&'static str, u32, Rect)> {
     let _ = app;
+    for sl in sh.slicers.iter().rev() {
+        let r = anchor_rect(geo, sh, &sl.anchor);
+        if r.contains(p) && geo.cells.contains(p) {
+            return Some(("slicer", sl.id, r));
+        }
+    }
     for ch in sh.charts.iter().rev() {
         let r = anchor_rect(geo, sh, &ch.anchor);
         if r.expand(4.0).contains(p) && geo.cells.contains(p) {

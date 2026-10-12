@@ -13,6 +13,15 @@
     <sub-class-of type="application/zip"/>
     <glob pattern="*.xlsm"/>
   </mime-type>
+  <mime-type type="application/vnd.ms-excel.sheet.binary.macroEnabled.12">
+    <comment>Excel binary workbook</comment>
+    <glob pattern="*.xlsb"/>
+  </mime-type>
+  <mime-type type="application/vnd.oasis.opendocument.spreadsheet">
+    <comment>OpenDocument spreadsheet</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.ods"/>
+  </mime-type>
   <mime-type type="text/csv">
     <comment>CSV document</comment>
     <sub-class-of type="text/plain"/>

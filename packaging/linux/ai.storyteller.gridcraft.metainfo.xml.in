@@ -56,6 +56,8 @@
     <binary>gridcraft-cli</binary>
     <mediatype>application/vnd.openxmlformats-officedocument.spreadsheetml.sheet</mediatype>
     <mediatype>application/vnd.ms-excel.sheet.macroEnabled.12</mediatype>
+    <mediatype>application/vnd.ms-excel.sheet.binary.macroEnabled.12</mediatype>
+    <mediatype>application/vnd.oasis.opendocument.spreadsheet</mediatype>
     <mediatype>text/csv</mediatype>
     <mediatype>text/tab-separated-values</mediatype>
   </provides>

@@ -496,7 +496,16 @@ pub(crate) fn specs() -> Vec<FnSpec> {
         f!("ISOWEEKNUM", 1, 1, DateTime, S, "ISOWEEKNUM(date)", "Returns the ISO 8601 week number of a date.", isoweeknum),
         f!("EDATE", 2, 2, DateTime, S, "EDATE(start_date, months)", "Returns the date a number of months before or after a date.", edate),
         f!("EOMONTH", 2, 2, DateTime, S, "EOMONTH(start_date, months)", "Returns the last day of the month a number of months away.", eomonth),
-        f!("DATEDIF", 3, 3, DateTime, S, "DATEDIF(start_date, end_date, unit)", "Counts whole years, months or days between two dates.", datedif),
+        f!(
+            "DATEDIF",
+            3,
+            3,
+            DateTime,
+            S,
+            "DATEDIF(start_date, end_date, unit)",
+            "Counts whole years, months or days between two dates. unit: Y, M, D, MD, YM or YD.",
+            datedif
+        ),
         f!("DATEVALUE", 1, 1, DateTime, S, "DATEVALUE(date_text)", "Converts a date written as text into a date serial number.", datevalue),
         f!("TIMEVALUE", 1, 1, DateTime, S, "TIMEVALUE(time_text)", "Converts a time written as text into a fraction of a day.", timevalue),
         f!("DAYS", 2, 2, DateTime, S, "DAYS(end_date, start_date)", "Returns the number of days between two dates.", days),

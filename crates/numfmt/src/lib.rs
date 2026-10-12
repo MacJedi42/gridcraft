@@ -102,7 +102,9 @@ impl NumberFormat {
     /// Parses a format code. Never fails: unknown or malformed parts degrade to literal text.
     pub fn parse(code: &str) -> NumberFormat {
         let trimmed = code.trim();
-        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("general") {
+        // `checkbox` marks a checkbox cell (Insert › Checkbox): TRUE/FALSE draw as a box, any other
+        // value displays as General.
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("general") || trimmed == "checkbox" {
             return NumberFormat {
                 inner: Arc::new(Inner { code: code.to_string(), general: true, sections: Vec::new(), num_sections: 0, text_section: None }),
             };
@@ -293,7 +295,8 @@ pub fn format_value(v: &Value, fmt: &NumberFormat, sys: DateSystem) -> Formatted
 }
 
 /// The `TEXT()` worksheet function: formats a value with a format code. Numeric text is
-/// converted to a number first; other text goes through the text section (or is returned as is).
+/// converted to a number first; other text and booleans (as `TRUE`/`FALSE`) go through the text
+/// section, or are returned as is.
 pub fn text_function(v: &Value, code: &str, sys: DateSystem) -> Result<String, CellError> {
     if code.is_empty() {
         return Ok(String::new());
@@ -303,7 +306,7 @@ pub fn text_function(v: &Value, code: &str, sys: DateSystem) -> Result<String, C
         Value::Error(e) => return Err(e),
         Value::Empty => 0.0,
         Value::Number(n) => n,
-        Value::Bool(b) => return Ok(if b { "TRUE" } else { "FALSE" }.into()),
+        Value::Bool(b) => return Ok(fmt.format_text(if b { "TRUE" } else { "FALSE" }).text),
         Value::Text(t) => match gridcraft_core::parse::parse_number_text(&t) {
             Some(n) => n,
             None => return Ok(fmt.format_text(&t).text),

@@ -71,6 +71,11 @@ pub trait Host {
     fn used_range(&mut self, sheet: usize) -> Option<RangeRef> {
         self.workbook().sheet(sheet).and_then(|s| s.used_range())
     }
+    /// Calls `f` on each stored value of a block, row-major (formula cells evaluated first),
+    /// until `f` returns false. `false` when this host can't (callers use `range_values`).
+    fn visit_range(&mut self, _sheet: usize, _range: RangeRef, _f: &mut dyn FnMut(&Value) -> bool) -> bool {
+        false
+    }
 }
 
 pub struct Evaluator<'h> {
@@ -266,6 +271,13 @@ impl<'h> Evaluator<'h> {
             let scope = def.scope.unwrap_or(self.sheet);
             return match gridcraft_formula::parse(&text) {
                 Ok(expr) => {
+                    // Relative references in a name are relative to A1: used here, they move by
+                    // this cell's offset from it.
+                    let expr = if gridcraft_formula::adjust::has_relative_refs(&expr) {
+                        gridcraft_formula::adjust::shift_relative_wrapping(expr, self.at.row as i64, self.at.col as i64)
+                    } else {
+                        expr
+                    };
                     let saved = self.sheet;
                     // Unqualified references in a name refer to the scope sheet.
                     self.sheet = scope;
@@ -368,6 +380,9 @@ impl<'h> Evaluator<'h> {
     }
 
     fn unary(&mut self, op: UnOp, x: &Expr) -> Ev {
+        if let UnOp::Trim(mode) = op {
+            return self.trim_ref(mode, x);
+        }
         if op == UnOp::Spill {
             return match self.eval(x) {
                 Ev::R(areas) => match areas.as_slice() {
@@ -402,7 +417,7 @@ impl<'h> Evaluator<'h> {
                 UnOp::Neg => Value::number(-n),
                 UnOp::Plus => Value::number(n),
                 UnOp::Percent => Value::number(n / 100.0),
-                UnOp::At | UnOp::Spill => Value::number(n),
+                UnOp::At | UnOp::Spill | UnOp::Trim(_) => Value::number(n),
             },
             op == UnOp::Plus,
         ))
@@ -582,7 +597,20 @@ impl<'h> Evaluator<'h> {
                 if args.len() < 2 {
                     return err(CellError::Value);
                 }
-                let i = match self.arg_num(args, 0, 0.0) {
+                let index = self.value(&args[0]);
+                if let Value::Array(_) = index {
+                    // An array of indexes picks element by element: `CHOOSE({1,2},A1:A3,B1:B3)`
+                    // is a two-column array. The library CHOOSE lifts over its arguments.
+                    let Some(spec) = gridcraft_functions::lookup(name) else { return err(CellError::Name) };
+                    let mut evaluated = vec![Arg { value: index, from_ref: false }];
+                    for a in &args[1..] {
+                        let value = self.value(a);
+                        evaluated.push(Arg { value, from_ref: false });
+                    }
+                    let mut ctx = FnCtx { ev: self };
+                    return gridcraft_functions::call(spec, &evaluated, &mut ctx).pipe(Ev::V);
+                }
+                let i = match index.to_number() {
                     Ok(n) => n.trunc() as i64,
                     Err(e) => return err(e),
                 };
@@ -691,7 +719,9 @@ impl<'h> Evaluator<'h> {
             "OFFSET" => self.offset(args),
             "INDIRECT" => self.indirect(args),
             "INDEX" => self.index(args),
+            "XLOOKUP" => self.xlookup(args),
             "CELL" => self.cell_info(args),
+            "TRIMRANGE" => self.trimrange(args),
             "SUBTOTAL" | "AGGREGATE" => self.subtotal(name, args),
             "TEXT" => {
                 if args.len() != 2 {
@@ -754,6 +784,9 @@ impl<'h> Evaluator<'h> {
         if args.len() < spec.min_args || args.len() > spec.max_args {
             return err(CellError::Value);
         }
+        if let Some(kind) = Agg::of(spec.name) {
+            return self.aggregate(kind, args);
+        }
         let mut evaluated = Vec::with_capacity(args.len());
         // SUMIF/AVERAGEIF: the size of the criteria range (argument 1), which the sum range takes.
         let mut criteria_shape = None;
@@ -788,6 +821,71 @@ impl<'h> Evaluator<'h> {
         }
         let mut ctx = FnCtx { ev: self };
         gridcraft_functions::call(spec, &evaluated, &mut ctx).pipe(Ev::V)
+    }
+
+    /// Performs aggregation operations without copying its ranges: blocks are folded over the stored
+    /// cells, so no array is built and there is no `MAX_CELLS` limit. Arguments are evaluated and read one
+    /// after another, as the array path does, so volatile formulas (like `RAND`) see the same order.
+    /// Only `SUM`, `COUNT` and `AVG` are supported currently.
+    fn aggregate(&mut self, kind: Agg, args: &[Expr]) -> Ev {
+        let mut acc = Acc::default();
+        let mut first_error = None;
+        for a in args {
+            let ev = self.eval(a);
+            let steps = match ev {
+                Ev::R(areas) => areas.iter().map(|area| self.aggregate_area(kind, area, &mut acc)).collect(),
+                ev => {
+                    let value = self.deref(ev);
+                    vec![self.aggregate_value(kind, value, false, &mut acc)]
+                }
+            };
+            if first_error.is_none() {
+                first_error = steps.into_iter().find_map(Result::err);
+            }
+        }
+        first_error.unwrap_or_else(|| Ev::V(acc.finish(kind)))
+    }
+
+    /// Adds one area to `acc`; `Err` is the result the function ends with.
+    fn aggregate_area(&mut self, kind: Agg, a: &Area, acc: &mut Acc) -> Result<(), Ev> {
+        if !a.range.is_single() {
+            let mut error = None;
+            let walked = self.host.visit_range(a.sheet, a.range, &mut |v| match acc.add_cell(kind, v) {
+                Ok(()) => true,
+                Err(e) => {
+                    error = Some(e);
+                    false
+                }
+            });
+            if walked {
+                return error.map_or(Ok(()), |e| Err(err(e)));
+            }
+        }
+        let value = self.area_value(a);
+        self.aggregate_value(kind, value, true, acc)
+    }
+
+    /// Adds one argument's value with `SUM`'s numbers and a call to `COUNT`, so coercion and error
+    /// rules stay in one place (`AVERAGE` of an argument is its `SUM` over its `COUNT`). The numbers
+    /// are added one by one so `SUM` can snap only its last addition.
+    fn aggregate_value(&mut self, kind: Agg, value: Value, from_ref: bool, acc: &mut Acc) -> Result<(), Ev> {
+        let Some(count) = gridcraft_functions::lookup("COUNT") else {
+            return Err(err(CellError::Name));
+        };
+        let args = [Arg { value, from_ref }];
+        if kind != Agg::Count {
+            match gridcraft_functions::numbers(&args) {
+                Ok(ns) => ns.into_iter().for_each(|n| acc.add(n)),
+                Err(e) => return Err(err(e)),
+            }
+        }
+        if kind != Agg::Sum {
+            match gridcraft_functions::call(count, &args, &mut FnCtx { ev: self }) {
+                Value::Number(n) => acc.count = acc.count.saturating_add(n as u64),
+                other => return Err(Ev::V(other)),
+            }
+        }
+        Ok(())
     }
 
     pub fn apply_lambda(&mut self, l: &Lambda, args: &[Expr]) -> Ev {
@@ -1033,18 +1131,57 @@ impl<'h> Evaluator<'h> {
             return err(CellError::Value);
         }
         let src = self.eval(&args[0]);
-        let row = match self.arg_num(args, 1, 0.0) {
-            Ok(n) => n.trunc() as i64,
-            Err(e) => return err(e),
+        let mut arg = |i: usize| match args.get(i) {
+            None | Some(Expr::Missing) => None,
+            Some(e) => Some(self.value(e)),
         };
-        let col = match self.arg_num(args, 2, 0.0) {
-            Ok(n) => n.trunc() as i64,
-            Err(e) => return err(e),
-        };
+        let (rows, cols) = (arg(1), arg(2));
         let area_n = match self.arg_num(args, 3, 1.0) {
             Ok(n) => n.trunc() as i64,
             Err(e) => return err(e),
         };
+        let two = args.len() == 2;
+        let num = |v: &Option<Value>| v.as_ref().map_or(Ok(0.0), |v| v.to_number()).map(|n| n.trunc() as i64);
+        // Arrays of positions pick a value for each: INDEX(A1:C10,{1;2},{1,3}) is 2×2.
+        if let (Some(Value::Array(_)), _) | (_, Some(Value::Array(_))) = (&rows, &cols) {
+            let as_array = |v: &Option<Value>| match v {
+                Some(Value::Array(a)) => Arc::clone(a),
+                Some(v) => Arc::new(Array::scalar(v.clone())),
+                None => Arc::new(Array::scalar(Value::Number(0.0))),
+            };
+            let (ra, ca) = (as_array(&rows), as_array(&cols));
+            let (h, w) = (ra.rows.max(ca.rows), ra.cols.max(ca.cols));
+            if (h as u64).saturating_mul(w as u64) > MAX_CELLS {
+                return err(CellError::Num);
+            }
+            let mut out = Vec::with_capacity(h * w);
+            for r in 0..h {
+                for c in 0..w {
+                    let pos = (num(&Some(ra.get_broadcast(r, c))), num(&Some(ca.get_broadcast(r, c))));
+                    let v = match pos {
+                        (Ok(row), Ok(col)) => {
+                            let one = self.index_one(src.clone(), row, col, area_n, two);
+                            match self.deref(one) {
+                                Value::Array(a) if a.rows * a.cols > 1 => Value::Error(CellError::Calc),
+                                v => v.scalar(),
+                            }
+                        }
+                        (Err(e), _) | (_, Err(e)) => Value::Error(e),
+                    };
+                    out.push(v);
+                }
+            }
+            return Ev::V(Array::new(h, w, out).map(Value::from).unwrap_or(Value::Error(CellError::Value)));
+        }
+        let (row, col) = match (num(&rows), num(&cols)) {
+            (Ok(r), Ok(c)) => (r, c),
+            (Err(e), _) | (_, Err(e)) => return err(e),
+        };
+        self.index_one(src, row, col, area_n, two)
+    }
+
+    /// INDEX for one row and column position (0 = the whole column or row).
+    fn index_one(&mut self, src: Ev, row: i64, col: i64, area_n: i64, two_args: bool) -> Ev {
         if row < 0 || col < 0 {
             return err(CellError::Value);
         }
@@ -1053,7 +1190,7 @@ impl<'h> Evaluator<'h> {
                 let Some(a) = areas.get((area_n - 1).max(0) as usize).copied() else { return err(CellError::Ref) };
                 let r = a.range;
                 // A single row or column with one index picks along it.
-                let (row, col) = if args.len() == 2 && r.height() == 1 { (1, row) } else { (row, col) };
+                let (row, col) = if two_args && r.height() == 1 { (1, row) } else { (row, col) };
                 if row as u64 > r.height() as u64 || col as u64 > r.width() as u64 {
                     return err(CellError::Ref);
                 }
@@ -1062,7 +1199,7 @@ impl<'h> Evaluator<'h> {
                 Ev::R(vec![Area { sheet: a.sheet, range: RangeRef::new(CellRef::new(r0, c0), CellRef::new(r1, c1)) }])
             }
             Ev::V(Value::Array(arr)) => {
-                let (row, col) = if args.len() == 2 && arr.rows == 1 { (1, row) } else { (row, col) };
+                let (row, col) = if two_args && arr.rows == 1 { (1, row) } else { (row, col) };
                 if row as usize > arr.rows || col as usize > arr.cols {
                     return err(CellError::Ref);
                 }
@@ -1083,6 +1220,66 @@ impl<'h> Evaluator<'h> {
             }
             Ev::L(_) => err(CellError::Value),
         }
+    }
+
+    /// XLOOKUP whose result range is a reference returns a reference, as in Excel, so that it can
+    /// end a range (`SUM(XLOOKUP(a,…):XLOOKUP(b,…))`) or feed CELL. Everything else (arrays of
+    /// lookup values, array arguments, errors) goes to the library function.
+    fn xlookup(&mut self, args: &[Expr]) -> Ev {
+        if (3..=6).contains(&args.len())
+            && let (Ev::R(look), Ev::R(ret)) = (self.eval(&args[1]), self.eval(&args[2]))
+            && let ([l], [r]) = (look.as_slice(), ret.as_slice())
+            && let Some(spec) = gridcraft_functions::lookup("XMATCH")
+        {
+            let key = self.value(&args[0]);
+            let (l, r) = (*l, *r);
+            let vertical = l.range.width() == 1 && l.range.height() > 1;
+            let horizontal = l.range.height() == 1 && l.range.width() > 1;
+            let same_len = if vertical { r.range.height() == l.range.height() } else { r.range.width() == l.range.width() };
+            if !matches!(key, Value::Array(_)) && (vertical || horizontal) && same_len {
+                let mut xargs = vec![Arg { value: key, from_ref: false }, Arg { value: self.area_value(&l), from_ref: true }];
+                // An empty match_mode before a given search_mode is the default (0), not the end.
+                let given = |i: usize| args.get(i).is_some_and(|e| !matches!(e, Expr::Missing));
+                let last = if given(5) {
+                    5
+                } else if given(4) {
+                    4
+                } else {
+                    3
+                };
+                for i in 4..=last {
+                    match args.get(i) {
+                        Some(Expr::Missing) | None => xargs.push(Arg { value: Value::Number(0.0), from_ref: false }),
+                        Some(e) => {
+                            let value = self.value(e);
+                            xargs.push(Arg { value, from_ref: false });
+                        }
+                    }
+                }
+                let mut ctx = FnCtx { ev: self };
+                return match gridcraft_functions::call(spec, &xargs, &mut ctx) {
+                    Value::Number(p) if p >= 1.0 => {
+                        let k = p as u32 - 1;
+                        let range = if vertical {
+                            RangeRef::new(
+                                CellRef::new(r.range.start.row + k, r.range.start.col),
+                                CellRef::new(r.range.start.row + k, r.range.end.col),
+                            )
+                        } else {
+                            RangeRef::new(
+                                CellRef::new(r.range.start.row, r.range.start.col + k),
+                                CellRef::new(r.range.end.row, r.range.start.col + k),
+                            )
+                        };
+                        Ev::R(vec![Area { sheet: r.sheet, range }])
+                    }
+                    Value::Error(CellError::NA) if args.get(3).is_some_and(|e| !matches!(e, Expr::Missing)) => self.eval(&args[3]),
+                    Value::Error(e) => err(e),
+                    _ => err(CellError::Value),
+                };
+            }
+        }
+        self.builtin("XLOOKUP", args)
     }
 
     fn cell_info(&mut self, args: &[Expr]) -> Ev {
@@ -1149,6 +1346,9 @@ impl<'h> Evaluator<'h> {
             return err(CellError::Value);
         }
         let skip_hidden = matches!(options, 1 | 3 | 5 | 7);
+        // SUBTOTAL leaves out rows a filter hides whatever the function number (Microsoft's
+        // SUBTOTAL documentation); 101-111 also leave out rows hidden by hand.
+        let skip_filtered = name == "SUBTOTAL";
         let skip_errors = matches!(options, 2 | 3 | 6 | 7);
         let skip_nested = options <= 3;
         let mut values = Vec::new();
@@ -1166,7 +1366,8 @@ impl<'h> Evaluator<'h> {
                             let (hidden, nested) = {
                                 let wb = self.host.workbook();
                                 let s = wb.sheet(a.sheet);
-                                let hidden = skip_hidden && s.is_some_and(|s| s.is_row_hidden(c.row));
+                                let hidden =
+                                    s.is_some_and(|s| if skip_hidden { s.is_row_hidden(c.row) } else { skip_filtered && s.is_row_filtered(c.row) });
                                 let nested = skip_nested
                                     && s.and_then(|s| s.cell(c)).and_then(|cell| cell.formula.as_ref()).is_some_and(|f| {
                                         let u = f.text.to_ascii_uppercase();
@@ -1271,6 +1472,67 @@ pub fn r1c1_to_a1(s: &str, at: CellRef) -> Option<String> {
         None => conv(body)?,
     };
     Some(format!("{sheet}{out}"))
+}
+
+/// The aggregates that can fold a reference without building an array.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Agg {
+    Sum,
+    Count,
+    Average,
+}
+
+impl Agg {
+    fn of(name: &str) -> Option<Agg> {
+        match name {
+            "SUM" => Some(Agg::Sum),
+            "COUNT" => Some(Agg::Count),
+            "AVERAGE" => Some(Agg::Average),
+            _ => None,
+        }
+    }
+}
+
+/// What a folded aggregate carries from one value to the next.
+#[derive(Default)]
+struct Acc {
+    /// The sum of every number but the last, left to right.
+    sum: f64,
+    /// The last number seen: `SUM` snaps only its last addition (see `gridcraft_core::arith::sum_snapped`).
+    last: Option<f64>,
+    count: u64,
+}
+
+impl Acc {
+    fn add(&mut self, n: f64) {
+        if let Some(prev) = self.last.replace(n) {
+            self.sum += prev;
+        }
+    }
+
+    /// Takes a value found inside a reference: only numbers count. `Err` is an error value that
+    /// ends `SUM` and `AVERAGE`; `COUNT` skips errors.
+    fn add_cell(&mut self, kind: Agg, v: &Value) -> Result<(), CellError> {
+        match v {
+            Value::Number(n) => {
+                self.add(*n);
+                self.count = self.count.saturating_add(1);
+                Ok(())
+            }
+            Value::Error(e) if kind != Agg::Count => Err(*e),
+            _ => Ok(()),
+        }
+    }
+
+    fn finish(&self, kind: Agg) -> Value {
+        let plain = self.sum + self.last.unwrap_or(0.0);
+        match kind {
+            Agg::Sum => Value::number(self.last.map_or(self.sum, |l| gridcraft_core::arith::snap_add(self.sum, l))),
+            Agg::Count => Value::number(self.count as f64),
+            Agg::Average if self.count == 0 => Value::Error(CellError::Div0),
+            Agg::Average => Value::number(plain / self.count as f64),
+        }
+    }
 }
 
 // ---------------------------------------------------------------- operators
@@ -1500,6 +1762,7 @@ fn is_special(n: &str) -> bool {
             | "INDIRECT"
             | "INDEX"
             | "CELL"
+            | "TRIMRANGE"
             | "SUBTOTAL"
             | "AGGREGATE"
             | "TEXT"
@@ -1537,6 +1800,7 @@ pub const SPECIAL_FUNCTIONS: &[&str] = &[
     "INDIRECT",
     "INDEX",
     "CELL",
+    "TRIMRANGE",
     "SUBTOTAL",
     "AGGREGATE",
     "TEXT",

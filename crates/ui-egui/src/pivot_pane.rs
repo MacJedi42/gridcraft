@@ -136,6 +136,9 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui) {
             if ui.button("Refresh").clicked() {
                 app.run_or_alert("pivot.refresh", json!({"pivot": name}));
             }
+            if ui.button("Calculated Field…").clicked() {
+                app.run_or_alert("pivot.calculatedField", json!({"pivot": name}));
+            }
             egui::ComboBox::from_id_salt("pv_layout").selected_text("Report Layout").show_ui(ui, |ui| {
                 for (l, v) in [("Compact", "compact"), ("Outline", "outline"), ("Tabular", "tabular")] {
                     if ui.button(l).clicked() {

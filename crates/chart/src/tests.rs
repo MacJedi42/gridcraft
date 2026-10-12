@@ -48,6 +48,7 @@ fn chart(kind: ChartKind) -> Chart {
         y_title: Some("Revenue".into()),
         source: None,
         by_rows: false,
+        pivot: None,
     }
 }
 
@@ -61,6 +62,7 @@ fn series(name: &str, values: &[f64], color: Rgba, kind: ChartKind) -> SeriesDat
         kind,
         secondary: false,
         smooth: false,
+        trendlines: Vec::new(),
         number_format: "$#,##0".into(),
     }
 }
@@ -225,6 +227,7 @@ fn resolve_from_workbook() {
             secondary: false,
             kind: None,
             smooth: false,
+            trendlines: Vec::new(),
         },
         Series {
             name: None,
@@ -235,6 +238,7 @@ fn resolve_from_workbook() {
             secondary: true,
             kind: None,
             smooth: false,
+            trendlines: Vec::new(),
         },
         Series {
             name: Some("Literal".into()),
@@ -245,6 +249,7 @@ fn resolve_from_workbook() {
             secondary: false,
             kind: None,
             smooth: false,
+            trendlines: Vec::new(),
         },
     ];
     let d = resolve(&wb, 0, &c);
@@ -282,6 +287,7 @@ fn resolve_from_workbook() {
             secondary: false,
             kind: None,
             smooth: false,
+            trendlines: Vec::new(),
         },
         Series {
             name: None,
@@ -292,6 +298,7 @@ fn resolve_from_workbook() {
             secondary: true,
             kind: None,
             smooth: false,
+            trendlines: Vec::new(),
         },
     ];
     let d = resolve(&wb, 0, &c);
@@ -307,6 +314,7 @@ fn resolve_from_workbook() {
         secondary: false,
         kind: None,
         smooth: false,
+        trendlines: Vec::new(),
     }];
     let d = resolve(&wb, 0, &c);
     assert_eq!(d.series[0].x.as_ref().map(|x| x.len()), Some(3));
@@ -323,6 +331,7 @@ fn resolve_from_workbook() {
         secondary: false,
         kind: None,
         smooth: false,
+        trendlines: Vec::new(),
     }];
     let d = resolve(&wb, 7, &c);
     assert_eq!(d.series.len(), 1);
@@ -582,6 +591,28 @@ fn fuzz_random_data_and_sizes() {
                 kind: ALL_KINDS[(r.next() % ALL_KINDS.len() as u64) as usize],
                 secondary: r.next().is_multiple_of(3),
                 smooth: r.next().is_multiple_of(4),
+                trendlines: (0..r.next() % 3)
+                    .map(|_| TrendlineData {
+                        spec: Trendline {
+                            kind: [
+                                TrendlineKind::Linear,
+                                TrendlineKind::Exponential,
+                                TrendlineKind::Logarithmic,
+                                TrendlineKind::Polynomial((r.next() % 8) as u8),
+                                TrendlineKind::Power,
+                                TrendlineKind::MovingAverage((r.next() % 6) as u32),
+                            ][(r.next() % 6) as usize],
+                            forward: [0.0, 1.5, -2.0, f64::NAN, 1e300][(r.next() % 5) as usize],
+                            backward: [0.0, 0.5, f64::INFINITY][(r.next() % 3) as usize],
+                            intercept: [None, Some(0.0), Some(-5.0), Some(f64::NAN)][(r.next() % 4) as usize],
+                            display_equation: r.next().is_multiple_of(2),
+                            display_r_squared: r.next().is_multiple_of(2),
+                            width: [None, Some(0.0), Some(f32::NAN), Some(3.0)][(r.next() % 4) as usize],
+                            ..Trendline::default()
+                        },
+                        color: [0, 0, 0, 255],
+                    })
+                    .collect(),
                 number_format: ["General", "$#,##0", "0.00%", "yyyy-mm-dd", "#,##0.0;[Red]-#,##0.0", "@"][(r.next() % 6) as usize].into(),
             })
             .collect();
@@ -630,6 +661,193 @@ fn sparklines() {
     assert!(render_sparkline(SparklineKind::Line, &[], [0; 4], false, 10.0, 10.0).is_empty());
 }
 
+// ---------------------------------------------------------------- trendlines
+
+fn close(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1e-9 * (1.0 + b.abs())
+}
+
+fn fit(kind: TrendlineKind, pts: &[(f64, f64)]) -> crate::trend::TrendFit {
+    crate::trend::fit_trendline(&Trendline { kind, ..Trendline::default() }, pts).expect("fits")
+}
+
+#[test]
+fn linear_trendline_matches_least_squares() {
+    // Slope 0.6, intercept 2.2, R² = 1 - 2.4 / 6.
+    let f = fit(TrendlineKind::Linear, &[(1.0, 2.0), (2.0, 4.0), (3.0, 5.0), (4.0, 4.0), (5.0, 5.0)]);
+    assert!(close(f.coef[0], 2.2) && close(f.coef[1], 0.6), "{:?}", f.coef);
+    assert!(close(f.r2.unwrap(), 0.6));
+    assert_eq!(f.equation(), "y = 0.6x + 2.2");
+    assert_eq!(f.r_squared(), "R² = 0.6");
+    assert!(close(f.eval(10.0).unwrap(), 8.2));
+    let down = fit(TrendlineKind::Linear, &[(0.0, 1.0), (1.0, -1.0), (2.0, -3.0)]);
+    assert_eq!(down.equation(), "y = -2x + 1");
+}
+
+#[test]
+fn set_intercept_fits_through_it() {
+    // Through the origin: slope Σxy / Σx² = 30 / 14; R² against the uncentred total.
+    let pts = [(1.0, 2.0), (2.0, 5.0), (3.0, 6.0)];
+    let f = crate::trend::fit_trendline(&Trendline { intercept: Some(0.0), ..Trendline::default() }, &pts).unwrap();
+    assert!(close(f.coef[0], 0.0) && close(f.coef[1], 15.0 / 7.0), "{:?}", f.coef);
+    let ss_res: f64 = pts.iter().map(|(x, y)| (y - 15.0 / 7.0 * x).powi(2)).sum();
+    assert!(close(f.r2.unwrap(), 1.0 - ss_res / 65.0));
+    let q = crate::trend::fit_trendline(
+        &Trendline { kind: TrendlineKind::Polynomial(2), intercept: Some(2.0), ..Trendline::default() },
+        &[(1.0, 0.0), (2.0, 0.0), (3.0, 2.0), (4.0, 6.0)],
+    )
+    .unwrap();
+    assert!(close(q.coef[0], 2.0) && close(q.coef[1], -3.0) && close(q.coef[2], 1.0), "{:?}", q.coef);
+}
+
+#[test]
+fn transformed_trendlines_recover_their_curves() {
+    let xs: [f64; 6] = [0.5, 1.0, 2.0, 3.0, 4.5, 6.0];
+    let e = fit(TrendlineKind::Exponential, &xs.map(|x| (x, 3.0 * (0.5 * x).exp())));
+    assert!(close(e.coef[0].exp(), 3.0) && close(e.coef[1], 0.5));
+    assert_eq!(e.equation(), "y = 3e^(0.5x)");
+    let l = fit(TrendlineKind::Logarithmic, &xs.map(|x| (x, 2.0 * x.ln() + 1.0)));
+    assert!(close(l.coef[1], 2.0) && close(l.coef[0], 1.0));
+    assert_eq!(l.equation(), "y = 2ln(x) + 1");
+    let p = fit(TrendlineKind::Power, &xs.map(|x| (x, 4.0 * x.powf(1.5))));
+    assert!(close(p.coef[0].exp(), 4.0) && close(p.coef[1], 1.5));
+    assert_eq!(p.equation(), "y = 4x^1.5");
+    assert!(close(p.r2.unwrap(), 1.0));
+    assert_eq!(p.eval(-1.0), None, "power is undefined left of zero");
+    // Points the transform can't take are skipped, as Excel documents.
+    let skip = fit(TrendlineKind::Exponential, &[(1.0, 2.0f64.exp()), (2.0, 0.0), (3.0, -4.0), (4.0, 8.0f64.exp())]);
+    assert!(close(skip.coef[1], 2.0) && close(skip.coef[0], 0.0), "{:?}", skip.coef);
+    assert!(
+        crate::trend::fit_trendline(&Trendline { kind: TrendlineKind::Power, ..Trendline::default() }, &[(-1.0, 1.0), (0.0, 2.0), (3.0, 3.0)])
+            .is_none()
+    );
+}
+
+#[test]
+fn polynomial_trendlines_are_stable() {
+    let q = fit(TrendlineKind::Polynomial(2), &[0.0, 1.0, 2.0, 3.0, 4.0].map(|x| (x, x * x - 3.0 * x + 2.0)));
+    assert!(close(q.coef[0], 2.0) && close(q.coef[1], -3.0) && close(q.coef[2], 1.0), "{:?}", q.coef);
+    assert_eq!(q.equation(), "y = x² - 3x + 2");
+    // Year-valued x would make the raw normal equations hopelessly ill-conditioned.
+    let curve = |x: f64| {
+        let t = x - 2000.0;
+        0.001 * t.powi(6) - 0.02 * t.powi(5) + 0.1 * t.powi(3) - t + 7.0
+    };
+    let years: Vec<(f64, f64)> = (2001..=2012).map(|x| (f64::from(x), curve(f64::from(x)))).collect();
+    let six = fit(TrendlineKind::Polynomial(6), &years);
+    for x in [2001.0, 2006.5, 2012.0, 2014.0] {
+        let (got, want) = (six.eval(x).unwrap(), curve(x));
+        assert!((got - want).abs() <= 1e-6 * (1.0 + want.abs()), "{x}: {got} vs {want}");
+    }
+    assert!(six.r2.unwrap() > 0.999_999);
+}
+
+#[test]
+fn degenerate_trendlines_fit_nothing() {
+    let lin = |pts: &[(f64, f64)]| crate::trend::fit_trendline(&Trendline::default(), pts);
+    assert!(lin(&[]).is_none());
+    assert!(lin(&[(1.0, 1.0)]).is_none());
+    assert!(lin(&[(2.0, 1.0), (2.0, 5.0), (2.0, 3.0)]).is_none(), "all x equal is singular");
+    assert!(lin(&[(f64::NAN, 1.0), (1.0, f64::INFINITY), (2.0, 3.0)]).is_none());
+    assert!(
+        crate::trend::fit_trendline(&Trendline { kind: TrendlineKind::Polynomial(3), ..Trendline::default() }, &[(1.0, 1.0), (2.0, 4.0), (3.0, 9.0)])
+            .is_none()
+    );
+    assert!(
+        crate::trend::fit_trendline(&Trendline { kind: TrendlineKind::MovingAverage(2), ..Trendline::default() }, &[(1.0, 1.0), (2.0, 2.0)])
+            .is_none()
+    );
+    let flat = lin(&[(1.0, 4.0), (2.0, 4.0), (3.0, 4.0)]).unwrap();
+    assert_eq!((flat.equation(), flat.r2), ("y = 4".to_string(), None));
+    assert!(lin(&[(0.0, 1e300), (1.0, -1e300), (2.0, 1e300)]).is_none_or(|f| f.coef.iter().all(|c| c.is_finite())));
+}
+
+#[test]
+fn moving_average_and_labels() {
+    let pts = [(1.0, 1.0), (2.0, 2.0), (3.0, 6.0), (4.0, f64::NAN), (5.0, 4.0)];
+    assert_eq!(crate::trend::moving_average(&pts, 2), vec![(2.0, 1.5), (3.0, 4.0), (5.0, 5.0)]);
+    assert_eq!(crate::trend::moving_average(&pts, 3), vec![(3.0, 3.0), (5.0, 4.0)]);
+    assert!(crate::trend::moving_average(&pts, 9).is_empty());
+    assert_eq!(crate::trend::num_text(0.000012345), "1.2345E-05");
+    assert_eq!(crate::trend::num_text(-0.00001), "-1E-05");
+    assert_eq!(crate::trend::num_text(1234.56789), "1234.5679");
+    assert_eq!(crate::trend::auto_name(TrendlineKind::MovingAverage(3), "Sales"), "3 per. Mov. Avg. (Sales)");
+    assert_eq!(crate::trend::auto_name(TrendlineKind::Exponential, "Sales"), "Expon. (Sales)");
+}
+
+fn lines_of(prims: &[Prim], color: Rgba) -> Vec<&Vec<[f32; 2]>> {
+    prims
+        .iter()
+        .filter_map(|p| match p {
+            Prim::Line { pts, color: c, .. } if *c == color => Some(pts),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn line_chart_draws_trendline_forecast_and_labels() {
+    let m = ApproxMeasure;
+    let tc: Rgba = [1, 2, 3, 255];
+    let mut s = series("Sales", &[9.0, 7.0, 5.0, 3.0], [10, 20, 30, 255], ChartKind::Line);
+    s.trendlines =
+        vec![TrendlineData { spec: Trendline { forward: 1.0, display_equation: true, display_r_squared: true, ..Trendline::default() }, color: tc }];
+    let d = ChartData { categories: ["a", "b", "c", "d"].map(String::from).to_vec(), series: vec![s.clone()] };
+    let mut c = chart(ChartKind::Line);
+    c.legend = LegendPos::None; // keeps legend swatches out of the line counts
+    let prims = render(&c, &d, 600.0, 400.0, &m);
+    assert_sane(&prims, 600.0, 400.0);
+    let data = lines_of(&prims, [10, 20, 30, 255]);
+    let trend = lines_of(&prims, tc);
+    assert_eq!((data.len(), trend.len()), (1, 1));
+    let (d0, dn) = (data[0][0], data[0][3]);
+    let (t0, tn) = (trend[0][0], *trend[0].last().unwrap());
+    // Exact data: the trendline starts on the first point and runs through the last,
+    // then on one more category (the forecast slot).
+    assert!((t0[0] - d0[0]).abs() < 0.01 && (t0[1] - d0[1]).abs() < 0.01, "{t0:?} vs {d0:?}");
+    let step = (dn[0] - d0[0]) / 3.0;
+    assert!((tn[0] - (dn[0] + step)).abs() < 0.01, "forecast end {tn:?}, last point {dn:?}");
+    assert!(tn[1] > dn[1], "keeps falling past the data");
+    let t = texts(&prims);
+    assert!(t.contains(&"y = -2x + 11") && t.contains(&"R² = 1"), "{t:?}");
+    assert!(legend_entries(&chart(ChartKind::Line), &d).iter().any(|(n, col, sw)| n == "Linear (Sales)" && *col == tc && *sw == Swatch::Line));
+    // Not on chart kinds Excel doesn't offer trendlines on.
+    let pie = render(&chart(ChartKind::Pie), &d, 600.0, 400.0, &m);
+    assert!(lines_of(&pie, tc).is_empty());
+    // One point: nothing to fit, nothing drawn.
+    s.values.truncate(1);
+    let one = ChartData { categories: vec!["a".into()], series: vec![s] };
+    assert!(lines_of(&render(&c, &one, 600.0, 400.0, &m), tc).is_empty());
+}
+
+#[test]
+fn scatter_trendlines_use_x_values_and_stay_in_the_plot() {
+    let m = ApproxMeasure;
+    let xs = [1.0, 2.0, 4.0, 8.0];
+    let mut s = series("P", &xs.map(|x| 4.0 * x * x), [10, 20, 30, 255], ChartKind::Scatter);
+    s.x = Some(xs.iter().map(|x| Some(*x)).collect());
+    let colors: [Rgba; 3] = [[1, 0, 0, 255], [2, 0, 0, 255], [3, 0, 0, 255]];
+    s.trendlines = vec![
+        TrendlineData {
+            spec: Trendline { kind: TrendlineKind::Power, backward: 0.5, display_equation: true, ..Trendline::default() },
+            color: colors[0],
+        },
+        // A steep exponential leaves the plot box and is clipped to it.
+        TrendlineData { spec: Trendline { kind: TrendlineKind::Exponential, forward: 30.0, ..Trendline::default() }, color: colors[1] },
+        TrendlineData { spec: Trendline { kind: TrendlineKind::MovingAverage(2), ..Trendline::default() }, color: colors[2] },
+    ];
+    let d = ChartData { categories: vec![], series: vec![s] };
+    let mut c = chart(ChartKind::Scatter);
+    c.legend = LegendPos::None;
+    let prims = render(&c, &d, 600.0, 400.0, &m);
+    assert_sane(&prims, 600.0, 400.0);
+    for c in colors {
+        assert!(!lines_of(&prims, c).is_empty(), "{c:?} not drawn");
+    }
+    assert_eq!(lines_of(&prims, colors[2])[0].len(), 3, "moving average: one point per full window");
+    assert!(texts(&prims).contains(&"y = 4x^2"));
+}
+
 #[test]
 fn treemap_and_histogram_shapes() {
     let d = ChartData {
@@ -657,4 +875,30 @@ fn treemap_and_histogram_shapes() {
     let prims = render(&chart(ChartKind::Histogram), &d, 600.0, 400.0, &ApproxMeasure);
     let bins = prims.iter().filter(|p| matches!(p, Prim::Rect { fill: Some([10, 20, 30, 255]), .. })).count();
     assert_eq!(bins, 10);
+}
+
+#[test]
+fn union_series_references() {
+    let mut wb = Workbook::new();
+    {
+        let s = wb.sheet_mut(0).unwrap();
+        for (r, (l, v)) in [("a", 1.0), ("b", 2.0), ("Total", 3.0), ("d", 4.0)].iter().enumerate() {
+            s.set_value(CellRef::new(r as u32, 0), Value::from(*l));
+            s.set_value(CellRef::new(r as u32, 1), Value::Number(*v));
+        }
+    }
+    let mut c = chart(ChartKind::ColumnClustered);
+    c.series = vec![Series {
+        name: Some("\"Sum of X\"".into()),
+        categories: Some("(Sheet1!$A$1:$A$2,Sheet1!$A$4)".into()),
+        values: "(Sheet1!$B$1:$B$2,Sheet1!$B$4)".into(),
+        ..Series::default()
+    }];
+    let d = resolve(&wb, 0, &c);
+    assert_eq!(d.series[0].values, vec![Some(1.0), Some(2.0), Some(4.0)]);
+    assert_eq!(d.series[0].name, "Sum of X");
+    assert_eq!(d.categories, vec!["a", "b", "d"]);
+    // Deeply nested parentheses from a file are bounded, not a crash.
+    c.series[0].values = format!("{}Sheet1!$B$1,Sheet1!$B$2{}", "(".repeat(5000), ")".repeat(5000));
+    let _ = resolve(&wb, 0, &c);
 }

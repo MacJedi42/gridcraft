@@ -4,7 +4,7 @@
 use std::fmt::Write as _;
 
 use gridcraft_core::{CellRef, MAX_COLS, MAX_ROWS};
-use gridcraft_model::{Anchor, AnchorMode, Color, Image, Shape, ShapeKind, Sheet, Theme};
+use gridcraft_model::{Anchor, AnchorMode, Color, Image, Shape, ShapeFormat, ShapeKind, ShapeTextAlign, ShapeTextAnchor, Sheet, Theme};
 
 use crate::IoError;
 use crate::read::Ctx;
@@ -217,7 +217,44 @@ fn read_shape(obj: &El, anchor: Anchor) -> Option<Shape> {
             tb.kids("p").map(|p| p.kids("r").filter_map(|r| r.child("t")).map(|t| t.text.as_str()).collect::<String>()).collect::<Vec<_>>().join("\n")
         })
         .unwrap_or_default();
-    Some(Shape { id: 0, kind, anchor, fill, line, text })
+    let mut format = read_text_format(obj.child("txBody"));
+    format.no_line = ln.is_some_and(|l| l.child("noFill").is_some());
+    Some(Shape { id: 0, kind, anchor, fill, line, text, format })
+}
+
+/// A shape's text formatting: vertical anchor (`a:bodyPr anchor`), the first paragraph's
+/// alignment (`a:pPr algn`) and the first run's properties (`a:rPr`: size, bold, italic, fill,
+/// outline, `a:latin` typeface).
+fn read_text_format(body: Option<&El>) -> ShapeFormat {
+    let mut f = ShapeFormat::default();
+    let Some(body) = body else { return f };
+    f.anchor = body.child("bodyPr").and_then(|b| b.attr("anchor")).map(|a| match a {
+        "ctr" => ShapeTextAnchor::Middle,
+        "b" => ShapeTextAnchor::Bottom,
+        _ => ShapeTextAnchor::Top,
+    });
+    let first_p = body.kids("p").next();
+    f.align = first_p.and_then(|p| p.child("pPr")).and_then(|p| p.attr("algn")).map(|a| match a {
+        "ctr" => ShapeTextAlign::Center,
+        "r" => ShapeTextAlign::Right,
+        _ => ShapeTextAlign::Left,
+    });
+    let rpr = body.kids("p").flat_map(|p| p.kids("r")).find_map(|r| r.child("rPr"));
+    if let Some(r) = rpr {
+        // `sz` is in hundredths of a point (100..=400000 in the schema).
+        f.font_size = r.attr_f64("sz").filter(|v| v.is_finite()).map(|v| (v / 100.0).clamp(1.0, 4000.0) as f32);
+        f.bold = r.flag("b", false);
+        f.italic = r.flag("i", false);
+        f.font = r.child("latin").and_then(|l| l.attr("typeface")).filter(|t| !t.is_empty() && !t.starts_with('+')).map(str::to_string);
+        f.text_color = r.child("solidFill").and_then(dml_color);
+        f.text_outline = r.child("ln").and_then(|l| {
+            let c = l.child("solidFill").and_then(dml_color)?;
+            // Width in EMU (12700 per point); Excel's default hairline is 0.75 pt.
+            let w = l.attr_f64("w").filter(|w| w.is_finite()).map_or(0.75, |w| (w / 12700.0).clamp(0.0, 100.0)) as f32;
+            Some((c, w))
+        });
+    }
+    f
 }
 
 // ---------------------------------------------------------------- writing
@@ -341,7 +378,9 @@ pub fn write_drawing(sheet: &Sheet, theme: &Theme, objs: &[Obj<'_>]) -> String {
                     let _ = write!(s, "<a:solidFill>{c}</a:solidFill>");
                 }
                 let line_c = srgb(&sh.line, theme);
-                if line_c.is_some() || sh.kind == ShapeKind::Arrow {
+                if sh.format.no_line {
+                    s.push_str("<a:ln><a:noFill/></a:ln>");
+                } else if line_c.is_some() || sh.kind == ShapeKind::Arrow {
                     s.push_str("<a:ln w=\"9525\">");
                     match line_c {
                         Some(c) => {
@@ -356,12 +395,30 @@ pub fn write_drawing(sheet: &Sheet, theme: &Theme, objs: &[Obj<'_>]) -> String {
                 }
                 s.push_str("</xdr:spPr>");
                 if !sh.text.is_empty() {
-                    s.push_str("<xdr:txBody><a:bodyPr wrap=\"square\" rtlCol=\"0\" anchor=\"t\"/><a:lstStyle/>");
+                    let f = &sh.format;
+                    let anchor = match f.anchor {
+                        Some(ShapeTextAnchor::Top) => " anchor=\"t\"",
+                        Some(ShapeTextAnchor::Middle) => " anchor=\"ctr\"",
+                        Some(ShapeTextAnchor::Bottom) => " anchor=\"b\"",
+                        None if sh.kind == ShapeKind::TextBox => " anchor=\"t\"",
+                        None => "",
+                    };
+                    let _ = write!(s, "<xdr:txBody><a:bodyPr wrap=\"square\" rtlCol=\"0\"{anchor}/><a:lstStyle/>");
+                    let ppr = match f.align {
+                        None => "",
+                        Some(ShapeTextAlign::Left) => "<a:pPr algn=\"l\"/>",
+                        Some(ShapeTextAlign::Center) => "<a:pPr algn=\"ctr\"/>",
+                        Some(ShapeTextAlign::Right) => "<a:pPr algn=\"r\"/>",
+                    };
+                    let (rpr_attrs, rpr_body) = run_props(f, theme);
                     for line in sh.text.split('\n') {
                         if line.is_empty() {
-                            s.push_str("<a:p><a:endParaRPr lang=\"en-US\"/></a:p>");
+                            let _ = write!(s, "<a:p>{ppr}<a:endParaRPr lang=\"en-US\"{rpr_attrs}/></a:p>");
+                        } else if rpr_body.is_empty() {
+                            let _ = write!(s, "<a:p>{ppr}<a:r><a:rPr lang=\"en-US\"{rpr_attrs}/><a:t>{}</a:t></a:r></a:p>", esc(line));
                         } else {
-                            let _ = write!(s, "<a:p><a:r><a:rPr lang=\"en-US\"/><a:t>{}</a:t></a:r></a:p>", esc(line));
+                            let _ =
+                                write!(s, "<a:p>{ppr}<a:r><a:rPr lang=\"en-US\"{rpr_attrs}>{rpr_body}</a:rPr><a:t>{}</a:t></a:r></a:p>", esc(line));
                         }
                     }
                     s.push_str("</xdr:txBody>");
@@ -374,6 +431,35 @@ pub fn write_drawing(sheet: &Sheet, theme: &Theme, objs: &[Obj<'_>]) -> String {
     }
     s.push_str("</xdr:wsDr>");
     s
+}
+
+/// A text run's `a:rPr` attributes (size, bold, italic) and children in schema order (outline,
+/// fill, typeface).
+fn run_props(f: &ShapeFormat, theme: &Theme) -> (String, String) {
+    let mut attrs = String::new();
+    if let Some(sz) = f.font_size.filter(|v| v.is_finite()) {
+        let _ = write!(attrs, " sz=\"{}\"", (sz.clamp(1.0, 4000.0) * 100.0).round() as u32);
+    }
+    if f.bold {
+        attrs.push_str(" b=\"1\"");
+    }
+    if f.italic {
+        attrs.push_str(" i=\"1\"");
+    }
+    let mut body = String::new();
+    if let Some((c, w)) = &f.text_outline
+        && let Some(c) = srgb(c, theme)
+    {
+        let emu = (w.clamp(0.0, 100.0) * 12700.0).round() as u32;
+        let _ = write!(body, "<a:ln w=\"{emu}\"><a:solidFill>{c}</a:solidFill></a:ln>");
+    }
+    if let Some(c) = f.text_color.as_ref().and_then(|c| srgb(c, theme)) {
+        let _ = write!(body, "<a:solidFill>{c}</a:solidFill>");
+    }
+    if let Some(font) = &f.font {
+        let _ = write!(body, "<a:latin typeface=\"{}\"/>", esc(font));
+    }
+    (attrs, body)
 }
 
 /// File extension for an image MIME type.

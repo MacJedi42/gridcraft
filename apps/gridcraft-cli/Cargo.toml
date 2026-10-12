@@ -18,3 +18,6 @@ gridcraft-engine = { workspace = true }
 gridcraft-mcp = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
+# `check`: validating the packages GridCraft writes (content types, relationships).
+zip = { workspace = true }
+quick-xml = { workspace = true }

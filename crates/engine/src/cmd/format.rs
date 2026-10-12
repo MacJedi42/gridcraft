@@ -89,7 +89,7 @@ pub fn specs() -> Vec<CommandSpec> {
         // Alignment
         cmd!("home.alignLeft", "Align Left", ["Home", "Alignment"], Some("Cmd+L"), "{range?}", has_doc, |s, p| halign(s, p, HAlign::Left)),
         cmd!("home.alignCenter", "Center", ["Home", "Alignment"], Some("Cmd+E"), "{range?}", has_doc, |s, p| halign(s, p, HAlign::Center)),
-        cmd!("home.alignRight", "Align Right", ["Home", "Alignment"], Some("Cmd+R"), "{range?}", has_doc, |s, p| halign(s, p, HAlign::Right)),
+        cmd!("home.alignRight", "Align Right", ["Home", "Alignment"], None, "{range?}", has_doc, |s, p| halign(s, p, HAlign::Right)),
         cmd!("home.justify", "Justify", ["Home", "Alignment"], None, "{range?}", has_doc, |s, p| halign(s, p, HAlign::Justify)),
         cmd!("home.alignTop", "Top Align", ["Home", "Alignment"], None, "{range?}", has_doc, |s, p| valign(s, p, VAlign::Top)),
         cmd!("home.alignMiddle", "Middle Align", ["Home", "Alignment"], None, "{range?}", has_doc, |s, p| valign(s, p, VAlign::Center)),
@@ -156,7 +156,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Row Height…",
             ["Home", "Cells", "Format"],
             None,
-            "{rows?: \"2:5\", height: 20 (points on screen)}",
+            "{rows?: \"2:5\" | \"2:2,4:5\", height: 20 (points on screen)}",
             has_doc,
             row_height
         ),
@@ -165,7 +165,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Column Width…",
             ["Home", "Cells", "Format"],
             None,
-            "{cols?: \"B:D\", width: 64 (points) | chars: 8.43}",
+            "{cols?: \"B:D\" | \"B:B,D:F\", width: 64 (points) | chars: 8.43}",
             has_doc,
             col_width
         ),
@@ -561,8 +561,11 @@ fn merge(s: &mut Session, p: &Json, how: &str) -> Result<Json> {
         if how == "center" && s.doc()?.wb.sheet(sheet).is_some_and(|sh| ranges.iter().all(|r| sh.merges.contains(r))) { "unmerge" } else { how };
     edit(s, |cx| {
         let mut touched = Vec::new();
+        // Areas whose merging changes: a merged cell blocks a dynamic array's spill.
+        let mut areas: Vec<RangeRef> = ranges.clone();
         for r in &ranges {
             let sh = cx.sheet_mut(sheet)?;
+            areas.extend(sh.merges.iter().filter(|m| m.intersects(r)));
             sh.merges.retain(|m| !m.intersects(r));
             match how {
                 "unmerge" => {}
@@ -592,6 +595,17 @@ fn merge(s: &mut Session, p: &Json, how: &str) -> Result<Json> {
                     }
                 }
             }
+        }
+        // Spills over the areas, and blocked ones that could reach them, are evaluated again.
+        let sh = cx.sheet_mut(sheet)?;
+        for a in &areas {
+            touched.extend(sh.spill_ranges.iter().filter(|(_, r)| r.intersects(a)).map(|(anchor, _)| (sheet, *anchor)));
+            let reach = RangeRef::new(CellRef::new(0, 0), a.end);
+            let blocked = sh
+                .cells
+                .iter_range(reach)
+                .filter(|(_, x)| x.formula.is_some() && x.value == gridcraft_core::Value::Error(gridcraft_core::CellError::Spill));
+            touched.extend(blocked.map(|(c, _)| (sheet, c)));
         }
         cx.changed.extend(touched);
         Ok(())
@@ -910,8 +924,14 @@ fn cell_style(s: &mut Session, p: &Json) -> Result<Json> {
 fn line_targets(s: &Session, p: &Json, rows: bool) -> Result<Vec<(u32, u32)>> {
     let key = if rows { "rows" } else { "cols" };
     if let Some(t) = str_param(p, key) {
-        let r = RangeRef::parse(t).ok_or_else(|| bad(key, format!("not a range: {t}")))?;
-        return Ok(vec![if rows { (r.start.row, r.end.row) } else { (r.start.col, r.end.col) }]);
+        // A comma-separated list ("B:B,D:F") targets several areas, like a multi-area selection.
+        return t
+            .split(',')
+            .map(|part| {
+                let r = RangeRef::parse(part).ok_or_else(|| bad(key, format!("not a range: {part}")))?;
+                Ok(if rows { (r.start.row, r.end.row) } else { (r.start.col, r.end.col) })
+            })
+            .collect();
     }
     Ok(s.doc()?.selection.ranges.iter().map(|r| if rows { (r.start.row, r.end.row) } else { (r.start.col, r.end.col) }).collect())
 }
@@ -1013,7 +1033,9 @@ fn autofit_cols(s: &mut Session, p: &Json) -> Result<Json> {
                     let st = cx.wb.styles.get(sh.style_id(cell));
                     let text = crate::display::cell_text(&cx.wb, sh, cell);
                     for line in text.lines() {
-                        max = max.max(approx_text_width(line, st.font.size, st.font.bold) + 6.0 + st.align.indent as f32 * 9.0);
+                        max = max.max(
+                            approx_text_width(line, st.font.size, st.font.bold) + 6.0 + st.align.indent as f32 * 9.0 + sh.filter_button_space(cell),
+                        );
                     }
                 }
                 if max > 0.0 {

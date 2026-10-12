@@ -1,4 +1,4 @@
-//! File menu: new, open, save, close, export, properties.
+//! File menu: new, open, save, close, export, properties, options.
 
 use serde_json::{Value as Json, json};
 
@@ -8,14 +8,23 @@ use crate::DocState;
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(noundo "file.new", "New Workbook", ["File"], Some("Cmd+N"), "{sample?: \"budget\"|\"sales\"|\"grades\"}", always, new_workbook),
-        cmd!(noundo "file.open", "Open…", ["File"], Some("Cmd+O"), "{path} | {name, base64} (xlsx, xlsm, xlsb and ods data import, csv, tsv, txt, json)", always, open),
-        cmd!(noundo "file.save", "Save", ["File"], Some("Cmd+S"), "{path?} (xlsx by default; .csv/.tsv/.json/.html by extension)", has_doc, save),
-        cmd!(noundo "file.saveAs", "Save As…", ["File"], Some("Cmd+Shift+S"), "{path}", has_doc, save_as),
+        cmd!(noundo "file.open", "Open…", ["File"], Some("Cmd+O"), "{path} | {name, base64}, plus {password} for a password-protected workbook (xlsx, xlsm, xls import, xlsb and ods data import, csv, tsv, txt, json)", always, open),
+        cmd!(noundo "file.save", "Save", ["File"], Some("Cmd+S"), "{path?} (xlsx by default; .csv/.tsv/.json/.html/.pdf by extension)", has_doc, save),
+        cmd!(noundo "file.saveAs", "Save As…", ["File"], Some("Cmd+Shift+S"), "{path} (.xlsx, .csv, .tsv, .json, .html, or .pdf: a PDF of the active sheet)", has_doc, save_as),
         cmd!(query "file.saveBytes", "Encode Workbook", [], None, "{format?: xlsx|csv|tsv|json|html} → {base64}", has_doc, save_bytes),
         cmd!(noundo "file.close", "Close", ["File"], Some("Cmd+W"), "{force?: bool}", has_doc, close),
         cmd!(noundo "file.exportCsv", "Export as CSV", ["File", "Export"], None, "{path, sheet?}", has_doc, |s, p| export(s, p, "csv")),
         cmd!(noundo "file.exportHtml", "Save as Web Page", ["File", "Export"], None, "{path}", has_doc, |s, p| export(s, p, "html")),
         cmd!("file.properties", "Properties", ["File"], None, "{title?, subject?, author?, company?, keywords?, description?}", has_doc, properties),
+        cmd!(
+            query "file.options",
+            "Options",
+            ["File"],
+            None,
+            "{} → {calculation: {mode, iterative, maxIterations, maxChange}} for the active workbook (the interface opens File › Options; change settings with their own commands, e.g. formulas.calculationOptions, view.theme, app.language.set)",
+            always,
+            options
+        ),
         cmd!(noundo "window.activate", "Switch Window", ["Window"], None, "{index}", has_doc, activate_window),
     ]
 }
@@ -46,16 +55,20 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
         s.ui_requests.push(crate::UiRequest::Dialog("open".into(), json!({})));
         return ok();
     };
-    let (wb, warnings) = crate::io::open_bytes(&name, &bytes)?;
-    let imported = matches!(crate::io::FileKind::from_path(&name), Some(crate::io::FileKind::Ods | crate::io::FileKind::Xlsb))
-        || matches!(gridcraft_xlsx::sniff(&bytes), gridcraft_xlsx::Format::Ods | gridcraft_xlsx::Format::Xlsb);
+    let encrypted = gridcraft_xlsx::sniff(&bytes) == gridcraft_xlsx::Format::Encrypted;
+    let (wb, warnings) = crate::io::open_bytes_with_password(&name, &bytes, str_param(p, "password"))?;
+    let imported =
+        matches!(crate::io::FileKind::from_path(&name), Some(crate::io::FileKind::Ods | crate::io::FileKind::Xlsb | crate::io::FileKind::Xls))
+            || matches!(gridcraft_xlsx::sniff(&bytes), gridcraft_xlsx::Format::Ods | gridcraft_xlsx::Format::Xlsb | gridcraft_xlsx::Format::Xls);
     let title = if imported {
         format!("{} (imported).xlsx", std::path::Path::new(&name).file_stem().and_then(|n| n.to_str()).unwrap_or("Book"))
     } else {
         std::path::Path::new(&name).file_name().and_then(|n| n.to_str()).unwrap_or("Book").to_string()
     };
-    // An import has no save target: ordinary Save must ask for a new destination.
-    let path = str_param(p, "path").filter(|_| !imported).map(str::to_string);
+    // An import has no save target: ordinary Save must ask for a new destination. Neither does a
+    // workbook decrypted with its password, so Save never replaces the encrypted original with
+    // an unprotected copy.
+    let path = str_param(p, "path").filter(|_| !imported && !encrypted).map(str::to_string);
     // Replace an untouched blank Book1 like Excel does.
     if s.documents().len() == 1
         && s.active().is_some_and(|d| d.path.is_none() && !d.is_dirty() && d.undo.is_empty() && d.wb.sheets.iter().all(|sh| sh.cells.is_empty()))
@@ -63,10 +76,12 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
         s.close_document(0);
     }
     let i = s.add_document(DocState::new(wb, path, title));
-    if !warnings.is_empty() {
-        let mut message = warnings.iter().take(5).cloned().collect::<Vec<_>>().join("\n\n");
-        if warnings.len() > 5 {
-            message.push_str(&format!("\n\n{} additional import warnings.", warnings.len() - 5));
+    // The decrypted-workbook notice is for the info bar, not a message box.
+    let shown: Vec<&str> = warnings.iter().map(String::as_str).filter(|w| *w != crate::io::DECRYPTED_NOTICE).collect();
+    if !shown.is_empty() {
+        let mut message = shown.iter().take(5).copied().collect::<Vec<_>>().join("\n\n");
+        if shown.len() > 5 {
+            message.push_str(&format!("\n\n{} additional import warnings.", shown.len() - 5));
         }
         s.ui_requests.push(crate::UiRequest::Message(message));
     }
@@ -84,6 +99,11 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
             return ok();
         }
     };
+    // A PDF is a print of the sheet (Page Setup applies), not a copy of the workbook: the
+    // document keeps its file and its unsaved changes.
+    if std::path::Path::new(&path).extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("pdf")) {
+        return super::print::export_pdf(s, &json!({"path": path}));
+    }
     let d = s.doc_mut()?;
     let bytes = crate::io::save_bytes(&d.wb, &path)?;
     crate::io::write_file(&path, &bytes)?;
@@ -154,6 +174,22 @@ fn properties(s: &mut Session, p: &Json) -> Result<Json> {
         }
         Ok(serde_json::to_value(&cx.wb.props).unwrap_or_default())
     })
+}
+
+/// File › Options: reports the workbook-level settings and asks the interface to show its Options
+/// page. Nothing changes here; every setting has its own command.
+fn options(s: &mut Session, _: &Json) -> Result<Json> {
+    s.ui_requests.push(crate::UiRequest::Dialog("options".into(), json!({})));
+    let calculation = s.active().map(|d| {
+        let c = &d.wb.calc;
+        let mode = match c.mode {
+            gridcraft_model::CalcMode::Automatic => "automatic",
+            gridcraft_model::CalcMode::AutomaticExceptTables => "automaticExceptTables",
+            gridcraft_model::CalcMode::Manual => "manual",
+        };
+        json!({"mode": mode, "iterative": c.iterative, "maxIterations": c.max_iterations, "maxChange": c.max_change})
+    });
+    Ok(json!({"calculation": calculation}))
 }
 
 fn activate_window(s: &mut Session, p: &Json) -> Result<Json> {

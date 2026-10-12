@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 
 use gridcraft_core::Value;
 use gridcraft_formula::{Expr, SheetSel};
-use gridcraft_model::{Chart, ChartKind, Color, LegendPos, Series, Workbook};
+use gridcraft_model::{Chart, ChartKind, Color, LegendPos, LineDash, Series, Trendline, TrendlineKind, Workbook};
 
 use crate::drawing::{dml_color, srgb};
 use crate::xml::{El, esc, num};
@@ -107,7 +107,59 @@ fn read_series(s: &El) -> Series {
         secondary: false,
         kind: None,
         smooth: s.child("smooth").and_then(|e| e.attr("val")).and_then(|v| v.parse::<u8>().ok()).is_some_and(|v| v != 0),
+        trendlines: s.kids("trendline").filter_map(read_trendline).collect(),
     }
+}
+
+const DASHES: [(LineDash, &str); 11] = [
+    (LineDash::Solid, "solid"),
+    (LineDash::Dot, "dot"),
+    (LineDash::Dash, "dash"),
+    (LineDash::LgDash, "lgDash"),
+    (LineDash::DashDot, "dashDot"),
+    (LineDash::LgDashDot, "lgDashDot"),
+    (LineDash::LgDashDotDot, "lgDashDotDot"),
+    (LineDash::SysDash, "sysDash"),
+    (LineDash::SysDot, "sysDot"),
+    (LineDash::SysDashDot, "sysDashDot"),
+    (LineDash::SysDashDotDot, "sysDashDotDot"),
+];
+
+const EMU_PER_PT: f64 = 12_700.0;
+
+/// A `CT_Boolean` child (`val` defaults to true).
+fn bool_val(e: &El, tag: &str) -> bool {
+    e.child(tag).is_some_and(|c| c.flag("val", true))
+}
+
+fn f64_val(e: &El, tag: &str) -> Option<f64> {
+    e.child(tag).and_then(|c| c.attr_f64("val"))
+}
+
+/// `<c:trendline>` (ECMA-376 Part 1, 21.2.2.211). Unknown types are dropped.
+fn read_trendline(t: &El) -> Option<Trendline> {
+    let kind = match t.child_val("trendlineType").unwrap_or("linear") {
+        "linear" => TrendlineKind::Linear,
+        "exp" => TrendlineKind::Exponential,
+        "log" => TrendlineKind::Logarithmic,
+        "power" => TrendlineKind::Power,
+        "poly" => TrendlineKind::Polynomial(t.child_val("order").and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(2).clamp(2, 6)),
+        "movingAvg" => TrendlineKind::MovingAverage(t.child_val("period").and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(2).clamp(2, 255)),
+        _ => return None,
+    };
+    let ln = t.path(&["spPr", "ln"]);
+    Some(Trendline {
+        kind,
+        name: t.child("name").map(|n| n.text.clone()),
+        forward: f64_val(t, "forward").unwrap_or(0.0).max(0.0),
+        backward: f64_val(t, "backward").unwrap_or(0.0).max(0.0),
+        intercept: f64_val(t, "intercept"),
+        display_equation: bool_val(t, "dispEq"),
+        display_r_squared: bool_val(t, "dispRSqr"),
+        color: ln.and_then(|l| l.child("solidFill")).and_then(dml_color),
+        width: ln.and_then(|l| l.attr_f64("w")).map(|w| (w / EMU_PER_PT) as f32).filter(|w| w.is_finite() && *w >= 0.0),
+        dash: ln.and_then(|l| l.child("prstDash")).and_then(|d| d.attr("val")).and_then(|v| DASHES.iter().find(|(_, n)| *n == v).map(|(d, _)| *d)),
+    })
 }
 
 fn rich_title(t: &El) -> Option<String> {
@@ -184,6 +236,7 @@ pub fn read_chart(root: &El) -> Option<Chart> {
         y_title: y_ax.and_then(|a| a.child("title")).and_then(rich_title),
         source: None,
         by_rows: false,
+        pivot: root.path(&["pivotSource", "name"]).map(|n| n.text.trim().to_string()).filter(|n| !n.is_empty()),
     })
 }
 
@@ -342,6 +395,13 @@ fn series_xml(s: &Series, idx: usize, g: G, wb: &Workbook, si: usize) -> String 
         G::Bubble => x.push_str("<c:invertIfNegative val=\"0\"/>"),
         _ => {}
     }
+    // Trendlines sit between dLbls and the data in CT_LineSer, CT_BarSer, CT_AreaSer,
+    // CT_ScatterSer and CT_BubbleSer; pie and radar series have none.
+    if !matches!(g, G::Pie | G::Doughnut | G::Radar) {
+        for t in &s.trendlines {
+            x.push_str(&trendline_xml(t, wb));
+        }
+    }
     match g {
         G::Scatter { .. } | G::Bubble => {
             if let Some(c) = &s.categories {
@@ -366,6 +426,63 @@ fn series_xml(s: &Series, idx: usize, g: G, wb: &Workbook, si: usize) -> String 
         }
     }
     x.push_str("</c:ser>");
+    x
+}
+
+/// `<c:trendline>` with children in schema order: name, spPr, trendlineType, order, period,
+/// forward, backward, intercept, dispRSqr, dispEq, trendlineLbl.
+fn trendline_xml(t: &Trendline, wb: &Workbook) -> String {
+    let mut x = String::from("<c:trendline>");
+    if let Some(n) = &t.name {
+        let _ = write!(x, "<c:name>{}</c:name>", esc(n));
+    }
+    let color = t.color.as_ref().and_then(|c| srgb(c, &wb.theme));
+    if color.is_some() || t.width.is_some() || t.dash.is_some() {
+        x.push_str("<c:spPr><a:ln");
+        if let Some(w) = t.width.filter(|w| w.is_finite()) {
+            // ST_LineWidth: 0..=20116800 EMU.
+            let _ = write!(x, " w=\"{}\"", (f64::from(w) * EMU_PER_PT).round().clamp(0.0, 20_116_800.0) as i64);
+        }
+        x.push_str(" cap=\"rnd\">");
+        if let Some(c) = &color {
+            let _ = write!(x, "<a:solidFill>{c}</a:solidFill>");
+        }
+        if let Some(d) = t.dash.and_then(|d| DASHES.iter().find(|(k, _)| *k == d)) {
+            let _ = write!(x, "<a:prstDash val=\"{}\"/>", d.1);
+        }
+        x.push_str("</a:ln></c:spPr>");
+    }
+    let ty = match t.kind {
+        TrendlineKind::Linear => "linear",
+        TrendlineKind::Exponential => "exp",
+        TrendlineKind::Logarithmic => "log",
+        TrendlineKind::Polynomial(_) => "poly",
+        TrendlineKind::Power => "power",
+        TrendlineKind::MovingAverage(_) => "movingAvg",
+    };
+    let _ = write!(x, "<c:trendlineType val=\"{ty}\"/>");
+    match t.kind {
+        TrendlineKind::Polynomial(o) => {
+            let _ = write!(x, "<c:order val=\"{}\"/>", o.clamp(2, 6));
+        }
+        TrendlineKind::MovingAverage(p) => {
+            let _ = write!(x, "<c:period val=\"{}\"/>", p.clamp(2, 255));
+        }
+        _ => {}
+    }
+    for (tag, v) in [("forward", t.forward), ("backward", t.backward)] {
+        if v.is_finite() && v > 0.0 {
+            let _ = write!(x, "<c:{tag} val=\"{}\"/>", num(v));
+        }
+    }
+    if let Some(i) = t.intercept.filter(|i| i.is_finite()) {
+        let _ = write!(x, "<c:intercept val=\"{}\"/>", num(i));
+    }
+    let _ = write!(x, "<c:dispRSqr val=\"{}\"/><c:dispEq val=\"{}\"/>", t.display_r_squared as u8, t.display_equation as u8);
+    if t.display_r_squared || t.display_equation {
+        x.push_str("<c:trendlineLbl><c:numFmt formatCode=\"General\" sourceLinked=\"0\"/></c:trendlineLbl>");
+    }
+    x.push_str("</c:trendline>");
     x
 }
 
@@ -464,6 +581,10 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart) -> String {
     );
     if (1..=48).contains(&ch.style) {
         let _ = write!(s, "<c:style val=\"{}\"/>", ch.style);
+    }
+    // A PivotChart names its PivotTable (`Sheet2!PivotTable1`).
+    if let Some(link) = ch.pivot.as_deref().map(str::trim).filter(|l| !l.is_empty()) {
+        let _ = write!(s, "<c:pivotSource><c:name>{}</c:name><c:fmtId val=\"0\"/></c:pivotSource>", esc(link));
     }
     s.push_str("<c:chart>");
     match &ch.title {

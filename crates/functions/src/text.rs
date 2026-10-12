@@ -292,17 +292,14 @@ fn unicode(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     num_val(ch as u32 as f64)
 }
 
+/// VALUE: a blank cell reads as 0, but empty or blank text is not a number (observed:
+/// `VALUE("")` is `#VALUE!`).
 fn value(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     match scalar(arg(a, 0)?) {
         Value::Number(n) => num_val(n),
         Value::Empty => num_val(0.0),
         Value::Error(e) => Err(e),
-        Value::Text(t) => {
-            if t.trim().is_empty() {
-                return num_val(0.0);
-            }
-            parse_number_text(&t).ok_or(CellError::Value).and_then(num_val)
-        }
+        Value::Text(t) => parse_number_text(&t).ok_or(CellError::Value).and_then(num_val),
         _ => Err(CellError::Value),
     }
 }
@@ -401,6 +398,88 @@ fn dollar(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     let (r, d) = rounded(a, 2.0)?;
     let body = format_fixed(r, d, true);
     text_val(if r < 0.0 { format!("(${body})") } else { format!("${body}") })
+}
+
+// ---------------------------------------------------------------------------------------------
+// BAHTTEXT
+
+const THAI_DIGITS: [&str; 10] = ["ศูนย์", "หนึ่ง", "สอง", "สาม", "สี่", "ห้า", "หก", "เจ็ด", "แปด", "เก้า"];
+/// Units, tens, hundreds, thousands, ten thousands, hundred thousands.
+const THAI_PLACES: [&str; 6] = ["", "สิบ", "ร้อย", "พัน", "หมื่น", "แสน"];
+
+/// Thai words for a group of up to six decimal digits (most significant first); empty for zero.
+/// One in the tens is สิบ, two is ยี่สิบ, and a final one after higher digits is เอ็ด.
+fn thai_group(digits: &[u8]) -> String {
+    let n = digits.len();
+    let higher = digits.iter().take(n.saturating_sub(1)).any(|d| *d != 0);
+    let mut out = String::new();
+    for (i, &d) in digits.iter().enumerate() {
+        let place = n - 1 - i;
+        match (place, d) {
+            (_, 0) => {}
+            (0, 1) if higher => out.push_str("เอ็ด"),
+            (1, 1) => out.push_str("สิบ"),
+            (1, 2) => out.push_str("ยี่สิบ"),
+            _ => {
+                out.push_str(THAI_DIGITS.get(d as usize).copied().unwrap_or_default());
+                out.push_str(THAI_PLACES.get(place).copied().unwrap_or_default());
+            }
+        }
+    }
+    out
+}
+
+/// Thai words for a whole number written in decimal digits: groups of six digits, each but the
+/// last followed by ล้าน (so 10^12 is หนึ่งล้านล้าน).
+fn thai_number(digits: &str) -> String {
+    let d: Vec<u8> = digits.bytes().filter(u8::is_ascii_digit).map(|b| b - b'0').skip_while(|x| *x == 0).collect();
+    if d.is_empty() {
+        return "ศูนย์".to_string();
+    }
+    let first = match d.len() % 6 {
+        0 => 6,
+        r => r,
+    };
+    let mut out = String::new();
+    let mut start = 0;
+    let mut len = first;
+    while let Some(group) = d.get(start..start + len) {
+        out.push_str(&thai_group(group));
+        start += len;
+        len = 6;
+        if start < d.len() {
+            out.push_str("ล้าน");
+        }
+    }
+    out
+}
+
+/// BAHTTEXT(number): the amount in Thai words with บาท, rounded to satang (สตางค์); a whole
+/// number of baht ends in ถ้วน and a negative amount starts with ลบ.
+fn bahttext(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
+    let x = round_half_away(num(a, 0)?, 2);
+    if !x.is_finite() {
+        return Err(CellError::Num);
+    }
+    let fixed = format!("{:.2}", x.abs());
+    let (whole, frac) = fixed.split_once('.').unwrap_or((fixed.as_str(), "00"));
+    let baht = whole.bytes().any(|b| b != b'0');
+    let satang = frac.bytes().any(|b| b != b'0');
+    let mut out = String::new();
+    if x < 0.0 && (baht || satang) {
+        out.push_str("ลบ");
+    }
+    if baht || !satang {
+        out.push_str(&thai_number(whole));
+        out.push_str("บาท");
+    }
+    if satang {
+        out.push_str(&thai_number(frac));
+        out.push_str("สตางค์");
+    } else {
+        out.push_str("ถ้วน");
+    }
+    text_val(out)
 }
 
 fn t_fn(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
@@ -762,6 +841,7 @@ pub(crate) fn specs() -> Vec<FnSpec> {
             fixed
         ),
         f!("DOLLAR", 1, 2, Text, S, "DOLLAR(number, [decimals])", "Formats a number as currency text.", dollar),
+        f!("BAHTTEXT", 1, 1, Text, S, "BAHTTEXT(number)", "Spells out a number in Thai words with Baht.", bahttext),
         f!("T", 1, 1, Text, S, "T(value)", "Returns the value if it is text, otherwise empty text.", t_fn),
         f!(
             "TEXTBEFORE",
@@ -857,6 +937,30 @@ mod tests {
     use crate::util::testutil::*;
 
     #[test]
+    fn bahttext() {
+        let bt = |x: f64| ev("BAHTTEXT", vec![n(x)]);
+        // Microsoft's example.
+        is_text(bt(1234.0), "หนึ่งพันสองร้อยสามสิบสี่บาทถ้วน");
+        // Tens, เอ็ด, satang, millions and beyond, sign and rounding to satang.
+        is_text(bt(0.0), "ศูนย์บาทถ้วน");
+        is_text(bt(21.25), "ยี่สิบเอ็ดบาทยี่สิบห้าสตางค์");
+        is_text(bt(0.5), "ห้าสิบสตางค์");
+        is_text(bt(101.0), "หนึ่งร้อยเอ็ดบาทถ้วน");
+        is_text(bt(1_000_000.0), "หนึ่งล้านบาทถ้วน");
+        is_text(bt(11_000_000.0), "สิบเอ็ดล้านบาทถ้วน");
+        is_text(bt(2_000_005_000_000.0), "สองล้านห้าล้านบาทถ้วน");
+        is_text(bt(1e12), "หนึ่งล้านล้านบาทถ้วน");
+        is_text(bt(-15.5), "ลบสิบห้าบาทห้าสิบสตางค์");
+        is_text(bt(1.999), "สองบาทถ้วน");
+        is_text(bt(0.005), "หนึ่งสตางค์");
+        is_text(bt(-0.001), "ศูนย์บาทถ้วน");
+        is_err(ev("BAHTTEXT", vec![t("abc")]), CellError::Value);
+        // Huge numbers give text (or #NUM! where rounding overflows), never a panic.
+        assert!(matches!(bt(-1e300), Value::Text(_)));
+        assert!(matches!(bt(f64::MAX), Value::Text(_) | Value::Error(CellError::Num)));
+    }
+
+    #[test]
     fn concat_family() {
         is_text(ev("CONCATENATE", vec![t("a"), n(1.5), b(true)]), "a1.5TRUE");
         is_text(ev("CONCAT", vec![av(arr(vec![vec![tv("a"), tv("b")], vec![nv(1.0), Value::Empty]])), t("!")]), "ab1!");
@@ -945,6 +1049,25 @@ mod tests {
         close(ev("UNICODE", vec![t("☃")]), 9731.0);
         is_err(ev("UNICHAR", vec![n(0.0)]), CellError::Value);
         is_err(ev("UNICHAR", vec![n(55296.0)]), CellError::NA);
+    }
+
+    /// VALUE cases observed in Excel (ValueFunctionOfBlank, FormulaEvalTestData); a blank cell
+    /// still reads as 0.
+    #[test]
+    fn value_observed() {
+        let cases: Vec<(crate::Arg, Result<f64, CellError>)> = vec![
+            (t(""), Err(CellError::Value)),
+            (t("ABC"), Err(CellError::Value)),
+            (t("0.33"), Ok(0.33)),
+            (t("$1,000"), Ok(1000.0)),
+            (rf(Value::Empty), Ok(0.0)),
+        ];
+        for (arg, want) in cases {
+            match want {
+                Ok(x) => close(ev("VALUE", vec![arg]), x),
+                Err(err) => is_err(ev("VALUE", vec![arg]), err),
+            }
+        }
     }
 
     #[test]

@@ -83,3 +83,36 @@ fn programmatic_copy_does_not_write_to_the_system_clipboard() {
     assert_eq!(*calls.borrow(), 0);
     assert!(!h.output().platform_output.commands.iter().any(|c| matches!(c, OutputCommand::CopyText(_))));
 }
+
+#[test]
+fn pasting_reads_the_clipboard_html_for_the_numbers_behind_the_text() {
+    // #257: currency text from another spreadsheet stays a number when the host offers the HTML.
+    let mut h = harness(Services {
+        paste_html: Some(Box::new(|| Some(r#"<table><tr><td x:num="10000">Rp10,000.00</td></tr></table>"#.to_string()))),
+        ..Default::default()
+    });
+    h.state_mut().run("selection.set", json!({"cell": "D5"})).unwrap();
+    h.input_mut().events.push(Event::Paste("Rp10,000.00".into()));
+    h.run_steps(2);
+    let value = h.state().session.active().and_then(|d| d.wb.active().map(|s| s.value(gridcraft_engine::core::CellRef::new(4, 3))));
+    assert_eq!(value, Some(gridcraft_engine::core::Value::number(10000.0)));
+}
+
+#[test]
+fn copying_multiple_areas_copies_lined_up_areas_and_explains_the_rest() {
+    // Issue #348: lined-up areas copy as one block; others get Excel's message instead of nothing.
+    let mut h = harness(Services::default());
+    h.state_mut().session.execute("selection.set", json!({"range": "B1:B2,A1:A2"})).unwrap();
+    h.input_mut().events.push(Event::Copy);
+    h.step();
+    assert!(h.output().platform_output.commands.iter().any(|c| matches!(c, OutputCommand::CopyText(text) if text == "Name\tScore\nAda\t42\n")));
+    assert!(h.state().message.is_none());
+    assert_eq!(h.state().session.clipboard.as_ref().map(|c| c.areas.len()), Some(2));
+
+    h.state_mut().session.execute("selection.set", json!({"range": "A1,B2"})).unwrap();
+    h.input_mut().events.push(Event::Copy);
+    h.step();
+    assert!(!h.output().platform_output.commands.iter().any(|c| matches!(c, OutputCommand::CopyText(_))));
+    assert_eq!(h.state().message.as_ref().map(|(_, text)| text.as_str()), Some("This action won't work on multiple selections."));
+    assert_eq!(h.state().session.clipboard.as_ref().map(|c| c.areas.len()), Some(2), "the earlier copy stays");
+}

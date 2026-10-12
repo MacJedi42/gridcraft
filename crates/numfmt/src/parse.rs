@@ -555,7 +555,9 @@ fn analyze(raw: Raw) -> Section {
                 }
             }
             Tok::Slash => {
-                let next_ok = matches!(toks.get(i + 1), Some(Tok::Digit(_) | Tok::FixedDenom(_)));
+                // Literal text may sit between the bar and the denominator (`#/ #`, `# ?=/=?`).
+                let next_ok = matches!(toks.get(i + 1), Some(Tok::FixedDenom(_)))
+                    || matches!(toks.get(i + 1..).and_then(|s| s.iter().find(|t| !matches!(t, Tok::Lit(_)))), Some(Tok::Digit(_)));
                 let has_exp = toks.iter().any(|t| matches!(t, Tok::Exp { .. }));
                 if !fraction_slash && seen_digit && next_ok && !seen_point && !has_exp {
                     fraction_slash = true;

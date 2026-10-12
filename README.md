@@ -84,6 +84,7 @@
 - **Compatible.** XLSX is the native format: styles, themes, formulas (including dynamic arrays),
   tables, conditional formats, validation, comments, hyperlinks, charts, pictures, sparklines,
   PivotTables and print settings round-trip. CSV and TSV too.
+  Excel 97-2003 `.xls` workbooks open with their values, formulas and number formats (formatting and objects not yet).
   [XLSB worksheet data can be imported](docs/xlsb-import.md), using saved values instead of formulas.
   [ODS worksheet data can be imported](docs/ods-import.md), using saved values instead of formulas.
   [Static pictures can live inside cells](docs/cell-pictures.md), fitting their size and moving with the data.
@@ -197,7 +198,7 @@ egui frontend is a separate crate, so the UI can be swapped without touching the
 
 GridCraft is in **alpha**: the core workflow works end to end, but depth, fidelity and file
 compatibility are still rough. It covers 89% of the Excel ribbon commands in our catalog
-([`docs/parity-checklist.md`](docs/parity-checklist.md)) and 501 of Excel's 523 worksheet functions
+([`docs/parity-checklist.md`](docs/parity-checklist.md)) and 513 of Excel's 523 worksheet functions
 ([`docs/function-parity.md`](docs/function-parity.md)); weighted by what Excel users rely on, we
 estimate it is about 50% ready for real work. Next up: XLSX fidelity on real-world files, very large
 workbooks and multi-threaded recalc, chart depth, text in every script, and `.xls` import. Stage,
@@ -230,8 +231,21 @@ $env:WGPU_BACKEND = "vulkan"
 Remove-Item Env:WGPU_BACKEND                     # restore the default for later launches
 ```
 
-An explicit `gl` override can bring the driver crash back on affected systems. The macOS, Linux
-and web backend defaults are unchanged.
+An explicit `gl` override can bring the driver crash back on affected systems, and `vulkan` can
+bring back a crash in some Intel UHD Graphics drivers (`igvk64.dll`, #120). The macOS, Linux and
+web backend defaults are unchanged.
+
+**If the app is slow on an older Windows PC, or DirectX 12 can't start:** when DirectX 12 finds no
+graphics card with a driver for it, it only offers Microsoft's software renderer, which draws every
+frame on the processor. In that case GridCraft uses OpenGL instead, without setting anything; if
+the first renderer fails to start, it tries the other one once. The log file records the choice
+(lines starting with `graphics:`). `WGPU_BACKEND` still overrides it (and then nothing else is
+tried), e.g. `$env:WGPU_BACKEND = "gl"` or `"dx12"`.
+
+DirectX 12 shaders are compiled with FXC, which is part of Windows, so no `dxcompiler.dll` or
+`dxil.dll` is needed, and a copy another program put on `PATH` can no longer stop the app at start
+("Parent device is lost", #339). `$env:WGPU_DX12_COMPILER = "dxc"` (or `"auto"`) selects wgpu's DXC
+handling again for troubleshooting.
 
 ### macOS
 

@@ -32,8 +32,12 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 log = "0.4"
 rayon = "1"
 regex = { version = "1", default-features = false, features = ["std", "unicode", "perf"] }
-quick-xml = "0.38"
+quick-xml = "0.41"
 zip = { version = "3", default-features = false, features = ["deflate"] }
+sha2 = { version = "0.11", default-features = false }
+# Decrypting password-protected workbooks ([MS-OFFCRYPTO]): AES and SHA-1, pure Rust (wasm-safe).
+aes = { version = "0.9", default-features = false }
+sha1 = { version = "0.11", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # ui
@@ -45,6 +49,11 @@ rfd = "0.17"
 arboard = { version = "3.6", default-features = false }
 # The desktop's preferred language, for the first-run interface language (native only).
 sys-locale = "0.3"
+# Font parser egui's epaint uses; the UI validates system font files with it before handing them
+# to egui, which panics on a file it can't parse. Same version as epaint's, so no second copy.
+skrifa = { version = "0.44", default-features = false, features = ["std"] }
+# Real font bytes for tests (Ubuntu Light, compiled into epaint).
+epaint_default_fonts = "0.36"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

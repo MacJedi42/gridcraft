@@ -19,6 +19,36 @@ pub enum Visibility {
     VeryHidden,
 }
 
+/// How a sheet is displayed (View › Workbook Views; `<sheetView view="…">` in XLSX).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SheetViewMode {
+    #[default]
+    Normal,
+    /// Pages on paper with rulers, margins and in-place headers and footers.
+    PageLayout,
+    PageBreakPreview,
+}
+
+impl SheetViewMode {
+    /// The XLSX / command spelling: `normal`, `pageLayout` or `pageBreakPreview`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SheetViewMode::Normal => "normal",
+            SheetViewMode::PageLayout => "pageLayout",
+            SheetViewMode::PageBreakPreview => "pageBreakPreview",
+        }
+    }
+    pub fn parse(s: &str) -> Option<SheetViewMode> {
+        match s {
+            "normal" => Some(SheetViewMode::Normal),
+            "pageLayout" => Some(SheetViewMode::PageLayout),
+            "pageBreakPreview" => Some(SheetViewMode::PageBreakPreview),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Sheet {
     pub name: String,
@@ -60,14 +90,27 @@ pub struct Sheet {
     pub images: Vec<Image>,
     pub shapes: Vec<Shape>,
     pub sparklines: Vec<Sparkline>,
+    /// On-sheet slicer widgets (filter a table column by clicking value tiles).
+    #[serde(default)]
+    pub slicers: Vec<Slicer>,
     /// PivotTables whose output lives on this sheet.
     #[serde(default)]
     pub pivots: Vec<PivotTable>,
     pub protection: Option<SheetProtection>,
+    /// Allow Edit Ranges (meaningful while the sheet is protected).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edit_ranges: Vec<crate::EditRange>,
     pub print: PrintSettings,
     /// Last selection and scroll position, saved with the file.
     pub view_active: CellRef,
     pub view_top_left: CellRef,
+    /// Normal, Page Layout or Page Break Preview.
+    #[serde(default)]
+    pub view: SheetViewMode,
+    /// Unmodelled file content of this sheet kept for saving (form controls, OLE objects, query
+    /// tables). Goes away with the sheet; not in JSON.
+    #[serde(skip)]
+    pub preserved: Option<Arc<crate::preserved::Preserved>>,
 }
 
 /// Default width of a column (points) and height of a row (points) for the default font.
@@ -106,11 +149,15 @@ impl Sheet {
             images: vec![],
             shapes: vec![],
             sparklines: vec![],
+            slicers: vec![],
             pivots: vec![],
             protection: None,
+            edit_ranges: vec![],
             print: PrintSettings::default(),
             view_active: CellRef::default(),
             view_top_left: CellRef::default(),
+            view: SheetViewMode::Normal,
+            preserved: None,
         }
     }
 
@@ -174,6 +221,20 @@ impl Sheet {
 
     // ---- geometry
 
+    /// Whether this cell has a table or ordinary AutoFilter dropdown.
+    pub fn has_filter_button(&self, c: CellRef) -> bool {
+        self.autofilter.as_ref().is_some_and(|af| af.range.start.row == c.row && af.range.contains(c))
+            || self.tables.iter().any(|t| t.filter_button && t.header_row && t.range.start.row == c.row && t.range.contains(c))
+    }
+
+    /// Horizontal header space in unzoomed grid units (96 units per inch).
+    /// Observed in Windows Excel 16.0 build 20326: AutoFit reserves 12.5 pt at
+    /// 100-200% zoom, 25 pt at 50%, regardless of header row height. Below 100%
+    /// the dropdown keeps its screen width. This is geometry, not font padding.
+    pub fn filter_button_space(&self, c: CellRef) -> f32 {
+        if self.has_filter_button(c) { (12.5 * 96.0 / 72.0) / (self.zoom as f32 / 100.0).clamp(0.1, 1.0) } else { 0.0 }
+    }
+
     pub fn col_width(&self, col: u32) -> f32 {
         match self.cols.get(&col) {
             Some(i) if i.hidden => 0.0,
@@ -190,6 +251,17 @@ impl Sheet {
     }
     pub fn is_row_hidden(&self, row: u32) -> bool {
         self.rows.get(&row).is_some_and(|r| r.hidden)
+    }
+    /// Whether `row` is hidden by an applied filter: a hidden row below the header of the
+    /// sheet AutoFilter while it has criteria, or a hidden data row of a filtered table.
+    /// Other hidden rows were hidden by hand.
+    pub fn is_row_filtered(&self, row: u32) -> bool {
+        if !self.is_row_hidden(row) {
+            return false;
+        }
+        let in_sheet_filter =
+            self.autofilter.as_ref().is_some_and(|af| !af.criteria.is_empty() && row > af.range.start.row && row <= af.range.end.row);
+        in_sheet_filter || self.tables.iter().any(|t| !t.filter.is_empty() && t.data_range().is_some_and(|r| row >= r.start.row && row <= r.end.row))
     }
     pub fn is_col_hidden(&self, col: u32) -> bool {
         self.cols.get(&col).is_some_and(|r| r.hidden)

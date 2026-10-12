@@ -8,6 +8,7 @@ use gridcraft_model::*;
 use serde_json::{Value as Json, json};
 
 use super::*;
+use crate::outline;
 use crate::selection::current_region;
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -29,7 +30,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "data.filter",
             "Filter",
             ["Data", "Sort & Filter"],
-            Some("Cmd+Shift+F"),
+            Some("Ctrl+Shift+L"),
             "{range?} toggles AutoFilter on the current region",
             has_doc,
             toggle_filter
@@ -74,10 +75,37 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         cmd!(query "data.validate", "Check Value Against Validation", [], None, "{cell?, input} → {ok, message?}", has_doc, validate_cmd),
         cmd!(noundo "data.circleInvalid", "Circle Invalid Data", ["Data", "Data Tools", "Data Validation"], None, "{} → invalid cells", has_doc, circle_invalid),
-        cmd!("data.group", "Group", ["Data", "Outline"], Some("Cmd+Shift+K"), "{rows?: \"2:5\" | cols?: \"B:C\"}", has_doc, |s, p| group(s, p, true)),
-        cmd!("data.ungroup", "Ungroup", ["Data", "Outline"], Some("Cmd+Shift+J"), "{rows? | cols?}", has_doc, |s, p| group(s, p, false)),
-        cmd!("data.hideDetail", "Hide Detail", ["Data", "Outline"], None, "{rows? | cols?}", has_doc, |s, p| detail(s, p, true)),
-        cmd!("data.showDetail", "Show Detail", ["Data", "Outline"], None, "{rows? | cols?}", has_doc, |s, p| detail(s, p, false)),
+        cmd!(
+            "data.group",
+            "Group",
+            ["Data", "Outline"],
+            Some("Alt+Shift+Right"),
+            "{rows?: \"2:5\" | cols?: \"B:C\" | by?: rows|cols (the selection's rows or columns; a block of cells groups rows by default)}",
+            has_doc,
+            |s, p| group(s, p, true)
+        ),
+        cmd!("data.ungroup", "Ungroup", ["Data", "Outline"], Some("Alt+Shift+Left"), "{rows? | cols? | by?: rows|cols}", has_doc, |s, p| group(
+            s, p, false
+        )),
+        cmd!(
+            "data.hideDetail",
+            "Hide Detail",
+            ["Data", "Outline"],
+            None,
+            "{rows? | cols? | by?, level?: 1-7} (the innermost group, or the one at `level`, holding the lines or summarised by them)",
+            has_doc,
+            |s, p| detail(s, p, true)
+        ),
+        cmd!("data.showDetail", "Show Detail", ["Data", "Outline"], None, "{rows? | cols? | by?, level?: 1-7}", has_doc, |s, p| detail(s, p, false)),
+        cmd!(
+            "data.showLevels",
+            "Show Outline Levels",
+            [],
+            None,
+            "{rows?: 1-8, cols?: 1-8} (1 shows only the top-level summaries, as the outline's level buttons)",
+            has_doc,
+            show_levels
+        ),
         cmd!(
             "data.subtotal",
             "Subtotal",
@@ -248,7 +276,7 @@ fn do_sort(s: &mut Session, r: RangeRef, header: bool, keys: Vec<SortKey>, by_co
                     let pos = |v: &Value| v.as_text().and_then(|t| list.iter().position(|x| x.eq_ignore_ascii_case(t))).unwrap_or(usize::MAX);
                     pos(va).cmp(&pos(vb))
                 } else if case && va.is_text() && vb.is_text() {
-                    va.as_text().unwrap_or("").cmp(vb.as_text().unwrap_or(""))
+                    sort_compare(va, vb).then_with(|| case_order(va.as_text().unwrap_or(""), vb.as_text().unwrap_or("")))
                 } else {
                     sort_compare(va, vb)
                 };
@@ -416,6 +444,9 @@ fn toggle_filter(s: &mut Session, p: &Json) -> Result<Json> {
             let sh = cx.sheet_mut(sheet)?;
             if let Some(t) = sh.tables.iter_mut().find(|t| t.name == name) {
                 t.filter_button = !t.filter_button;
+                if !t.filter_button {
+                    t.filter.clear();
+                }
             }
             Ok(Json::Null)
         });
@@ -431,7 +462,16 @@ fn toggle_filter(s: &mut Session, p: &Json) -> Result<Json> {
             Ok(json!({"filter": false}))
         });
     }
-    let r = data_range(s, p)?;
+    let mut r = data_range(s, p)?;
+    // A selected header row filters the data below it (#201).
+    if p.get("range").is_none() && r.height() == 1 {
+        let d = s.doc()?;
+        let sh = d.wb.active().ok_or(EngineError::NoDocument)?;
+        let below = current_region(sh, r.start).end.row;
+        if below > r.end.row {
+            r = RangeRef::new(r.start, CellRef::new(below, r.end.col));
+        }
+    }
     edit(s, |cx| {
         cx.sheet_mut(sheet)?.autofilter = Some(AutoFilter { range: r, criteria: vec![] });
         Ok(json!({"filter": true, "range": r.a1()}))
@@ -587,6 +627,8 @@ pub(crate) fn apply_filter(wb: &mut Workbook, sheet: usize) {
                 },
                 FilterCriterion::FillColor(col) => wb.styles.get(sh.style_id(c)).fill.fg == *col,
                 FilterCriterion::FontColor(col) => wb.styles.get(sh.style_id(c)).font.color == *col,
+                // Icons are not evaluated here: the row keeps its current visibility.
+                FilterCriterion::Icon { .. } => !sh.is_row_hidden(row),
             };
             if !ok {
                 visible = false;
@@ -653,6 +695,12 @@ pub fn filter_values(wb: &Workbook, sheet: usize, col: u32) -> Vec<(String, bool
     seen.into_iter().map(|((_, t), on)| (t, on)).collect()
 }
 
+/// Case-sensitive tie-break for text that is equal ignoring case: as in Excel, lowercase sorts
+/// before uppercase at the first letter that differs in case.
+fn case_order(a: &str, b: &str) -> Ordering {
+    a.chars().zip(b.chars()).find(|(x, y)| x != y).map_or(Ordering::Equal, |(x, y)| y.is_lowercase().cmp(&x.is_lowercase()))
+}
+
 fn sort_key(v: &Value) -> (u8, i64, String) {
     match v {
         Value::Number(n) => (0, (n * 1e6) as i64, String::new()),
@@ -685,8 +733,11 @@ fn remove_duplicates(s: &mut Session, p: &Json) -> Result<Json> {
         let Some(sh) = cx.wb.sheet(sheet) else { return Ok(()) };
         let mut seen = std::collections::HashSet::new();
         let mut keep: Vec<u32> = Vec::new();
+        // Cells are compared by the text they show, as in Excel: the same date in two formats
+        // isn't a duplicate, while 1.01 and 1.02 shown as 1.0 are.
+        let shown = |c: CellRef| crate::display::format(&sh.value(c), cx.wb.styles.get(sh.style_id(c)).num_fmt.as_str(), &cx.wb).text;
         for row in start..=r.end.row {
-            let key: Vec<String> = cols.iter().map(|c| sh.value(CellRef::new(row, *c)).display().to_lowercase()).collect();
+            let key: Vec<String> = cols.iter().map(|c| shown(CellRef::new(row, *c)).to_lowercase()).collect();
             if seen.insert(key) {
                 keep.push(row);
             } else {
@@ -741,7 +792,7 @@ fn text_to_columns(s: &mut Session, p: &Json) -> Result<Json> {
         p.get("fixedWidths").and_then(Json::as_array).map(|a| a.iter().filter_map(|x| x.as_u64().map(|v| v as usize)).collect());
     let consecutive = bool_param(p, "treatConsecutive").unwrap_or(false);
     let quote = str_param(p, "textQualifier").and_then(|q| q.chars().next()).unwrap_or('"');
-    let dest = cell_param(p, "destination").unwrap_or(r.start);
+    let dest = cell_param_on(s, p, "destination", sheet)?.unwrap_or(r.start);
     edit(s, |cx| {
         let Some(sh) = cx.wb.sheet(sheet) else { return Ok(()) };
         let mut out: Vec<(CellRef, String)> = Vec::new();
@@ -934,10 +985,26 @@ pub fn check_validation(wb: &Workbook, sheet: usize, at: CellRef, input: &str) -
         return None;
     }
     let v = gridcraft_core::parse::parse_input(input, wb.date_system).value;
-    let num = |f: &str| gridcraft_calc::evaluate(wb, sheet, at, f).to_number().ok();
+    // The formulas are written for the first cell of the range and see the value being entered,
+    // as in Excel (a custom `=A1>10` on A1:A9 checks A5's new value at A5).
+    let first = dv.ranges.first().map(|r| r.start).unwrap_or(at);
+    let entered;
+    let wb = if sh.value(at) == v {
+        wb
+    } else {
+        let mut w = wb.clone();
+        if let Some(sh) = w.sheet_mut(sheet) {
+            let style = sh.style_id(at);
+            sh.cells.set(at, Cell { value: v.clone(), style, ..Default::default() });
+        }
+        entered = w;
+        &entered
+    };
+    let eval = |f: &str| gridcraft_calc::evaluate(wb, sheet, at, &formula_at(f, first, at));
+    let num = |f: &str| eval(f).to_number().ok();
     let ok = match dv.kind {
         ValidationKind::List => list_items(wb, sheet, dv).iter().any(|x| x.eq_ignore_ascii_case(input)),
-        ValidationKind::Custom => gridcraft_calc::evaluate(wb, sheet, at, &dv.f1).to_bool().unwrap_or(false),
+        ValidationKind::Custom => eval(&dv.f1).to_bool().unwrap_or(false),
         ValidationKind::TextLength => {
             let n = input.chars().count() as f64;
             compare_op(dv.op, n, num(&dv.f1), dv.f2.as_deref().and_then(num))
@@ -964,6 +1031,21 @@ pub fn check_validation(wb: &Workbook, sheet: usize, at: CellRef, input: &str) -
     Some((dv.clone(), msg))
 }
 
+/// A formula written for `first`, as seen from `at` (relative references shifted).
+fn formula_at(f: &str, first: CellRef, at: CellRef) -> String {
+    if first == at {
+        return f.to_string();
+    }
+    match gridcraft_formula::parse(f.trim_start_matches('=')) {
+        Ok(e) => gridcraft_formula::print(&gridcraft_formula::adjust::shift_relative(
+            e,
+            at.row as i64 - first.row as i64,
+            at.col as i64 - first.col as i64,
+        )),
+        Err(_) => f.to_string(),
+    }
+}
+
 fn compare_op(op: CfOperator, n: f64, a: Option<f64>, b: Option<f64>) -> bool {
     let Some(a) = a else { return false };
     match op {
@@ -980,7 +1062,7 @@ fn compare_op(op: CfOperator, n: f64, a: Option<f64>, b: Option<f64>) -> bool {
 
 fn validate_cmd(s: &mut Session, p: &Json) -> Result<Json> {
     let d = s.doc()?;
-    let at = cell_param(p, "cell").unwrap_or(d.selection.active);
+    let at = cell_param(s, p, "cell")?.unwrap_or(d.selection.active);
     let input = str_param(p, "input").unwrap_or("");
     match check_validation(&d.wb, d.wb.active_sheet, at, input) {
         None => Ok(json!({"ok": true})),
@@ -1018,7 +1100,12 @@ fn outline_lines(s: &Session, p: &Json) -> Result<(bool, u32, u32)> {
         return Ok((false, r.start.col, r.end.col));
     }
     let r = s.doc()?.selection.current();
-    if r.is_full_cols() && !r.is_full_rows() { Ok((false, r.start.col, r.end.col)) } else { Ok((true, r.start.row, r.end.row)) }
+    match str_param(p, "by") {
+        Some("rows") => Ok((true, r.start.row, r.end.row)),
+        Some("cols" | "columns") => Ok((false, r.start.col, r.end.col)),
+        _ if r.is_full_cols() && !r.is_full_rows() => Ok((false, r.start.col, r.end.col)),
+        _ => Ok((true, r.start.row, r.end.row)),
+    }
 }
 
 fn group(s: &mut Session, p: &Json, on: bool) -> Result<Json> {
@@ -1027,39 +1114,94 @@ fn group(s: &mut Session, p: &Json, on: bool) -> Result<Json> {
         let si = cx.sheet_index();
         let sh = cx.sheet_mut(si)?;
         let map = if rows { &mut sh.rows } else { &mut sh.cols };
-        for i in a..=b.min(a + 1_048_575) {
+        let b = b.min(a.saturating_add(1_048_575));
+        for i in a..=b {
             let e = map.entry(i).or_default();
-            e.outline = if on { (e.outline + 1).min(7) } else { e.outline.saturating_sub(1) };
+            e.outline = if on { (e.outline + 1).min(outline::MAX_LEVEL) } else { e.outline.saturating_sub(1) };
             if !on && e.outline == 0 {
                 e.hidden = false;
             }
+        }
+        // A summary line whose group is gone has nothing left to collapse.
+        if !on
+            && !outline::groups(map).iter().any(|g| g.end == b)
+            && let Some(e) = map.get_mut(&b.saturating_add(1))
+        {
+            e.collapsed = false;
         }
         Ok(Json::Null)
     })
 }
 
+/// Hide Detail / Show Detail: the innermost group (or the one at `level`) that holds the lines, or
+/// failing that the one they are the summary of. Hiding marks the summary line collapsed (the
+/// + button, saved to XLSX); showing keeps inner groups that were collapsed on their own collapsed.
 fn detail(s: &mut Session, p: &Json, hide: bool) -> Result<Json> {
     let (rows, a, b) = outline_lines(s, p)?;
+    let want = p.get("level").and_then(Json::as_u64).map(|l| l.min(outline::MAX_LEVEL as u64) as u8);
     edit(s, |cx| {
         let si = cx.sheet_index();
         let sh = cx.sheet_mut(si)?;
         let map = if rows { &mut sh.rows } else { &mut sh.cols };
-        // Expand to the whole group around the selection.
-        let level = (a..=b).filter_map(|i| map.get(&i).map(|e| e.outline)).max().unwrap_or(0);
-        if level == 0 {
-            return Ok(Json::Null);
+        let all = outline::groups(map);
+        let level_ok = |g: &outline::OutlineGroup| want.is_none_or(|l| g.level == l);
+        let pick = |hit: &dyn Fn(&outline::OutlineGroup) -> bool| -> Vec<outline::OutlineGroup> {
+            let hits: Vec<_> = all.iter().filter(|g| level_ok(g) && hit(g)).copied().collect();
+            let deepest = hits.iter().map(|g| g.level).max().unwrap_or(0);
+            hits.into_iter().filter(|g| g.level == deepest).collect()
+        };
+        let mut chosen = pick(&|g| g.start <= b && g.end >= a);
+        if chosen.is_empty() {
+            chosen = pick(&|g| g.summary() >= a && g.summary() <= b);
         }
-        let mut lo = a;
-        while lo > 0 && map.get(&(lo - 1)).is_some_and(|e| e.outline >= level) {
-            lo -= 1;
+        for g in chosen {
+            // Inner groups collapsed on their own (their summary marked), before this one changes.
+            let inner: Vec<outline::OutlineGroup> = all
+                .iter()
+                .filter(|o| o.level > g.level && o.start >= g.start && o.end <= g.end && o.summary() != g.summary())
+                .filter(|o| map.get(&o.summary()).is_some_and(|e| e.collapsed))
+                .copied()
+                .collect();
+            for i in g.start..=g.end {
+                if let Some(e) = map.get_mut(&i) {
+                    e.hidden = hide || inner.iter().any(|o| o.contains(i));
+                }
+            }
+            if hide {
+                map.entry(g.summary()).or_default().collapsed = true;
+            } else if let Some(e) = map.get_mut(&g.summary()) {
+                e.collapsed = false;
+            }
         }
-        let mut hi = b;
-        while map.get(&(hi + 1)).is_some_and(|e| e.outline >= level) {
-            hi += 1;
-        }
-        for i in lo..=hi {
-            if let Some(e) = map.get_mut(&i) {
-                e.hidden = hide;
+        cx.structural = true;
+        Ok(Json::Null)
+    })
+}
+
+/// The outline's level buttons: show rows / columns down to outline level `n` (1 = only the
+/// top-level summaries); deeper detail is hidden and its summary lines marked collapsed.
+fn show_levels(s: &mut Session, p: &Json) -> Result<Json> {
+    let level = |k: &str| p.get(k).and_then(Json::as_u64).map(|n| n.clamp(1, outline::MAX_LEVEL as u64 + 1) as u8);
+    let (rows, cols) = (level("rows"), level("cols"));
+    if rows.is_none() && cols.is_none() {
+        return Err(EngineError::BadParams {
+            cmd: "data.showLevels".into(),
+            msg: "give `rows` or `cols`: the outline level to show (1 = top-level summaries only)".into(),
+        });
+    }
+    edit(s, |cx| {
+        let si = cx.sheet_index();
+        let sh = cx.sheet_mut(si)?;
+        for (map, n) in [(&mut sh.rows, rows), (&mut sh.cols, cols)] {
+            let Some(n) = n else { continue };
+            let groups = outline::groups(map);
+            for e in map.values_mut().filter(|e| e.outline > 0) {
+                e.hidden = e.outline >= n;
+            }
+            // Inner groups come first, so a summary line shared with the group around it ends up
+            // as that outer group says.
+            for g in groups {
+                map.entry(g.summary()).or_default().collapsed = g.level >= n;
             }
         }
         cx.structural = true;
@@ -1156,6 +1298,81 @@ mod tests {
         }
         assert!(ok(&mut s, "B1", "5"));
         assert!(!ok(&mut s, "B1", "150"));
+    }
+
+    /// Rows 5:8 grouped, with 6:7 grouped again inside (0-based 4..=7 and 5..=6).
+    fn nested_rows() -> Session {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("data.group", json!({"rows": "5:8"})).unwrap();
+        s.execute("data.group", json!({"rows": "6:7"})).unwrap();
+        s
+    }
+
+    /// (hidden, collapsed) of 0-based rows.
+    fn row_state(s: &Session, rows: std::ops::RangeInclusive<u32>) -> Vec<(bool, bool)> {
+        let sh = s.doc().unwrap().wb.active().unwrap();
+        rows.map(|r| sh.rows.get(&r).map(|l| (l.hidden, l.collapsed)).unwrap_or_default()).collect()
+    }
+
+    #[test]
+    fn hide_detail_marks_the_summary_collapsed_and_show_detail_keeps_inner_groups_collapsed() {
+        let mut s = nested_rows();
+        s.execute("data.hideDetail", json!({"rows": "6:7", "level": 2})).unwrap();
+        assert_eq!(row_state(&s, 4..=8), [(false, false), (true, false), (true, false), (false, true), (false, false)]);
+        s.execute("data.hideDetail", json!({"rows": "5:8", "level": 1})).unwrap();
+        assert_eq!(row_state(&s, 4..=8), [(true, false), (true, false), (true, false), (true, true), (false, true)]);
+        s.execute("data.showDetail", json!({"rows": "5:8", "level": 1})).unwrap();
+        assert_eq!(row_state(&s, 4..=8), [(false, false), (true, false), (true, false), (false, true), (false, false)]);
+        s.execute("data.showDetail", json!({"rows": "6:7", "level": 2})).unwrap();
+        assert_eq!(row_state(&s, 4..=8), [(false, false); 5]);
+        // Each step is one undoable command.
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(row_state(&s, 5..=7), [(true, false), (true, false), (false, true)]);
+    }
+
+    #[test]
+    fn hide_detail_on_the_summary_row_collapses_the_group_above_it() {
+        let mut s = nested_rows();
+        s.execute("data.hideDetail", json!({"rows": "9:9"})).unwrap();
+        assert_eq!(row_state(&s, 4..=8), [(true, false), (true, false), (true, false), (true, false), (false, true)]);
+    }
+
+    #[test]
+    fn show_levels_collapses_and_expands_to_a_level() {
+        let mut s = nested_rows();
+        s.execute("data.showLevels", json!({"rows": 1})).unwrap();
+        assert_eq!(row_state(&s, 4..=8), [(true, false), (true, false), (true, false), (true, true), (false, true)]);
+        s.execute("data.showLevels", json!({"rows": 2})).unwrap();
+        assert_eq!(row_state(&s, 4..=8), [(false, false), (true, false), (true, false), (false, true), (false, false)]);
+        s.execute("data.showLevels", json!({"rows": 3})).unwrap();
+        assert_eq!(row_state(&s, 4..=8), [(false, false); 5]);
+        // Columns are separate; no level at all is an error rather than a guess.
+        s.execute("data.group", json!({"cols": "C:E"})).unwrap();
+        s.execute("data.showLevels", json!({"cols": 1})).unwrap();
+        let sh = s.doc().unwrap().wb.active().unwrap();
+        assert!((2..=4).all(|c| sh.cols.get(&c).is_some_and(|l| l.hidden)));
+        assert!(sh.cols.get(&5).is_some_and(|l| l.collapsed));
+        assert_eq!(row_state(&s, 4..=4), [(false, false)]);
+        assert!(s.execute("data.showLevels", json!({})).is_err());
+    }
+
+    #[test]
+    fn group_by_columns_for_a_block_of_cells() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("selection.set", json!({"range": "B2:C5"})).unwrap();
+        s.execute("data.group", json!({"by": "cols"})).unwrap();
+        let sh = s.doc().unwrap().wb.active().unwrap();
+        assert!((1..=2).all(|c| sh.cols.get(&c).is_some_and(|l| l.outline == 1)));
+        assert!(sh.rows.values().all(|l| l.outline == 0));
+    }
+
+    #[test]
+    fn group_shortcuts_are_the_windows_ones() {
+        let sc = |id: &str| specs().into_iter().find(|c| c.id == id).and_then(|c| c.shortcut);
+        assert_eq!(sc("data.group"), Some("Alt+Shift+Right"));
+        assert_eq!(sc("data.ungroup"), Some("Alt+Shift+Left"));
     }
 
     #[test]

@@ -99,7 +99,7 @@ fn system_tracks_live_os_changes_with_both_gridcraft_palettes_and_light_fallback
         system_theme(&mut h, reported);
         assert_appearance(&h, dark);
         assert_eq!(preferences(&h)["systemTheme"], true);
-        assert_eq!(h.ctx.options(|o| o.theme_preference), ThemePreference::System);
+        assert_eq!(h.ctx.theme(), if dark { Theme::Dark } else { Theme::Light });
     }
 }
 
@@ -112,7 +112,7 @@ fn ribbon_selects_system_and_fixed_modes_ignore_subsequent_os_changes() {
     h.run_steps(2);
     select_ribbon_theme(&mut h, "System");
     assert_eq!(preferences(&h)["systemTheme"], true);
-    assert_eq!(h.ctx.options(|o| o.theme_preference), ThemePreference::System);
+    assert_eq!(h.ctx.theme(), Theme::Dark);
     assert_appearance(&h, true);
     for (label, dark, preference) in [("Dark", true, ThemePreference::Dark), ("Light", false, ThemePreference::Light)] {
         select_ribbon_theme(&mut h, label);
@@ -161,4 +161,34 @@ fn invalid_mode_preserves_preferences_and_legacy_overrides_leave_system_mode() {
     assert_appearance(&h, false);
     system_theme(&mut h, Some(Theme::Dark));
     assert_appearance(&h, false);
+}
+
+#[test]
+fn title_bar_switch_and_file_menu_choose_the_theme() {
+    // #194: one click in the title bar switches light/dark; File › Display theme offers all three.
+    let mut h = harness(UiState::default());
+    system_theme(&mut h, Some(Theme::Light));
+    assert_appearance(&h, false);
+    h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "Dark Mode").click();
+    h.run_steps(2);
+    assert_eq!(preferences(&h)["dark"], true);
+    assert_eq!(preferences(&h)["systemTheme"], false);
+    assert_appearance(&h, true);
+    h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "Dark Mode").click();
+    h.run_steps(2);
+    assert_appearance(&h, false);
+
+    // File opens Backstage; its Options page holds the Office Theme choice (#331).
+    h.get_by_label("File").click();
+    h.run_steps(3);
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Options").click();
+    h.run_steps(3);
+    // The first combo box on the page is Display theme.
+    h.get_all_by_role(egui::accesskit::Role::ComboBox).next().expect("theme combo").click();
+    h.run_steps(3);
+    h.get_by_label("System").click();
+    h.run_steps(3);
+    assert_eq!(preferences(&h)["systemTheme"], true);
+    system_theme(&mut h, Some(Theme::Dark));
+    assert_appearance(&h, true);
 }

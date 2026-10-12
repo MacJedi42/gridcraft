@@ -8,6 +8,11 @@ description = "GridCraft file formats: XLSX (SpreadsheetML) and CSV import/expor
 [lints]
 workspace = true
 
+[features]
+# Builds password-encrypted workbooks in code for other crates' tests (a dev-dependency feature;
+# never enabled in a shipped build).
+test-support = []
+
 [dependencies]
 gridcraft-core = { workspace = true }
 gridcraft-formula = { workspace = true }
@@ -15,3 +20,6 @@ gridcraft-model = { workspace = true }
 thiserror = { workspace = true }
 quick-xml = { workspace = true }
 zip = { workspace = true }
+aes = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }

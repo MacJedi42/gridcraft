@@ -329,7 +329,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "open_workbook",
             "Open workbook",
-            "Open a workbook file (.xlsx, .xlsm, .xlsb, .ods, .csv, .tsv, .txt, .json) and make it active. XLSB and ODS import worksheet data and cached formula values only; check the returned warnings.",
+            "Open a workbook file (.xlsx, .xlsm, .xls, .xlsb, .ods, .csv, .tsv, .txt, .json) and make it active. Excel 97-2003 .xls imports values, formulas and number formats; XLSB and ODS import worksheet data and cached formula values only; check the returned warnings.",
             obj(json!({"path": string("File path")}), &["path"]),
             false,
         ),

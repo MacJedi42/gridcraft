@@ -183,6 +183,7 @@ fn calculated_table_column_keeps_formula_and_cell_value() {
         first_col: false,
         last_col: false,
         filter_button: true,
+        filter: vec![],
     });
     let bytes = write_xlsx(&wb).unwrap();
     let mut pkg = Package::open(&bytes).unwrap();
@@ -236,8 +237,10 @@ fn implicit_intersection_metadata_respects_function_argument_context() {
             ("SUM(A1:A3)", false),
             ("SUMPRODUCT(A1:A3*B1:B3)", false),
             ("SUMPRODUCT(SQRT(A1:A3))", false),
-            ("SQRT(@A1:A3)", false),
-            ("@A1:A3*2", false),
+            // An explicit `@` is written as `_xlfn.SINGLE`, a dynamic-array formula. Dropping it
+            // instead would need the reader to put it back on legacy formulas.
+            ("SQRT(@A1:A3)", true),
+            ("@A1:A3*2", true),
             ("@(A1:A3*2)", true),
             ("SQRT(INDIRECT(\"A1\"))", false),
             ("SUM(INDIRECT(\"A1:A3\"))", false),
@@ -257,6 +260,12 @@ fn implicit_intersection_metadata_respects_function_argument_context() {
             ("LET(x,A1:A3,SUM(x*2))", true),
             ("XLOOKUP(1,A1:A3,B1:B3)", false),
             ("XLOOKUP(1,A1:A3,B1:C3)", true),
+            ("FORECAST.LINEAR(4,A1:A3,B1:B3)", false),
+            ("FORECAST.ETS(4,A1:A3,B1:B3,1,1,1)", false),
+            ("FORECAST.ETS(C1:C3,A1:A3,B1:B3)", true),
+            ("FORECAST.ETS.CONFINT(4,A1:A3,B1:B3,0.95)", false),
+            ("FORECAST.ETS.SEASONALITY(A1:A3,B1:B3)", false),
+            ("FORECAST.ETS.STAT(A1:A3,B1:B3,1)", false),
         ],
     );
 }
@@ -322,6 +331,7 @@ fn implicit_intersection_metadata_distinguishes_table_rows_and_columns() {
         first_col: false,
         last_col: false,
         filter_button: true,
+        filter: vec![],
     });
     sh.cells.set(at("A2"), Cell::value(Value::Number(3.0)));
     sh.cells.set(at("B2"), formula("[@Input]*2", 6.0));

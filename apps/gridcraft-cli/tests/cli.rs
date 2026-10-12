@@ -150,3 +150,27 @@ fn mcp_over_stdio() {
     assert_eq!(lines[0]["result"]["serverInfo"]["name"], "gridcraft");
     assert!(lines[1]["result"]["content"][0]["text"].as_str().unwrap().contains("42"));
 }
+
+#[test]
+fn check_exit_codes_and_json() {
+    let dir = tmpdir("check");
+    let book = dir.join("calc.xlsx");
+    let book_s = book.to_str().unwrap();
+    ok(&["run", "--cmd", r#"cell.set={"cell":"A1","input":"2"}"#, "--cmd", r#"cell.set={"cell":"B1","input":"=A1*3"}"#, "--out", book_s, "--quiet"]);
+    // GridCraft's own file: its cached values are its own results, and it round-trips.
+    let o = run(&["check", dir.to_str().unwrap()]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(o.status.code(), Some(0), "{out}");
+    assert!(out.contains("1 checked: 1 matched, 0 mismatched"), "{out}");
+    let v: serde_json::Value = serde_json::from_str(&ok(&["check", book_s, "--json"])).unwrap();
+    assert_eq!(v["schema"], "gridcraft-check/1");
+    assert_eq!(v["totals"]["matched"], 1);
+    // A file that can't be opened is reported, not fatal, and fails the check.
+    let o = run(&["check", book_s, "/no/such/file.xlsx"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("1 failed to open"));
+    // Usage errors exit 2.
+    assert_eq!(run(&["check"]).status.code(), Some(2));
+    assert_eq!(run(&["check", book_s, "--tolerance", "x"]).status.code(), Some(2));
+    assert_eq!(run(&["check", book_s, "--bogus"]).status.code(), Some(2));
+}
