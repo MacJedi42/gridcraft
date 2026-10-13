@@ -82,6 +82,9 @@ fn expr_to_file(e: Expr) -> String {
         Expr::Unary(gridcraft_formula::UnOp::Spill, r) => Expr::Call("_xlfn.ANCHORARRAY".into(), vec![*r]),
         // Nor an `@` operator: Excel writes `@x` as `_xlfn.SINGLE(x)`.
         Expr::Unary(gridcraft_formula::UnOp::At, x) => Expr::Call("_xlfn.SINGLE".into(), vec![*x]),
+        // Nor the `[@Col]` shorthand: files spell it `[[#This Row],[Col]]`, or Excel repairs
+        // the file and drops the table. Carried as a name, which prints verbatim.
+        Expr::Struct(st) => Expr::Name(gridcraft_formula::printer::struct_ref_file(&st)),
         // Nor trim-reference operators: written as the equivalent `TRIMRANGE(range,n,n)`, which
         // every Excel with trim references reads. (Excel's own file spelling of `A1:.E10` is
         // not publicly documented; the `_xlfn._TRO_*` call forms are accepted on read.)
@@ -150,6 +153,20 @@ mod tests {
     #[test]
     fn unbracketed_this_row_column() {
         assert_eq!(from_file("Sales[[#This Row],Units]*[[#This Row],Price]"), "Sales[@Units]*[@Price]");
+    }
+
+    #[test]
+    fn this_row_long_form() {
+        // `[@Col]` is only Excel's display shorthand; a file holding it is repaired by Excel,
+        // which drops the table.
+        assert_eq!(to_file(&Formula::new("Sales[@Units]*Sales[@[Unit Price]]")), "Sales[[#This Row],[Units]]*Sales[[#This Row],[Unit Price]]");
+        assert_eq!(text_to_file("=[@Units]&COUNTA(Sales[@])"), "[[#This Row],[Units]]&COUNTA(Sales[#This Row])");
+        assert_eq!(text_to_file("=SUM(Sales[Units])+[#Totals]"), "SUM(Sales[Units])+[#Totals]");
+        for f in ["Sales[@Units]*[@[Unit Price]]", "Sales[@]", "[@[Unit Price]]+1"] {
+            let file = to_file(&Formula::new(f));
+            assert!(!file.contains("[@"), "{file}");
+            assert_eq!(from_file(&file), f);
+        }
     }
 
     #[test]

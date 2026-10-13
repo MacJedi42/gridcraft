@@ -17,7 +17,10 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui) {
     }
     let Some(pane) = app.grid.pane.clone().or_else(|| app.session.comments_pane.then(|| "comments".to_string())) else { return };
     let t = Tokens::get(ui.ctx());
-    egui::Panel::right("task_pane").default_size(300.0).resizable(true).frame(egui::Frame::NONE.fill(t.ribbon).inner_margin(10)).show(ui, |ui| {
+    // Capped at half the window so a pane can never cover the sheet, whatever its content asks for.
+    let max = (ui.available_width() / 2.0).max(300.0);
+    let panel = egui::Panel::right("task_pane").default_size(300.0).max_size(max).resizable(true);
+    panel.frame(egui::Frame::NONE.fill(t.ribbon).inner_margin(10)).show(ui, |ui| {
         ui.horizontal(|ui| {
             let title = match pane.as_str() {
                 "comments" => "Comments",
@@ -62,7 +65,7 @@ fn comments(app: &mut SheetApp, ui: &mut Ui) {
             .stroke(egui::Stroke::new(1.0, Color32::from_gray(215)))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.link(egui::RichText::new(&cell).strong()).clicked() {
                         let _ = app.run("selection.set", json!({"cell": cell}));
                         app.grid.ensure_visible = true;
@@ -78,18 +81,23 @@ fn comments(app: &mut SheetApp, ui: &mut Ui) {
                 }
                 let key = egui::Id::new(("reply", &cell));
                 let mut draft: String = ui.ctx().data_mut(|m| m.get_temp(key)).unwrap_or_default();
+                // Buttons first, right to left, so the reply field gets exactly the width they leave:
+                // a field sized by a guess wider than the row pushes the resizable pane wider every frame.
                 ui.horizontal(|ui| {
-                    let r = ui.add(egui::TextEdit::singleline(&mut draft).hint_text("Reply…").desired_width(ui.available_width() - 120.0));
-                    if (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) || ui.small_button("Send").clicked()) && !draft.is_empty() {
-                        app.run_or_alert("review.replyComment", json!({"cell": cell, "text": draft}));
-                        draft.clear();
-                    }
-                    if ui.small_button(if c.resolved { "Reopen" } else { "Resolve" }).clicked() {
-                        app.run_or_alert("review.resolveComment", json!({"cell": cell, "resolved": !c.resolved}));
-                    }
-                    if ui.small_button("Delete").clicked() {
-                        app.run_or_alert("review.deleteComment", json!({"cell": cell}));
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Delete").clicked() {
+                            app.run_or_alert("review.deleteComment", json!({"cell": cell}));
+                        }
+                        if ui.small_button(if c.resolved { "Reopen" } else { "Resolve" }).clicked() {
+                            app.run_or_alert("review.resolveComment", json!({"cell": cell, "resolved": !c.resolved}));
+                        }
+                        let send = ui.small_button("Send").clicked();
+                        let r = ui.add(egui::TextEdit::singleline(&mut draft).hint_text("Reply…").desired_width(ui.available_width()));
+                        if (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) || send) && !draft.is_empty() {
+                            app.run_or_alert("review.replyComment", json!({"cell": cell, "text": draft}));
+                            draft.clear();
+                        }
+                    });
                 });
                 ui.ctx().data_mut(|m| m.insert_temp(key, draft));
             });

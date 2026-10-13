@@ -149,3 +149,68 @@ fn space_shortcuts_per_platform() {
     // Cmd+Space is Spotlight on macOS.
     assert_eq!(space(mac_cmd, true), None);
 }
+
+#[test]
+fn alt_down_opens_autofilter_headers_without_changing_the_workbook() {
+    for rtl in [false, true] {
+        for cell in ["A1", "B1"] {
+            let mut session = book(cell);
+            session.execute("data.filter", json!({"range": "A1:B3"})).unwrap();
+            session.execute("view.rightToLeft", json!({"on": rtl})).unwrap();
+            let mut h = harness(session);
+            let before = h.state().session.active().unwrap().wb.clone();
+            key(&mut h, Key::ArrowDown, Modifiers::ALT);
+            let (column, _row, at) = h.state().grid.filter_menu.expect("Alt+Down must open the filter header menu");
+            let d = h.state().session.active().unwrap();
+            let active = CellRef::parse(cell).unwrap();
+            assert_eq!(column, active.col);
+            assert_eq!(d.selection.active, active);
+            assert_eq!(d.wb, before);
+            let sh = d.wb.active().unwrap();
+            let geo = gridcraft_ui_egui::grid::Geo::new(sh, h.state().grid.rect.unwrap(), h.state().view().scroll);
+            assert_eq!(at, geo.mirror_pos(gridcraft_ui_egui::grid::filter_button_rect(&geo, sh, active).center()));
+            // Opening focuses the existing search box; typing must not edit the header.
+            h.input_mut().events.push(Event::Text("1".into()));
+            h.run_steps(2);
+            assert_eq!(h.ctx.data(|data| data.get_temp::<String>(egui::Id::new(("filter_search", column)))).as_deref(), Some("1"));
+            assert!(h.state().editor.is_none());
+            assert_eq!(h.state().session.active().unwrap().wb, before);
+            key(&mut h, Key::Escape, Modifiers::NONE);
+            assert!(h.state().grid.filter_menu.is_none());
+        }
+    }
+}
+
+#[test]
+fn alt_down_keeps_validation_priority_and_plain_down_navigation() {
+    let mut session = book("A1");
+    session.execute("data.filter", json!({"range": "A1:B3"})).unwrap();
+    session.execute("data.validation", json!({"range": "A1", "type": "list", "formula1": "\"First,Second\""})).unwrap();
+    let mut h = harness(session);
+    key(&mut h, Key::ArrowDown, Modifiers::ALT);
+    assert_eq!(h.state().grid.list_picker, Some(CellRef::parse("A1").unwrap()));
+    assert!(h.state().grid.filter_menu.is_none());
+    key(&mut h, Key::Escape, Modifiers::NONE);
+    key(&mut h, Key::ArrowDown, Modifiers::NONE);
+    assert_eq!(h.state().session.active().unwrap().selection.active.a1(), "A2");
+    assert!(h.state().grid.filter_menu.is_none());
+    key(&mut h, Key::ArrowDown, Modifiers::ALT);
+    assert!(h.state().grid.filter_menu.is_none(), "a data cell has no filter button");
+    assert_eq!(h.state().session.active().unwrap().selection.active.a1(), "A2");
+}
+
+#[test]
+fn alt_down_only_opens_enabled_table_filter_buttons() {
+    for enabled in [false, true] {
+        let mut session = book("B1");
+        session.execute("insert.table", json!({"range": "A1:B3"})).unwrap();
+        if !enabled {
+            session.execute("table.headerRow", json!({"on": false})).unwrap();
+        }
+        session.execute("selection.set", json!({"cell": "B1"})).unwrap();
+        let mut h = harness(session);
+        key(&mut h, Key::ArrowDown, Modifiers::ALT);
+        assert_eq!(h.state().grid.filter_menu.map(|(column, _, _)| column), enabled.then_some(1));
+        assert_eq!(h.state().session.active().unwrap().selection.active.a1(), "B1");
+    }
+}

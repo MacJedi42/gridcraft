@@ -24,6 +24,7 @@ fn tree() -> Vec<(&'static str, Vec<Entry>)> {
                 ("Close", "file.close", Some("CMD+W")),
                 ("Save", "file.save", Some("CMD+S")),
                 ("Save As…", "file.saveAs", Some("CMD+SHIFT+S")),
+                ("Export as PDF…", "file.exportPdf", None),
                 ("Export as CSV…", "dialog:saveCopy:csv", None),
                 ("Save as Web Page…", "dialog:saveCopy:html", None),
                 ("-", "", None),
@@ -215,6 +216,7 @@ impl NativeMenu {
         ]);
         let _ = menu.append(&app_menu);
         let mut theme_items = Vec::new();
+        let mut window_menu = None;
         for (title, entries) in tree() {
             let sub = Submenu::new(title, true);
             for (label, id, acc) in entries {
@@ -237,8 +239,17 @@ impl NativeMenu {
                 let _ = sub.append(&item);
             }
             let _ = menu.append(&sub);
+            if title == "Window" {
+                window_menu = Some(sub);
+            }
         }
         menu.init_for_nsapp();
+        // NSApp's windowsMenu is where macOS adds Move & Resize, Fill and Center, the targets of the
+        // system tiling shortcuts (Fn+Ctrl+arrows, Fn+F). Only once the menu is NSApp's: muda looks
+        // the submenu up in the installed main menu.
+        if let Some(window) = window_menu {
+            window.set_as_windows_menu_for_nsapp();
+        }
         let (tx, rx) = channel();
         let ctx = ctx.clone();
         MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
@@ -298,6 +309,8 @@ impl NativeMenu {
                 app.open_dialog(name, params);
             } else if id == "edit.copy" || id == "edit.cut" {
                 app.copy_to_clipboard(ctx, &id);
+            } else if id == "edit.paste" {
+                app.paste_from_clipboard();
             } else {
                 app.run_or_alert(&id, json!({}));
             }
@@ -314,6 +327,15 @@ impl NativeMenu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_menu_has_export_as_pdf_dispatching_the_command() {
+        let tree = tree();
+        let (_, file) = tree.iter().find(|(title, _)| *title == "File").expect("File menu");
+        let item = file.iter().find(|e| e.0 == "Export as PDF…").expect("Export as PDF… in the File menu");
+        assert_eq!(item.1, "file.exportPdf");
+        assert!(gridcraft_engine::find_command("file.exportPdf").is_some());
+    }
 
     #[test]
     fn theme_choices_use_the_shared_preference_command() {

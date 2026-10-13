@@ -14,18 +14,25 @@
 //!   projection. It finds a local optimum of a smooth model; integer constraints use a small
 //!   branch and bound on top.
 //!
+//! - **Evolutionary**: a genetic search for models that aren't smooth (IF, lookups, rounding),
+//!   with tournament selection, blend crossover and Gaussian mutation inside the variable bounds,
+//!   feasibility-first ranking and integer rounding, followed by a compass (pattern) search around
+//!   the best member. It stops when the population has converged, when the best member stops
+//!   improving, or at the evaluation budget.
+//!
 //! Work is bounded by an evaluation budget (no clock: `Instant` traps on wasm). The model is
 //! saved as hidden sheet-scoped names (`solver_opt`, `solver_adj`, `solver_lhs1`…), so it
 //! travels with the workbook through XLSX.
 
 use gridcraft_core::{CellRef, RangeRef, Value};
-use gridcraft_model::{Cell, DefinedName, Workbook};
+use gridcraft_model::{Cell, DefinedName, Sheet, Workbook};
 use serde_json::{Value as Json, json};
 
 use super::whatif::Trial;
 use super::*;
 
 const CMD: &str = "data.solver";
+const REPORT_CMD: &str = "data.solverReport";
 /// Excel's limit on decision variables.
 const MAX_VARS: usize = 200;
 /// Most scalar constraints (after expanding ranges).
@@ -36,20 +43,34 @@ const MAX_EVALS: u64 = 200_000;
 const LP_WORK: u64 = 2_000_000_000;
 const MAX_NODES_LP: usize = 10_000;
 const MAX_NODES_NLP: usize = 200;
+/// Evolutionary population sizes.
+const MIN_POPULATION: usize = 10;
+const MAX_POPULATION: usize = 1000;
 /// Constraint precision (Excel's default 0.000001).
 const PRECISION: f64 = 1e-6;
 const EPS: f64 = 1e-9;
 
 pub fn specs() -> Vec<CommandSpec> {
-    vec![cmd!(
-        "data.solver",
-        "Solver…",
-        ["Data", "Analysis"],
-        None,
-        "{objective: \"B10\" (formula cell), goal?: max|min|value (default max), value?: number (for goal value), variables: \"B2:B4,D1\" (≤200 constant cells, same sheet), constraints?: [\"B5 <= 10\", \"B2:B4 >= C2:C4\", \"B2 int\", \"B3 bin\", {lhs: \"B6\", op: \"=\", rhs: 3 | \"C6\"}], nonNegative?: bool (default true: variables without a lower bound get 0), method?: grg|simplex (default grg), keep?: bool (default true; false restores the original values), saveModel?: bool (default true: hidden solver_* names), maxEvaluations?: 20000, integerOptimality?: percent (default 0), saved?: bool (solve the sheet's saved model; other params override)} → {status: optimal|converged|iterationLimit|infeasible|unbounded|notLinear, message, objective, values: {cell: value}, evaluations, changed}. No `objective` → {model: the saved model} (the menu opens the dialog).",
-        has_doc,
-        run
-    )]
+    vec![
+        cmd!(
+            "data.solver",
+            "Solver…",
+            ["Data", "Analysis"],
+            None,
+            "{objective: \"B10\" (formula cell), goal?: max|min|value (default max), value?: number (for goal value), variables: \"B2:B4,D1\" (≤200 constant cells, same sheet), constraints?: [\"B5 <= 10\", \"B2:B4 >= C2:C4\", \"B2 int\", \"B3 bin\", {lhs: \"B6\", op: \"=\", rhs: 3 | \"C6\"}], nonNegative?: bool (default true: variables without a lower bound get 0), method?: grg|simplex|evolutionary (default grg), populationSize?: 100, mutationRate?: 0.075, randomSeed?: 0 (a fixed seed, so runs repeat), convergence?: 0.0001, generationsWithoutImprovement?: 50, requireBounds?: bool (default true: every variable needs both bounds; false searches within ±100 of the start) (Evolutionary options), keep?: bool (default true; false restores the original values), saveModel?: bool (default true: hidden solver_* names), maxEvaluations?: 20000, integerOptimality?: percent (default 0), saved?: bool (solve the sheet's saved model; other params override), reports?: [answer|limits] (written on new sheets when a solution is found)} → {status: optimal|converged|cannotImprove|iterationLimit|infeasible|unbounded|notLinear, message, objective, values: {cell: value}, original: {cell: value}, model: the model as params, evaluations, changed, reports?: [sheet names]}. No `objective` → {model: the saved model} (the menu opens the dialog).",
+            has_doc,
+            run
+        ),
+        cmd!(
+            "data.solverReport",
+            "Solver Reports",
+            [],
+            None,
+            "{reports: [answer|limits], values?: {cell: number} (the solution; default the variable cells' current values), original?: {cell: number} (the values before solving; default `values`), message?: text (the result line), model?: data.solver params (default the sheet's saved model, with any data.solver params given here over it)} → {sheets: [names]}. Writes Answer and Limits reports on new sheets before the model's sheet; Limits needs Simplex LP or GRG Nonlinear and no integer constraints. data.solver's result can be passed as is.",
+            has_doc,
+            report
+        ),
+    ]
 }
 
 // ---------------------------------------------------------------- model
@@ -132,6 +153,38 @@ enum Goal {
 enum Method {
     Simplex,
     Grg,
+    Evolutionary,
+}
+
+/// The Evolutionary method's options (Solver Options › Evolutionary). The search keeps no
+/// clock, so the time without improvement is counted in generations.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EvoOptions {
+    population: usize,
+    mutation: f64,
+    seed: u64,
+    convergence: f64,
+    stall: u64,
+    require_bounds: bool,
+}
+
+impl Default for EvoOptions {
+    fn default() -> EvoOptions {
+        EvoOptions { population: 100, mutation: 0.075, seed: 0, convergence: 1e-4, stall: 50, require_bounds: true }
+    }
+}
+
+fn evo_options(p: &Json) -> EvoOptions {
+    let d = EvoOptions::default();
+    let num = |k: &str| p.get(k).and_then(Json::as_f64).or_else(|| str_param(p, k).and_then(num_text)).filter(|v| v.is_finite());
+    EvoOptions {
+        population: num("populationSize").map_or(d.population, |v| v.clamp(MIN_POPULATION as f64, MAX_POPULATION as f64) as usize),
+        mutation: num("mutationRate").map_or(d.mutation, |v| v.clamp(0.0, 1.0)),
+        seed: num("randomSeed").map_or(d.seed, |v| v.clamp(0.0, f64::from(u32::MAX)) as u64),
+        convergence: num("convergence").map_or(d.convergence, |v| v.clamp(0.0, 1.0)),
+        stall: num("generationsWithoutImprovement").map_or(d.stall, |v| v.clamp(1.0, 100_000.0) as u64),
+        require_bounds: bool_param(p, "requireBounds").unwrap_or(d.require_bounds),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -144,6 +197,7 @@ struct Model {
     cons: Vec<Constraint>,
     non_negative: bool,
     method: Method,
+    evo: EvoOptions,
 }
 
 /// Cells of `"B2:B4,D1"` on one sheet (row-major per area, in order), at most `cap`.
@@ -301,10 +355,10 @@ fn parse_model(s: &Session, p: &Json) -> Result<Model> {
     let method = match str_param(p, "method").unwrap_or("grg").to_ascii_lowercase().replace([' ', '_', '-'], "").as_str() {
         "grg" | "grgnonlinear" | "nonlinear" => Method::Grg,
         "simplex" | "simplexlp" | "lp" | "linear" => Method::Simplex,
-        "evolutionary" => return Err(EngineError::Other("The Evolutionary method isn't available; use GRG Nonlinear or Simplex LP.".into())),
-        m => return Err(bad(CMD, format!("unknown method `{m}` (grg or simplex)"))),
+        "evolutionary" | "evo" | "genetic" => Method::Evolutionary,
+        m => return Err(bad(CMD, format!("unknown method `{m}` (grg, simplex or evolutionary)"))),
     };
-    Ok(Model { sheet, objective, goal, vars, vars_text, cons, non_negative, method })
+    Ok(Model { sheet, objective, goal, vars, vars_text, cons, non_negative, method, evo: evo_options(p) })
 }
 
 // ---------------------------------------------------------------- saved model
@@ -359,7 +413,18 @@ fn save_model(wb: &mut Workbook, m: &Model) {
     }
     put("solver_num".into(), m.cons.len().to_string());
     put("solver_neg".into(), if m.non_negative { "1" } else { "2" }.into());
-    put("solver_eng".into(), if m.method == Method::Simplex { "2" } else { "1" }.into());
+    let eng = match m.method {
+        Method::Grg => "1",
+        Method::Simplex => "2",
+        Method::Evolutionary => "3",
+    };
+    put("solver_eng".into(), eng.into());
+    if m.method == Method::Evolutionary {
+        put("solver_ssz".into(), m.evo.population.to_string());
+        put("solver_mrt".into(), m.evo.mutation.to_string());
+        put("solver_rsd".into(), m.evo.seed.to_string());
+        put("solver_rbv".into(), if m.evo.require_bounds { "1" } else { "2" }.into());
+    }
     put("solver_ver".into(), "3".into());
 }
 
@@ -398,15 +463,72 @@ pub fn saved_model(wb: &Workbook, sheet: usize) -> Option<Json> {
             }
         });
     }
-    Some(json!({
+    let method = match get("solver_eng").as_deref().map(str::trim) {
+        Some("2") => "simplex",
+        Some("3") => "evolutionary",
+        _ => "grg",
+    };
+    let mut model = json!({
         "objective": objective,
         "goal": goal,
         "value": value,
         "variables": get("solver_adj").map(local).unwrap_or_default(),
         "constraints": constraints,
         "nonNegative": get("solver_neg").as_deref().map(str::trim) != Some("2"),
-        "method": if get("solver_eng").as_deref().map(str::trim) == Some("2") { "simplex" } else { "grg" },
-    }))
+        "method": method,
+    });
+    for (name, key) in [("solver_ssz", "populationSize"), ("solver_mrt", "mutationRate"), ("solver_rsd", "randomSeed")] {
+        if let Some(v) = get(name).and_then(|v| num_text(&v)) {
+            model[key] = json!(v);
+        }
+    }
+    if let Some(v) = get("solver_rbv") {
+        model["requireBounds"] = json!(v.trim() != "2");
+    }
+    Some(model)
+}
+
+/// The model as `data.solver` params, in the form [`saved_model`] returns (the objective
+/// qualified by its sheet).
+fn model_params(wb: &Workbook, m: &Model) -> Json {
+    let sheet = wb.sheet(m.sheet).map(|s| crate::pivot::quote_sheet(&s.name)).unwrap_or_default();
+    let (goal, value) = match m.goal {
+        Goal::Max => ("max", 0.0),
+        Goal::Min => ("min", 0.0),
+        Goal::Value(v) => ("value", v),
+    };
+    let constraints: Vec<Json> = m
+        .cons
+        .iter()
+        .map(|c| match c.rel {
+            Rel::Int | Rel::Bin => json!(format!("{} {}", c.lhs_text, c.rel.text())),
+            _ => json!(format!("{} {} {}", c.lhs_text, c.rel.text(), c.rhs_text)),
+        })
+        .collect();
+    let method = match m.method {
+        Method::Simplex => "simplex",
+        Method::Grg => "grg",
+        Method::Evolutionary => "evolutionary",
+    };
+    let mut out = json!({
+        "objective": format!("{sheet}!{}", m.objective.a1()),
+        "goal": goal,
+        "value": value,
+        "variables": m.vars_text,
+        "constraints": constraints,
+        "nonNegative": m.non_negative,
+        "method": method,
+    });
+    if m.method == Method::Evolutionary {
+        let e = &m.evo;
+        out["populationSize"] = json!(e.population);
+        out["mutationRate"] = json!(e.mutation);
+        out["randomSeed"] = json!(e.seed);
+        out["convergence"] = json!(e.convergence);
+        out["generationsWithoutImprovement"] = json!(e.stall);
+        out["requireBounds"] = json!(e.require_bounds);
+    }
+    out
 }
 
 // ---------------------------------------------------------------- evaluation
@@ -442,6 +564,8 @@ struct Evaluator {
     rows: Vec<Row>,
     evals: u64,
     budget: u64,
+    /// The Limits report: the objective is this variable itself.
+    target: Option<usize>,
 }
 
 fn as_num(v: &Value) -> f64 {
@@ -476,6 +600,10 @@ impl Evaluator {
         let vals = self.trial.run(&sets, &reads);
         let mut it = vals.iter().map(as_num);
         let f = it.next().unwrap_or(f64::NAN);
+        let f = match self.target {
+            Some(j) => x.get(j).copied().unwrap_or(f64::NAN),
+            None => f,
+        };
         let mut g = Vec::with_capacity(self.rows.len());
         for r in &self.rows {
             let l = it.next().unwrap_or(f64::NAN);
@@ -1182,6 +1310,673 @@ fn nlp(ev: &mut Evaluator, x0: &[f64], lo: &[f64], hi: &[f64], goal: Goal) -> Ou
     Outcome::Solved(x, phi, (converged || viol <= PRECISION * scale) && !out_of_budget)
 }
 
+// ---------------------------------------------------------------- evolutionary
+
+/// A small deterministic generator (SplitMix64), so a seed reproduces a run on every platform.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Rng {
+        Rng(seed ^ 0x2545_F491_4F6C_DD1D)
+    }
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    /// Uniform in [0, 1).
+    fn uniform(&mut self) -> f64 {
+        (self.next() >> 11) as f64 / (1u64 << 53) as f64
+    }
+    fn between(&mut self, a: f64, b: f64) -> f64 {
+        a + (b - a) * self.uniform()
+    }
+    fn below(&mut self, n: usize) -> usize {
+        if n == 0 { 0 } else { usize::try_from(self.next() % n as u64).unwrap_or(0) }
+    }
+    /// Standard normal (Box–Muller).
+    fn normal(&mut self) -> f64 {
+        let u = self.uniform().max(f64::MIN_POSITIVE);
+        (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * self.uniform()).cos()
+    }
+}
+
+/// A candidate: its point, the objective to minimise and its constraint violation.
+#[derive(Clone, Debug)]
+struct Member {
+    x: Vec<f64>,
+    phi: f64,
+    viol: f64,
+}
+
+impl Member {
+    /// Feasible beats infeasible; then the lower objective, or the smaller violation.
+    fn better(&self, o: &Member, tol: f64) -> bool {
+        match (self.viol <= tol, o.viol <= tol) {
+            (true, false) => true,
+            (false, true) => false,
+            (true, true) => self.phi < o.phi,
+            (false, false) => self.viol < o.viol,
+        }
+    }
+}
+
+/// Why the Evolutionary search stopped.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum EvoEnd {
+    /// Almost all of the population is within Convergence of the best member.
+    Converged,
+    /// The best member didn't improve for the set number of generations.
+    Stalled,
+    /// The evaluation budget ran out.
+    Budget,
+}
+
+/// The search box, integer flags and scoring shared by the genetic and pattern phases.
+struct EvoSearch<'a> {
+    ev: &'a mut Evaluator,
+    rows: Vec<Row>,
+    senses: Vec<Sense>,
+    goal: Goal,
+    lo: Vec<f64>,
+    hi: Vec<f64>,
+    integer: &'a [bool],
+    tol: f64,
+}
+
+impl EvoSearch<'_> {
+    /// Clamps into the box and rounds integer variables.
+    fn repair(&self, x: &mut [f64]) {
+        for (j, v) in x.iter_mut().enumerate() {
+            let (l, h) = (self.lo.get(j).copied().unwrap_or(0.0), self.hi.get(j).copied().unwrap_or(0.0));
+            *v = if v.is_finite() { v.clamp(l, h) } else { l };
+            if self.integer.get(j).copied().unwrap_or(false) {
+                *v = v.round().clamp(l.ceil(), h.floor());
+            }
+        }
+    }
+
+    /// Scores `x`; `None` once the budget is spent.
+    fn score(&mut self, x: Vec<f64>) -> Option<Member> {
+        let p = self.ev.eval(&x)?;
+        let (phi, cons) = shape(&p, &self.rows, self.goal);
+        let viol = violation(&cons, &self.senses);
+        let phi = if phi.is_finite() { phi } else { f64::INFINITY };
+        let viol = if viol.is_finite() && cons.iter().all(|c| c.is_finite()) { viol } else { f64::INFINITY };
+        Some(Member { x, phi, viol })
+    }
+}
+
+/// The Evolutionary method within `lo..hi` from `x0`.
+fn evolutionary(ev: &mut Evaluator, x0: &[f64], lo: &[f64], hi: &[f64], integer: &[bool], goal: Goal, o: &EvoOptions) -> (Outcome, EvoEnd) {
+    let rows = ev.rows.clone();
+    let senses: Vec<Sense> = rows.iter().map(|r| r.sense).collect();
+    let scale = rows.iter().map(|r| r.rhs_const.abs()).fold(1.0, f64::max);
+    let mut start = x0.to_vec();
+    project(&mut start, lo, hi);
+    // Without a bound, search within 100 of the start.
+    let blo: Vec<f64> = lo.iter().zip(&start).map(|(l, s)| if l.is_finite() { *l } else { s - 100.0 }).collect();
+    let bhi: Vec<f64> = hi.iter().zip(&start).map(|(h, s)| if h.is_finite() { *h } else { s + 100.0 }).collect();
+    let no_integer = blo.iter().zip(&bhi).zip(integer).any(|((l, h), int)| *int && l.ceil() > h.floor());
+    if blo.iter().zip(&bhi).any(|(l, h)| l > h) || no_integer {
+        return (Outcome::Infeasible, EvoEnd::Converged);
+    }
+    let span: Vec<f64> = blo.iter().zip(&bhi).map(|(l, h)| (h - l).max(1e-9)).collect();
+    let mut se = EvoSearch { ev, rows, senses, goal, lo: blo, hi: bhi, integer, tol: PRECISION * scale };
+    let mut rng = Rng::new(o.seed);
+    let size = o.population.clamp(MIN_POPULATION, MAX_POPULATION);
+    let tol = se.tol;
+    let mut end = EvoEnd::Budget;
+    // The first generation: the start and random points in the box.
+    let mut pop: Vec<Member> = Vec::with_capacity(size);
+    se.repair(&mut start);
+    let mut next_x = Some(start);
+    while pop.len() < size {
+        let x = next_x.take().unwrap_or_else(|| {
+            let mut x: Vec<f64> = se.lo.iter().zip(&se.hi).map(|(l, h)| rng.between(*l, *h)).collect();
+            se.repair(&mut x);
+            x
+        });
+        match se.score(x) {
+            Some(m) => pop.push(m),
+            None => break,
+        }
+    }
+    let mut best: Option<Member> = None;
+    for m in &pop {
+        if best.as_ref().is_none_or(|b| m.better(b, tol)) {
+            best = Some(m.clone());
+        }
+    }
+    let mut last_improved = 0u64;
+    let mut generation = 0u64;
+    'search: while pop.len() == size {
+        let Some(b) = best.clone() else { break };
+        // Converged: 99% of the population is feasible and within Convergence of the best.
+        let close = pop.iter().filter(|m| m.viol <= tol && (m.phi - b.phi).abs() <= o.convergence * b.phi.abs().max(1.0)).count();
+        if b.viol <= tol && generation >= 5 && close * 100 >= size * 99 {
+            end = EvoEnd::Converged;
+            break;
+        }
+        if generation.saturating_sub(last_improved) >= o.stall {
+            end = EvoEnd::Stalled;
+            break;
+        }
+        // The next generation: the best survives, the rest are children of two tournaments.
+        let mut next = Vec::with_capacity(size);
+        next.push(b.clone());
+        while next.len() < size {
+            let mut parent = || {
+                let (i, k) = (rng.below(size), rng.below(size));
+                match (pop.get(i), pop.get(k)) {
+                    (Some(p), Some(q)) => Some(if q.better(p, tol) { q.x.clone() } else { p.x.clone() }),
+                    _ => None,
+                }
+            };
+            let (Some(pa), Some(pb)) = (parent(), parent()) else { break 'search };
+            let mut x: Vec<f64> = pa
+                .iter()
+                .zip(&pb)
+                .zip(&span)
+                .map(|((a, c), w)| {
+                    let mut v = a + rng.between(-0.25, 1.25) * (c - a);
+                    if rng.uniform() < o.mutation {
+                        v += 0.1 * w * rng.normal();
+                    }
+                    v
+                })
+                .collect();
+            se.repair(&mut x);
+            match se.score(x) {
+                Some(m) => next.push(m),
+                None => break 'search,
+            }
+        }
+        generation += 1;
+        for m in &next {
+            let Some(cur) = &best else { continue };
+            if m.better(cur, tol) {
+                let improved = cur.viol > tol || cur.phi - m.phi > 1e-9 * cur.phi.abs().max(1.0);
+                best = Some(m.clone());
+                if improved {
+                    last_improved = generation;
+                }
+            }
+        }
+        pop = next;
+    }
+    // Polish: a compass search on the continuous variables around the best member.
+    if let Some(mut b) = best.clone() {
+        let mut step: Vec<f64> = span.iter().map(|w| 0.01 * w).collect();
+        let n = b.x.len();
+        'polish: for _ in 0..10_000 {
+            if step.iter().zip(&span).zip(integer).all(|((s, w), int)| *int || *s <= 1e-9 * w.max(1.0)) {
+                break;
+            }
+            let mut moved = false;
+            for j in 0..n {
+                if integer.get(j).copied().unwrap_or(false) {
+                    continue;
+                }
+                for dir in [1.0, -1.0] {
+                    let mut x = b.x.clone();
+                    if let (Some(v), Some(s)) = (x.get_mut(j), step.get(j)) {
+                        *v += dir * s;
+                    }
+                    se.repair(&mut x);
+                    if x == b.x {
+                        continue;
+                    }
+                    let Some(m) = se.score(x) else { break 'polish };
+                    if m.better(&b, tol) {
+                        b = m;
+                        moved = true;
+                        break;
+                    }
+                }
+            }
+            if !moved {
+                for s in &mut step {
+                    *s *= 0.5;
+                }
+            }
+        }
+        best = Some(b);
+    }
+    match best {
+        Some(b) if b.viol <= tol => (Outcome::Solved(b.x, b.phi, end != EvoEnd::Budget), end),
+        _ if end == EvoEnd::Budget => (Outcome::Limit, end),
+        _ => (Outcome::Infeasible, end),
+    }
+}
+
+/// What a solve ended with, and why Simplex LP or Evolutionary stopped.
+struct Solve {
+    outcome: Outcome,
+    not_linear: bool,
+    evo_end: Option<EvoEnd>,
+}
+
+/// Runs the model's method for `goal` within `lo..hi` from `x0`.
+#[allow(clippy::too_many_arguments)]
+fn optimise(ev: &mut Evaluator, m: &Model, goal: Goal, x0: &[f64], lo: &[f64], hi: &[f64], integer: &[bool], gap: f64) -> Solve {
+    let any_int = integer.iter().any(|b| *b);
+    let mut not_linear = false;
+    let mut evo_end = None;
+    let outcome = if lo.iter().zip(hi).any(|(l, h)| l > h) {
+        Outcome::Infeasible
+    } else {
+        match m.method {
+            Method::Simplex => match linearize(ev, x0) {
+                Err("nonlinear") | Err("error") => {
+                    not_linear = true;
+                    Outcome::Infeasible
+                }
+                Err(_) => Outcome::Limit,
+                Ok(((cf, f_const), lin)) => {
+                    let mut rows: Vec<(Vec<f64>, Sense, f64)> = lin.iter().zip(&ev.rows).map(|((a, k), r)| (a.clone(), r.sense, -k)).collect();
+                    let c: Vec<f64> = match goal {
+                        Goal::Max => cf.iter().map(|v| -v).collect(),
+                        Goal::Min => cf.clone(),
+                        Goal::Value(v) => {
+                            rows.push((cf.clone(), Sense::Eq, v - f_const));
+                            vec![0.0; cf.len()]
+                        }
+                    };
+                    let size = (rows.len() as u64 + 2 * x0.len() as u64 + 1) * (4 * x0.len() as u64 + 2 * rows.len() as u64 + 1);
+                    let mut work = LP_WORK.max(size);
+                    let mut relax = |l: &[f64], h: &[f64]| solve_lp(&c, &rows, l, h, &mut work);
+                    if any_int { branch_and_bound(lo, hi, integer, MAX_NODES_LP, gap, &mut relax).0 } else { relax(lo, hi) }
+                }
+            },
+            Method::Grg => {
+                if any_int {
+                    let mut relax = |l: &[f64], h: &[f64]| {
+                        let mut start = x0.to_vec();
+                        project(&mut start, l, h);
+                        nlp(ev, &start, l, h, goal)
+                    };
+                    branch_and_bound(lo, hi, integer, MAX_NODES_NLP, gap, &mut relax).0
+                } else {
+                    nlp(ev, x0, lo, hi, goal)
+                }
+            }
+            Method::Evolutionary => {
+                let (out, end) = evolutionary(ev, x0, lo, hi, integer, goal, &m.evo);
+                evo_end = Some(end);
+                out
+            }
+        }
+    };
+    Solve { outcome, not_linear, evo_end }
+}
+
+// ---------------------------------------------------------------- reports
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ReportKind {
+    Answer,
+    Limits,
+}
+
+impl ReportKind {
+    fn title(self) -> &'static str {
+        match self {
+            ReportKind::Answer => "Answer",
+            ReportKind::Limits => "Limits",
+        }
+    }
+}
+
+/// The `reports` list (`None` when absent).
+fn report_kinds(cmd: &'static str, p: &Json) -> Result<Option<Vec<ReportKind>>> {
+    let Some(list) = p.get("reports") else { return Ok(None) };
+    let list = list.as_array().ok_or_else(|| bad(cmd, "`reports` must be an array of answer and limits"))?;
+    let mut kinds = Vec::new();
+    for k in list {
+        let kind = match k.as_str().map(|t| t.trim().to_ascii_lowercase()).as_deref() {
+            Some("answer") => ReportKind::Answer,
+            Some("limits") => ReportKind::Limits,
+            _ => return Err(bad(cmd, format!("unknown report {k} (answer or limits)"))),
+        };
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    Ok(Some(kinds))
+}
+
+/// A report's cells: (row, column, value, bold).
+type Lines = Vec<(u32, u32, Value, bool)>;
+
+fn abs_ref(c: CellRef) -> String {
+    format!("${}${}", gridcraft_core::col_to_letters(c.col), u64::from(c.row) + 1)
+}
+
+/// A cell's name in the reports: the nearest text to its left and the nearest text above it.
+fn cell_name(sh: &Sheet, c: CellRef) -> String {
+    let text = |c: CellRef| match sh.value(c) {
+        Value::Text(t) if !t.trim().is_empty() => Some(t.to_string()),
+        _ => None,
+    };
+    let left = (0..c.col).rev().find_map(|col| text(CellRef::new(c.row, col)));
+    let top = (0..c.row).rev().find_map(|row| text(CellRef::new(row, c.col)));
+    [left, top].into_iter().flatten().collect::<Vec<_>>().join(" ")
+}
+
+fn method_name(m: Method) -> &'static str {
+    match m {
+        Method::Simplex => "Simplex LP",
+        Method::Grg => "GRG Nonlinear",
+        Method::Evolutionary => "Evolutionary",
+    }
+}
+
+/// Header labels in bold from column 1, then the rows below them; returns the next free row.
+fn table(out: &mut Lines, row: u32, headers: &[&str], rows: Vec<Vec<Value>>) -> u32 {
+    for (k, h) in headers.iter().enumerate() {
+        out.push((row, 1 + k as u32, Value::text(*h), true));
+    }
+    let mut r = row;
+    for cells in rows {
+        r = r.saturating_add(1);
+        for (k, v) in cells.into_iter().enumerate() {
+            out.push((r, 1 + k as u32, v, false));
+        }
+    }
+    r.saturating_add(2)
+}
+
+/// Everything a report describes: the model, its starting and final values, and the result.
+struct ReportInput<'a> {
+    model: &'a Model,
+    prob: &'a Problem,
+    original: Vec<f64>,
+    solution: Vec<f64>,
+    message: String,
+    budget: u64,
+}
+
+fn title(out: &mut Lines, kind: ReportKind, sheet: &str) -> u32 {
+    out.push((0, 0, Value::text(format!("GridCraft {} Report", kind.title())), true));
+    out.push((1, 0, Value::text(format!("Worksheet: {sheet}")), false));
+    3
+}
+
+fn answer_report(d: &DocState, sh: &Sheet, inp: &ReportInput) -> Lines {
+    let m = inp.model;
+    let mut trial = Trial::new(d);
+    let read = |trial: &mut Trial, x: &[f64], cells: &[CellRef]| -> Vec<f64> {
+        let sets: Vec<(usize, CellRef, Value)> = m.vars.iter().zip(x).map(|(c, v)| (m.sheet, *c, Value::number(*v))).collect();
+        let reads: Vec<(usize, CellRef)> = cells.iter().map(|c| (m.sheet, *c)).collect();
+        trial.run(&sets, &reads).iter().map(as_num).collect()
+    };
+    let f0 = read(&mut trial, &inp.original, &[m.objective]).first().copied().unwrap_or(f64::NAN);
+    // Every cell the constraints read, at the solution.
+    let mut cells = vec![m.objective];
+    for c in &m.cons {
+        cells.extend(&c.lhs);
+        if let Rhs::Cells(r) = &c.rhs {
+            cells.extend(r);
+        }
+    }
+    let vals = read(&mut trial, &inp.solution, &cells);
+    let mut at = vals.iter().copied();
+    let f1 = at.next().unwrap_or(f64::NAN);
+    let num = |v: f64| if v.is_finite() { Value::number(v) } else { Value::Error(gridcraft_core::CellError::Value) };
+    let mut out = Lines::new();
+    let mut r = title(&mut out, ReportKind::Answer, &sh.name);
+    out.push((r, 0, Value::text(format!("Result: {}", inp.message)), false));
+    out.push((r + 1, 0, Value::text(format!("Engine: {}", method_name(m.method))), false));
+    r += 3;
+    let goal = match m.goal {
+        Goal::Max => "Max".to_string(),
+        Goal::Min => "Min".to_string(),
+        Goal::Value(v) => format!("Value Of {v}"),
+    };
+    out.push((r, 0, Value::text(format!("Objective Cell ({goal})")), true));
+    let obj = vec![vec![Value::text(abs_ref(m.objective)), Value::text(cell_name(sh, m.objective)), num(f0), num(f1)]];
+    r = table(&mut out, r + 1, &["Cell", "Name", "Original Value", "Final Value"], obj);
+    out.push((r, 0, Value::text("Variable Cells"), true));
+    let kind = |j: usize| {
+        let bin = m.cons.iter().any(|c| c.rel == Rel::Bin && m.vars.get(j).is_some_and(|v| c.lhs.contains(v)));
+        match (bin, inp.prob.integer.get(j).copied().unwrap_or(false)) {
+            (true, _) => "Binary",
+            (false, true) => "Integer",
+            _ => "Contin",
+        }
+    };
+    let vars = m
+        .vars
+        .iter()
+        .enumerate()
+        .map(|(j, c)| {
+            let (a, b) = (inp.original.get(j).copied().unwrap_or(f64::NAN), inp.solution.get(j).copied().unwrap_or(f64::NAN));
+            vec![Value::text(abs_ref(*c)), Value::text(cell_name(sh, *c)), num(a), num(b), Value::text(kind(j))]
+        })
+        .collect();
+    r = table(&mut out, r + 1, &["Cell", "Name", "Original Value", "Final Value", "Integer"], vars);
+    out.push((r, 0, Value::text("Constraints"), true));
+    let mut rows = Vec::new();
+    for c in &m.cons {
+        let lhs: Vec<f64> = c.lhs.iter().map(|_| at.next().unwrap_or(f64::NAN)).collect();
+        let rhs: Vec<f64> = match &c.rhs {
+            Rhs::Cells(cells) => cells.iter().map(|_| at.next().unwrap_or(f64::NAN)).collect(),
+            Rhs::Const(v) => vec![*v],
+            Rhs::None => vec![],
+        };
+        for (k, (cell, v)) in c.lhs.iter().zip(&lhs).enumerate() {
+            let (formula, status, slack) = match (c.rel, &c.rhs) {
+                (Rel::Int, _) => (format!("{}=Integer", abs_ref(*cell)), "Binding", 0.0),
+                (Rel::Bin, _) => (format!("{}=Binary", abs_ref(*cell)), "Binding", 0.0),
+                (rel, rhs_cells) => {
+                    let b = rhs.get(k).or_else(|| rhs.first()).copied().unwrap_or(f64::NAN);
+                    let rhs_text = match rhs_cells {
+                        Rhs::Cells(cells) => cells.get(k).or_else(|| cells.first()).map(|c| abs_ref(*c)).unwrap_or_default(),
+                        _ => gridcraft_core::number_to_text(b),
+                    };
+                    let slack = (v - b).abs();
+                    let binding = rel == Rel::Eq || slack <= PRECISION * (1.0 + b.abs());
+                    let slack = if binding { 0.0 } else { slack };
+                    (format!("{}{}{rhs_text}", abs_ref(*cell), rel.text()), if binding { "Binding" } else { "Not Binding" }, slack)
+                }
+            };
+            rows.push(vec![
+                Value::text(abs_ref(*cell)),
+                Value::text(cell_name(sh, *cell)),
+                num(*v),
+                Value::text(formula),
+                Value::text(status),
+                num(slack),
+            ]);
+        }
+    }
+    table(&mut out, r + 1, &["Cell", "Name", "Cell Value", "Formula", "Status", "Slack"], rows);
+    out
+}
+
+fn limits_report(d: &DocState, sh: &Sheet, inp: &ReportInput) -> Result<Lines> {
+    let m = inp.model;
+    if inp.prob.integer.iter().any(|b| *b) {
+        return Err(EngineError::Other("The Limits report doesn't apply to models with integer or binary constraints.".into()));
+    }
+    if m.method == Method::Evolutionary {
+        return Err(EngineError::Other("The Limits report is available for Simplex LP and GRG Nonlinear.".into()));
+    }
+    let n = m.vars.len();
+    let x = &inp.solution;
+    // Each variable is minimised and maximised with the others held at the solution.
+    let per = (inp.budget / (2 * n as u64).max(1)).max(n as u64 + 3);
+    let mut ev = Evaluator {
+        trial: Trial::new(d),
+        sheet: m.sheet,
+        vars: m.vars.clone(),
+        objective: m.objective,
+        rows: inp.prob.rows.clone(),
+        evals: 0,
+        budget: 0,
+        target: None,
+    };
+    let objective_at = |ev: &mut Evaluator, x: &[f64]| {
+        ev.target = None;
+        ev.budget = ev.evals.saturating_add(1);
+        ev.eval(x).map(|p| p.f).unwrap_or(f64::NAN)
+    };
+    let num = |v: f64| if v.is_finite() { Value::number(v) } else { Value::Error(gridcraft_core::CellError::Value) };
+    let f = objective_at(&mut ev, x);
+    let mut rows = Vec::new();
+    for (j, c) in m.vars.iter().enumerate() {
+        let (mut lo, mut hi) = (x.clone(), x.clone());
+        if let (Some(l), Some(h), Some(pl), Some(ph)) = (lo.get_mut(j), hi.get_mut(j), inp.prob.lo.get(j), inp.prob.hi.get(j)) {
+            *l = *pl;
+            *h = *ph;
+        }
+        let mut ends = Vec::new();
+        for goal in [Goal::Min, Goal::Max] {
+            ev.target = Some(j);
+            ev.evals = 0;
+            ev.budget = per;
+            let solve = optimise(&mut ev, m, goal, x, &lo, &hi, &inp.prob.integer, 0.0);
+            ends.push(match solve.outcome {
+                Outcome::Solved(p, _, _) => {
+                    let v = p.get(j).copied().unwrap_or(f64::NAN);
+                    (num(v), num(objective_at(&mut ev, &p)))
+                }
+                Outcome::Unbounded => (Value::text("Unbounded"), Value::Empty),
+                _ => (Value::Error(gridcraft_core::CellError::NA), Value::Empty),
+            });
+        }
+        let mut row = vec![Value::text(abs_ref(*c)), Value::text(cell_name(sh, *c)), num(x.get(j).copied().unwrap_or(f64::NAN))];
+        for (v, o) in ends {
+            row.push(v);
+            row.push(o);
+        }
+        rows.push(row);
+    }
+    let mut out = Lines::new();
+    let r = title(&mut out, ReportKind::Limits, &sh.name);
+    let obj = vec![vec![Value::text(abs_ref(m.objective)), Value::text(cell_name(sh, m.objective)), num(f)]];
+    let r = table(&mut out, r, &["Objective Cell", "Name", "Value"], obj);
+    table(&mut out, r, &["Variable Cell", "Name", "Value", "Lower Limit", "Objective Result", "Upper Limit", "Objective Result"], rows);
+    Ok(out)
+}
+
+/// Writes the reports on new sheets ("Answer Report 1"…) before the model's sheet, in one step;
+/// the model's sheet stays active. Returns the new sheets' names.
+fn write_reports(s: &mut Session, kinds: &[ReportKind], inp: &ReportInput) -> Result<Vec<String>> {
+    if kinds.is_empty() {
+        return Ok(Vec::new());
+    }
+    let d = s.doc()?;
+    if d.wb.protected_structure {
+        return Err(EngineError::Other("The workbook is protected and cannot be changed.".into()));
+    }
+    let sh = d.wb.sheet(inp.model.sheet).ok_or(EngineError::NoDocument)?;
+    let mut built = Vec::new();
+    for k in kinds {
+        let lines = match k {
+            ReportKind::Answer => answer_report(d, sh, inp),
+            ReportKind::Limits => limits_report(d, sh, inp)?,
+        };
+        let name = (1..=10_000u32)
+            .map(|i| format!("{} Report {i}", k.title()))
+            .find(|n| d.wb.sheet_index(n).is_none() && !built.iter().any(|(b, _): &(String, Lines)| b == n))
+            .ok_or_else(|| EngineError::Other("Too many report sheets.".into()))?;
+        built.push((name, lines));
+    }
+    let names: Vec<String> = built.iter().map(|(n, _)| n.clone()).collect();
+    let at = inp.model.sheet;
+    let count = built.len();
+    edit(s, |cx| {
+        let bold = cx.wb.styles.derive(gridcraft_model::StyleId::DEFAULT, |st| st.font.bold = true);
+        for (i, (name, lines)) in built.into_iter().enumerate() {
+            let mut sheet = Sheet::new(name);
+            for (r, c, v, b) in lines {
+                let style = if b { bold } else { gridcraft_model::StyleId::DEFAULT };
+                sheet.set_cell(CellRef::new(r, c), Cell { value: v, formula: None, style });
+            }
+            for (c, w) in [(0u32, 14.0f32), (1, 110.0), (2, 140.0), (3, 120.0), (4, 120.0), (5, 120.0), (6, 120.0), (7, 120.0)] {
+                sheet.cols.insert(c, gridcraft_model::LineInfo { size: Some(w), ..Default::default() });
+            }
+            cx.wb.sheets.insert(at + i, std::sync::Arc::new(sheet));
+        }
+        for nm in cx.wb.names.iter_mut() {
+            if let Some(sc) = nm.scope.as_mut()
+                && *sc >= at
+            {
+                *sc += count;
+            }
+        }
+        if cx.wb.active_sheet >= at {
+            cx.wb.active_sheet += count;
+        }
+        cx.structural = true;
+        Ok(())
+    })?;
+    if let Ok(d) = s.doc_mut() {
+        for i in 0..count {
+            d.sheet_selections.insert((at + i).min(d.sheet_selections.len()), crate::Selection::default());
+        }
+    }
+    Ok(names)
+}
+
+/// `data.solverReport`: reports for a solution of the sheet's saved model.
+fn report(s: &mut Session, p: &Json) -> Result<Json> {
+    let kinds = report_kinds(REPORT_CMD, p)?.ok_or_else(|| bad(REPORT_CMD, "missing `reports` (answer, limits)"))?;
+    if kinds.is_empty() {
+        return Err(bad(REPORT_CMD, "`reports` is empty (answer, limits)"));
+    }
+    let d = s.doc()?;
+    // The given model as is, else the saved model with any params given here over it.
+    let params = match p.get("model") {
+        Some(m @ Json::Object(_)) => m.clone(),
+        Some(Json::Null) | None => {
+            let mut params = saved_model(&d.wb, d.wb.active_sheet).unwrap_or_else(|| json!({}));
+            if let (Some(base), Some(over)) = (params.as_object_mut(), p.as_object()) {
+                for (k, v) in over {
+                    base.insert(k.clone(), v.clone());
+                }
+            }
+            params
+        }
+        Some(_) => return Err(bad(REPORT_CMD, "`model` must be data.solver params")),
+    };
+    let model = parse_model(s, &params)?;
+    let prob = build_problem(&model);
+    let d = s.doc()?;
+    let sh = d.wb.sheet(model.sheet).ok_or(EngineError::NoDocument)?;
+    let current: Vec<f64> = model.vars.iter().map(|c| as_num(&sh.value(*c))).collect();
+    // `{cell: number}` maps; cells they leave out keep their current values.
+    let point = |key: &str| -> Result<Vec<f64>> {
+        let mut x = current.clone();
+        let Some(map) = p.get(key) else { return Ok(x) };
+        let map = map.as_object().ok_or_else(|| bad(REPORT_CMD, format!("`{key}` must map cells to numbers")))?;
+        for (cell, v) in map {
+            let c = CellRef::parse(&cell.replace('$', "")).ok_or_else(|| bad(REPORT_CMD, format!("not a cell: `{cell}`")))?;
+            let j = model.vars.iter().position(|v| *v == c).ok_or_else(|| bad(REPORT_CMD, format!("`{cell}` is not a variable cell")))?;
+            let v = v.as_f64().filter(|v| v.is_finite()).ok_or_else(|| bad(REPORT_CMD, format!("`{key}.{cell}` must be a number")))?;
+            if let Some(e) = x.get_mut(j) {
+                *e = v;
+            }
+        }
+        Ok(x)
+    };
+    let solution = point("values")?;
+    let original = if p.get("original").is_some() { point("original")? } else { solution.clone() };
+    let budget = params
+        .get("maxEvaluations")
+        .and_then(Json::as_f64)
+        .filter(|v| v.is_finite() && *v >= 1.0)
+        .map_or(DEFAULT_EVALS, |v| (v as u64).min(MAX_EVALS));
+    let message = str_param(p, "message").unwrap_or("").chars().take(500).collect();
+    let inp = ReportInput { model: &model, prob: &prob, original, solution, message, budget };
+    let sheets = write_reports(s, &kinds, &inp)?;
+    Ok(json!({"sheets": sheets}))
+}
+
 // ---------------------------------------------------------------- command
 
 fn run(s: &mut Session, p: &Json) -> Result<Json> {
@@ -1213,6 +2008,7 @@ fn run(s: &mut Session, p: &Json) -> Result<Json> {
     let gap = params.get("integerOptimality").and_then(Json::as_f64).filter(|v| v.is_finite()).map_or(0.0, |v| v.clamp(0.0, 100.0) / 100.0);
     let keep = bool_param(&params, "keep").unwrap_or(true);
     let save = bool_param(&params, "saveModel").unwrap_or(true);
+    let reports = report_kinds(CMD, &params)?;
     let prob = build_problem(&model);
     let d = s.doc()?;
     let sh = d.wb.sheet(model.sheet).ok_or(EngineError::NoDocument)?;
@@ -1225,56 +2021,23 @@ fn run(s: &mut Session, p: &Json) -> Result<Json> {
         rows: prob.rows.clone(),
         evals: 0,
         budget,
+        target: None,
     };
-    let any_int = prob.integer.iter().any(|b| *b);
-    let mut not_linear = false;
-    let outcome = if prob.lo.iter().zip(&prob.hi).any(|(l, h)| l > h) {
-        Outcome::Infeasible
-    } else {
-        match model.method {
-            Method::Simplex => match linearize(&mut ev, &x0) {
-                Err("nonlinear") | Err("error") => {
-                    not_linear = true;
-                    Outcome::Infeasible
-                }
-                Err(_) => Outcome::Limit,
-                Ok(((cf, f_const), lin)) => {
-                    let mut rows: Vec<(Vec<f64>, Sense, f64)> = lin.iter().zip(&prob.rows).map(|((a, k), r)| (a.clone(), r.sense, -k)).collect();
-                    let c: Vec<f64> = match model.goal {
-                        Goal::Max => cf.iter().map(|v| -v).collect(),
-                        Goal::Min => cf.clone(),
-                        Goal::Value(v) => {
-                            rows.push((cf.clone(), Sense::Eq, v - f_const));
-                            vec![0.0; cf.len()]
-                        }
-                    };
-                    let size = (rows.len() as u64 + 2 * model.vars.len() as u64 + 1) * (4 * model.vars.len() as u64 + 2 * rows.len() as u64 + 1);
-                    let mut work = LP_WORK.max(size);
-                    let mut relax = |l: &[f64], h: &[f64]| solve_lp(&c, &rows, l, h, &mut work);
-                    if any_int {
-                        branch_and_bound(&prob.lo, &prob.hi, &prob.integer, MAX_NODES_LP, gap, &mut relax).0
-                    } else {
-                        relax(&prob.lo, &prob.hi)
-                    }
-                }
-            },
-            Method::Grg => {
-                let goal = model.goal;
-                if any_int {
-                    let mut relax = |l: &[f64], h: &[f64]| {
-                        let mut start = x0.clone();
-                        project(&mut start, l, h);
-                        nlp(&mut ev, &start, l, h, goal)
-                    };
-                    branch_and_bound(&prob.lo, &prob.hi, &prob.integer, MAX_NODES_NLP, gap, &mut relax).0
-                } else {
-                    nlp(&mut ev, &x0, &prob.lo, &prob.hi, goal)
-                }
-            }
-        }
-    };
+    if model.method == Method::Evolutionary && model.evo.require_bounds && prob.lo.iter().chain(&prob.hi).any(|b| !b.is_finite()) {
+        return Err(EngineError::Other(
+            "The Evolutionary method needs a lower and an upper bound on every variable cell (constraints such as \"A1:A3 <= 10\"), or requireBounds: false."
+                .into(),
+        ));
+    }
+    let Solve { outcome, not_linear, evo_end } = optimise(&mut ev, &model, model.goal, &x0, &prob.lo, &prob.hi, &prob.integer, gap);
     let (status, message, solution) = match outcome {
         _ if not_linear => ("notLinear", "The model isn't linear in the variable cells, so Simplex LP can't solve it. Try GRG Nonlinear.", None),
+        Outcome::Solved(x, _, true) if model.method == Method::Evolutionary => match evo_end {
+            Some(EvoEnd::Stalled) => {
+                ("cannotImprove", "Solver stopped when the best solution stopped improving. All constraints are satisfied.", Some(x))
+            }
+            _ => ("converged", "The population converged. The best solution found satisfies all constraints.", Some(x)),
+        },
         Outcome::Solved(x, _, true) => (
             if model.method == Method::Simplex { "optimal" } else { "converged" },
             if model.method == Method::Simplex {
@@ -1303,6 +2066,7 @@ fn run(s: &mut Session, p: &Json) -> Result<Json> {
             values.insert(c.a1(), json!(v));
         }
     }
+    let original: serde_json::Map<String, Json> = model.vars.iter().zip(&x0).map(|(c, v)| (c.a1(), json!(v))).collect();
     let changed = keep && solution.is_some();
     if changed || save {
         let sheet = model.sheet;
@@ -1325,19 +2089,27 @@ fn run(s: &mut Session, p: &Json) -> Result<Json> {
             Ok(())
         })?;
     }
-    Ok(json!({
+    let mut out = json!({
         "status": status,
         "message": message,
         "objective": objective,
         "values": values,
+        "original": original,
+        "model": model_params(&s.doc()?.wb, &model),
         "evaluations": evaluations,
         "changed": changed,
-    }))
+    });
+    // Reports describe a solution; they are part of the solve's undo step.
+    if let (Some(kinds), Some(x)) = (reports, solution) {
+        let inp = ReportInput { model: &model, prob: &prob, original: x0, solution: x, message: message.to_string(), budget };
+        out["reports"] = json!(write_reports(s, &kinds, &inp)?);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
-    use gridcraft_core::CellRef;
+    use gridcraft_core::{CellRef, Value};
     use serde_json::json;
 
     use crate::Session;
@@ -1350,6 +2122,11 @@ mod tests {
     fn n(s: &Session, a: &str) -> f64 {
         let d = s.doc().unwrap();
         d.wb.active().unwrap().value(CellRef::parse(a).unwrap()).as_f64().unwrap_or(f64::NAN)
+    }
+    /// The first saved-model name scoped to the active sheet.
+    fn saved(s: &Session) -> String {
+        let d = s.doc().unwrap();
+        d.wb.names.iter().find(|n| n.scope == Some(d.wb.active_sheet)).map(|n| n.name.clone()).unwrap_or_default()
     }
     fn set(s: &mut Session, cells: &[(&str, &str)]) {
         for (c, v) in cells {
@@ -1433,6 +2210,204 @@ mod tests {
     }
 
     #[test]
+    fn evolutionary_finds_the_global_minimum_of_non_smooth_and_multimodal_models() {
+        let mut s = s();
+        // |x − 3| + |y + 2| has a kink at its minimum (3, −2).
+        set(&mut s, &[("A1", "0"), ("A2", "0"), ("B1", "=ABS(A1-3)+ABS(A2+2)")]);
+        let p =
+            json!({"objective": "B1", "goal": "min", "variables": "A1:A2", "constraints": ["A1:A2 >= -10", "A1:A2 <= 10"], "method": "evolutionary"});
+        let r = s.execute("data.solver", p.clone()).unwrap();
+        assert!(r["status"] == "converged" || r["status"] == "cannotImprove", "{r}");
+        assert!((n(&s, "A1") - 3.0).abs() < 1e-6 && (n(&s, "A2") + 2.0).abs() < 1e-6, "{r}");
+        // The same seed repeats the run exactly.
+        set(&mut s, &[("A1", "0"), ("A2", "0")]);
+        let again = s.execute("data.solver", p).unwrap();
+        assert_eq!(again["values"], r["values"]);
+        assert_eq!(again["evaluations"], r["evaluations"]);
+        // Rastrigin's function 20 + Σ (x² − 10 cos 2πx) on [−5.12, 5.12]² has its global minimum 0
+        // at the origin among many local minima; GRG from (3.3, −2.7) stops at a local one.
+        set(&mut s, &[("C1", "3.3"), ("C2", "-2.7"), ("D1", "=20+C1^2-10*COS(2*PI()*C1)+C2^2-10*COS(2*PI()*C2)")]);
+        let base = json!({"objective": "D1", "goal": "min", "variables": "C1:C2", "constraints": ["C1:C2 >= -5.12", "C1:C2 <= 5.12"]});
+        s.execute("data.solver", base.clone()).unwrap();
+        assert!(n(&s, "D1") > 0.5, "GRG is local: {}", n(&s, "D1"));
+        set(&mut s, &[("C1", "3.3"), ("C2", "-2.7")]);
+        let mut p = base.clone();
+        p["method"] = json!("evolutionary");
+        let r = s.execute("data.solver", p).unwrap();
+        assert!(n(&s, "D1") < 1e-8 && n(&s, "C1").abs() < 1e-5 && n(&s, "C2").abs() < 1e-5, "{r}");
+        // A stepped model: ROUND makes it flat almost everywhere; the minimum is at 7.2.
+        set(&mut s, &[("E1", "0"), ("F1", "=ABS(ROUND(E1,0)-7)+ABS(E1-7.2)/100")]);
+        s.execute("data.solver", json!({"objective": "F1", "goal": "min", "variables": "E1", "constraints": ["E1 <= 20"], "method": "evolutionary"}))
+            .unwrap();
+        assert!((n(&s, "E1") - 7.2).abs() < 1e-6, "{}", n(&s, "E1"));
+    }
+
+    #[test]
+    fn evolutionary_handles_integers_bounds_and_the_saved_model() {
+        let mut s = s();
+        // The 0/1 knapsack of the branch-and-bound test: items 2 and 3, value 20.
+        set(&mut s, &[("D1", "=10*C1+13*C2+7*C3"), ("D2", "=5*C1+6*C2+4*C3")]);
+        let p = json!({"objective": "D1", "variables": "C1:C3", "constraints": ["D2 <= 10", "C1:C3 bin"], "method": "evolutionary", "populationSize": 30, "randomSeed": 7});
+        let r = s.execute("data.solver", p).unwrap();
+        assert!(r["status"] == "converged" || r["status"] == "cannotImprove", "{r}");
+        assert_eq!((n(&s, "C1"), n(&s, "C2"), n(&s, "C3"), n(&s, "D1")), (0.0, 1.0, 1.0, 20.0));
+        // The method and its options are saved, survive XLSX and solve again.
+        let b64 = s.execute("file.saveBytes", json!({"format": "xlsx"})).unwrap()["base64"].as_str().unwrap().to_string();
+        s.execute("file.open", json!({"name": "e.xlsx", "base64": b64})).unwrap();
+        let m = s.execute("data.solver", json!({})).unwrap();
+        assert_eq!(m["model"]["method"], "evolutionary");
+        assert_eq!((m["model"]["populationSize"].as_f64(), m["model"]["randomSeed"].as_f64()), (Some(30.0), Some(7.0)));
+        set(&mut s, &[("C1", "0"), ("C2", "0"), ("C3", "0")]);
+        s.execute("data.solver", json!({"saved": true})).unwrap();
+        assert_eq!(n(&s, "D1"), 20.0);
+        // Integer constraints: max x + y with x + 2y ≤ 7 on integers in [0, 10] → (7, 0).
+        set(&mut s, &[("A1", "0"), ("A2", "0"), ("B1", "=A1+A2"), ("B2", "=A1+2*A2")]);
+        let r = s
+            .execute(
+                "data.solver",
+                json!({"objective": "B1", "variables": "A1:A2", "constraints": ["B2 <= 7", "A1:A2 <= 10", "A1:A2 int"], "method": "evolutionary"}),
+            )
+            .unwrap();
+        assert_eq!((n(&s, "A1"), n(&s, "A2")), (7.0, 0.0), "{r}");
+        // Every variable needs bounds unless requireBounds is off; then it searches around the start.
+        set(&mut s, &[("E1", "1"), ("F1", "=ABS(E1-4)")]);
+        let p = json!({"objective": "F1", "goal": "min", "variables": "E1", "method": "evolutionary"});
+        assert!(s.execute("data.solver", p.clone()).is_err());
+        let mut p = p;
+        p["requireBounds"] = json!(false);
+        s.execute("data.solver", p).unwrap();
+        assert!((n(&s, "E1") - 4.0).abs() < 1e-6);
+        // Infeasible constraints and a tiny budget are reported without changing the cells.
+        set(&mut s, &[("E1", "1")]);
+        let r = s
+            .execute("data.solver", json!({"objective": "F1", "variables": "E1", "constraints": ["E1 <= 3", "F1 >= 10"], "method": "evolutionary"}))
+            .unwrap();
+        assert_eq!(r["status"], "infeasible", "{r}");
+        let r = s
+            .execute(
+                "data.solver",
+                json!({"objective": "F1", "variables": "E1", "constraints": ["E1 <= 3"], "method": "evolutionary", "maxEvaluations": 3}),
+            )
+            .unwrap();
+        assert_eq!(r["status"], "iterationLimit", "{r}");
+        assert_eq!(n(&s, "E1"), 1.0);
+    }
+
+    /// Text or number at `a1` on sheet `name`.
+    fn at(s: &Session, name: &str, a1: &str) -> Value {
+        let d = s.doc().unwrap();
+        d.wb.sheet(d.wb.sheet_index(name).unwrap()).unwrap().value(CellRef::parse(a1).unwrap())
+    }
+
+    /// The row of the first cell holding `text` on sheet `name`.
+    fn row_of(s: &Session, name: &str, text: &str) -> u32 {
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet(d.wb.sheet_index(name).unwrap()).unwrap();
+        (0..60).find(|r| (0..8).any(|c| sh.value(CellRef::new(*r, c)) == Value::text(text))).unwrap()
+    }
+
+    #[test]
+    fn answer_and_limits_reports_describe_the_wyndor_glass_solution() {
+        // Wyndor Glass with labels: doors and windows across, the three plants' hours down.
+        let mut s = s();
+        s.execute(
+            "range.setValues",
+            json!({"range": "A1", "values": [[null, "Doors", "Windows", "Used", "Available"], ["Batches", 0, 0, null, null], ["Plant 1", 1, 0, null, 4], ["Plant 2", 0, 2, null, 12], ["Plant 3", 3, 2, null, 18], ["Profit", 3, 5, null, null]]}),
+        )
+        .unwrap();
+        for r in 3..=6 {
+            set(&mut s, &[(&format!("D{r}"), &format!("=SUMPRODUCT(B{r}:C{r},$B$2:$C$2)"))]);
+        }
+        let solved = s
+            .execute(
+                "data.solver",
+                json!({"objective": "D6", "variables": "B2:C2", "constraints": ["D3:D5 <= E3:E5"], "method": "simplex", "reports": ["answer", "limits"]}),
+            )
+            .unwrap();
+        assert_eq!(solved["status"], "optimal", "{solved}");
+        assert_eq!(solved["reports"], json!(["Answer Report 1", "Limits Report 1"]));
+        assert_eq!(solved["original"], json!({"B2": 0.0, "C2": 0.0}));
+        let d = s.doc().unwrap();
+        let names: Vec<&str> = d.wb.sheets.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, ["Answer Report 1", "Limits Report 1", "Sheet1"]);
+        assert_eq!(d.wb.active().unwrap().name, "Sheet1", "the model's sheet stays active");
+        assert_eq!(saved(&s), "solver_opt", "the saved model follows its sheet");
+        let a = "Answer Report 1";
+        assert_eq!(at(&s, a, "A1"), Value::text("GridCraft Answer Report"));
+        // Objective: $D$6 "Profit Used", from 0 to 36.
+        let r = row_of(&s, a, "$D$6");
+        assert_eq!(at(&s, a, &format!("C{}", r + 1)), Value::text("Profit Used"));
+        assert_eq!((at(&s, a, &format!("D{}", r + 1)), at(&s, a, &format!("E{}", r + 1))), (Value::number(0.0), Value::number(36.0)));
+        // Variables: doors 0 → 2, windows 0 → 6, continuous.
+        let r = row_of(&s, a, "$B$2") + 1;
+        assert_eq!(at(&s, a, &format!("C{r}")), Value::text("Batches Doors"));
+        assert_eq!(at(&s, a, &format!("E{r}")), Value::number(2.0));
+        assert_eq!(at(&s, a, &format!("F{r}")), Value::text("Contin"));
+        assert_eq!(at(&s, a, &format!("E{}", r + 1)), Value::number(6.0));
+        // Constraints: plant 1 has 2 hours to spare; plants 2 and 3 are binding.
+        let r = row_of(&s, a, "$D$3") + 1;
+        assert_eq!(at(&s, a, &format!("E{r}")), Value::text("$D$3<=$E$3"));
+        assert_eq!((at(&s, a, &format!("F{r}")), at(&s, a, &format!("G{r}"))), (Value::text("Not Binding"), Value::number(2.0)));
+        for k in 1..=2 {
+            assert_eq!((at(&s, a, &format!("F{}", r + k)), at(&s, a, &format!("G{}", r + k))), (Value::text("Binding"), Value::number(0.0)));
+        }
+        // Limits with the other variable held: doors 0..2 (profit 30..36), windows 0..6 (6..36).
+        let l = "Limits Report 1";
+        let r = row_of(&s, l, "$B$2") + 1;
+        let row = |r: u32| ["D", "E", "F", "G", "H"].map(|c| at(&s, l, &format!("{c}{r}")).as_f64().unwrap());
+        assert_eq!(row(r), [2.0, 0.0, 30.0, 2.0, 36.0]);
+        assert_eq!(row(r + 1), [6.0, 0.0, 6.0, 6.0, 36.0]);
+        // data.solverReport writes reports from the saved model and a given solution.
+        let out =
+            s.execute("data.solverReport", json!({"reports": ["answer"], "values": {"B2": 2, "C2": 6}, "original": {"B2": 1, "C2": 1}})).unwrap();
+        assert_eq!(out["sheets"], json!(["Answer Report 2"]));
+        let r = row_of(&s, "Answer Report 2", "$D$6") + 1;
+        assert_eq!(at(&s, "Answer Report 2", &format!("D{r}")), Value::number(8.0));
+        // Undo removes the reports and keeps the solution; refused requests write nothing.
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc().unwrap().wb.sheets.len(), 3);
+        for p in [
+            json!({}),
+            json!({"reports": []}),
+            json!({"reports": "answer"}),
+            json!({"reports": ["population"]}),
+            json!({"reports": ["answer"], "values": {"Z9": 1}}),
+            json!({"reports": ["answer"], "values": {"B2": "x"}}),
+            json!({"reports": ["limits"], "constraints": ["D3:D5 <= E3:E5", "B2:C2 int"]}),
+            json!({"reports": ["limits"], "method": "evolutionary", "constraints": ["D3:D5 <= E3:E5", "B2:C2 <= 10"]}),
+        ] {
+            assert!(s.execute("data.solverReport", p.clone()).is_err(), "{p}");
+        }
+        assert_eq!(s.doc().unwrap().wb.sheets.len(), 3);
+        // With the solve, its reports and the saved model undone (one step), the result still
+        // describes the solution.
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!((s.doc().unwrap().wb.sheets.len(), n(&s, "B2")), (1, 0.0));
+        let mut p = solved.clone();
+        p["reports"] = json!(["answer"]);
+        assert_eq!(s.execute("data.solverReport", p).unwrap()["sheets"], json!(["Answer Report 1"]));
+        let r = row_of(&s, "Answer Report 1", "$B$2") + 1;
+        assert_eq!(at(&s, "Answer Report 1", &format!("E{r}")), Value::number(2.0));
+    }
+
+    #[test]
+    fn limits_report_of_a_nonlinear_model() {
+        // The largest rectangle with perimeter at most 20 (5 × 5): with the height held at 5, the
+        // width ranges over 0..5, the area over 0..25.
+        let mut s = s();
+        set(&mut s, &[("A1", "1"), ("A2", "1"), ("B1", "=A1*A2"), ("B2", "=2*A1+2*A2")]);
+        let r =
+            s.execute("data.solver", json!({"objective": "B1", "variables": "A1:A2", "constraints": ["B2 <= 20"], "reports": ["limits"]})).unwrap();
+        assert_eq!(r["reports"], json!(["Limits Report 1"]), "{r}");
+        let l = "Limits Report 1";
+        let r = row_of(&s, l, "$A$1") + 1;
+        let got: Vec<f64> = ["E", "F", "G", "H"].iter().map(|c| at(&s, l, &format!("{c}{r}")).as_f64().unwrap()).collect();
+        for (g, want) in got.iter().zip([0.0, 0.0, 5.0, 25.0]) {
+            assert!((g - want).abs() < 1e-3, "{got:?}");
+        }
+    }
+
+    #[test]
     fn infeasible_unbounded_and_nonlinear_models_are_reported() {
         let mut s = s();
         set(&mut s, &[("A1", "1"), ("B1", "=2*A1")]);
@@ -1469,6 +2444,7 @@ mod tests {
             json!({"objective": "B1", "variables": "A1", "goal": "sideways"}),
             json!({"objective": "B1", "variables": "A1", "goal": "value"}),
             json!({"objective": "B1", "variables": "A1", "method": "evolutionary"}),
+            json!({"objective": "B1", "variables": "A1", "method": "annealing"}),
             json!({"objective": "B1", "variables": "A1", "constraints": ["A1 ?? 3"]}),
             json!({"objective": "B1", "variables": "A1", "constraints": "A1 <= 3"}),
             json!({"objective": "B1", "variables": "A1", "constraints": ["A1:A3 <= C1:C2"]}),

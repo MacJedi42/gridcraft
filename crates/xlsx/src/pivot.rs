@@ -810,6 +810,9 @@ fn table_xml(pt: &PivotTable, idx: usize, cache_id: u32, c: &Cache, fmt_id: &dyn
         PivotLayout::Outline => s.push_str(" compact=\"0\" compactData=\"0\" outline=\"1\" outlineData=\"1\""),
         PivotLayout::Tabular => s.push_str(" compact=\"0\" compactData=\"0\""),
     }
+    if pt.values_on_rows {
+        s.push_str(" dataOnRows=\"1\"");
+    }
     if !pt.show_headers {
         s.push_str(" showHeaders=\"0\"");
     }
@@ -826,13 +829,20 @@ fn table_xml(pt: &PivotTable, idx: usize, cache_id: u32, c: &Cache, fmt_id: &dyn
     let end = pt.last_range.map(|r| r.end).unwrap_or(a);
     let loc = RangeRef::new(a, CellRef::new(end.row.max(a.row), end.col.max(a.col)));
     let k = vals.len();
-    let first_data_row = if col_idx.is_empty() { 1 } else { 1 + col_idx.len() + usize::from(k > 1) };
-    let first_data_col = if row_idx.is_empty() && col_idx.is_empty() {
+    // Σ Values (two or more value fields): its index among the written fields of its axis.
+    let (row_map, _) = c.axis_map.split_at(pt.rows.len().min(c.axis_map.len()));
+    let values_at = |map: &[Option<usize>], n: usize| pt.values_position.map_or(n, |p| map.iter().take(p).filter(|x| x.is_some()).count());
+    let row_values = (k > 1 && pt.values_on_rows).then(|| values_at(row_map, row_idx.len()));
+    // In Columns Σ Values comes after the last field: the column layout doesn't place it elsewhere.
+    let col_values = (k > 1 && !pt.values_on_rows).then_some(col_idx.len());
+    let first_data_row = if col_idx.is_empty() { 1 } else { 1 + col_idx.len() + usize::from(col_values.is_some()) };
+    let row_levels = row_idx.len() + usize::from(row_values.is_some());
+    let first_data_col = if row_levels == 0 && col_idx.is_empty() {
         0
     } else if compact {
         1
     } else {
-        row_idx.len().max(1)
+        row_levels.max(1)
     };
     let _ = write!(s, "<location ref=\"{}\" firstHeaderRow=\"1\" firstDataRow=\"{first_data_row}\" firstDataCol=\"{first_data_col}\"", loc.a1());
     if !pages.is_empty() {
@@ -922,24 +932,8 @@ fn table_xml(pt: &PivotTable, idx: usize, cache_id: u32, c: &Cache, fmt_id: &dyn
     }
     s.push_str("</pivotFields>");
 
-    if !row_idx.is_empty() {
-        let _ = write!(s, "<rowFields count=\"{}\">", row_idx.len());
-        for i in &row_idx {
-            let _ = write!(s, "<field x=\"{i}\"/>");
-        }
-        s.push_str("</rowFields>");
-    }
-    let values_field = k > 1;
-    if !col_idx.is_empty() || values_field {
-        let _ = write!(s, "<colFields count=\"{}\">", col_idx.len() + usize::from(values_field));
-        for i in &col_idx {
-            let _ = write!(s, "<field x=\"{i}\"/>");
-        }
-        if values_field {
-            s.push_str("<field x=\"-2\"/>");
-        }
-        s.push_str("</colFields>");
-    }
+    axis_fields_xml(&mut s, "rowFields", &row_idx, row_values);
+    axis_fields_xml(&mut s, "colFields", &col_idx, col_values);
     if !pages.is_empty() {
         let _ = write!(s, "<pageFields count=\"{}\">", pages.len());
         for (i, f) in &pages {
@@ -1009,6 +1003,25 @@ fn table_xml(pt: &PivotTable, idx: usize, cache_id: u32, c: &Cache, fmt_id: &dyn
     s.push_str(" showRowHeaders=\"1\" showColHeaders=\"1\" showRowStripes=\"0\" showColStripes=\"0\" showLastColumn=\"1\"/>");
     s.push_str("</pivotTableDefinition>");
     s
+}
+
+/// `<rowFields>`/`<colFields>`: the axis's cache field indices, with Σ Values (`-2`) at `values_at`.
+fn axis_fields_xml(s: &mut String, tag: &str, idx: &[usize], values_at: Option<usize>) {
+    let n = idx.len() + usize::from(values_at.is_some());
+    if n == 0 {
+        return;
+    }
+    let _ = write!(s, "<{tag} count=\"{n}\">");
+    for (j, i) in idx.iter().enumerate() {
+        if values_at == Some(j) {
+            s.push_str("<field x=\"-2\"/>");
+        }
+        let _ = write!(s, "<field x=\"{i}\"/>");
+    }
+    if values_at.is_some_and(|p| p >= idx.len()) {
+        s.push_str("<field x=\"-2\"/>");
+    }
+    let _ = write!(s, "</{tag}>");
 }
 
 // ================================================================ reading
@@ -1253,18 +1266,21 @@ fn read_table(cx: &mut Ctx<'_>, x: &El, cache: &CacheIn, id: u32) -> Option<Pivo
     pt.grand_totals_cols = x.flag("colGrandTotals", true);
     pt.show_headers = x.flag("showHeaders", true);
     pt.style = x.child("pivotTableStyleInfo").and_then(|s| s.attr("name")).unwrap_or("").to_string();
-    if x.flag("dataOnRows", false) {
-        cx.warn(format!("PivotTable \"{}\": values on rows are shown on columns", pt.name));
-    }
     if x.child("calculatedItems").is_some() || x.path(&["filters", "filter"]).is_some() {
         cx.warn(format!("PivotTable \"{}\": calculated items and label/value filters are not supported", pt.name));
     }
 
     let mut filters: Vec<PivotFilter> = Vec::new();
 
-    let axis = |cx: &mut Ctx<'_>, list: &[i64], filters: &mut Vec<PivotFilter>| -> Vec<PivotField> {
+    // (fields, position of Σ Values (`-2`) among them)
+    let axis = |cx: &mut Ctx<'_>, list: &[i64], filters: &mut Vec<PivotFilter>| -> (Vec<PivotField>, Option<usize>) {
         let mut v = Vec::new();
+        let mut values_at = None;
         for &i in list {
+            if i == -2 {
+                values_at = Some(v.len());
+                continue;
+            }
             if i < 0 {
                 continue;
             }
@@ -1290,7 +1306,7 @@ fn read_table(cx: &mut Ctx<'_>, x: &El, cache: &CacheIn, id: u32) -> Option<Pivo
             }
             v.push(f);
         }
-        v
+        (v, values_at)
     };
     let mut page_filters = Vec::new();
     for p in &pages {
@@ -1314,8 +1330,15 @@ fn read_table(cx: &mut Ctx<'_>, x: &El, cache: &CacheIn, id: u32) -> Option<Pivo
         page_filters.push(PivotFilter { source_col: name, selected });
     }
     let mut axis_filters = Vec::new();
-    pt.rows = axis(cx, &row_x, &mut axis_filters);
-    pt.columns = axis(cx, &col_x, &mut axis_filters);
+    let (rows, rows_values) = axis(cx, &row_x, &mut axis_filters);
+    let (columns, cols_values) = axis(cx, &col_x, &mut axis_filters);
+    pt.rows = rows;
+    pt.columns = columns;
+    // Σ Values: where its `-2` entry is, else `dataOnRows` and `dataPosition`; after the last
+    // field by default. In Columns it always comes last, as the column layout puts it there.
+    pt.values_on_rows = rows_values.is_some() || (cols_values.is_none() && x.flag("dataOnRows", false));
+    pt.values_position =
+        if pt.values_on_rows { rows_values.or_else(|| x.attr_u32("dataPosition").map(|p| p as usize)).filter(|p| *p < pt.rows.len()) } else { None };
     filters.extend(page_filters);
     filters.extend(axis_filters);
     pt.filters = filters;

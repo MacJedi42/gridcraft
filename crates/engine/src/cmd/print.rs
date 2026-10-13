@@ -391,7 +391,7 @@ pub struct HfContext {
 
 /// Today's date and the current time as headers and footers show them (`&D`, `&T`).
 pub fn hf_date_time(wb: &Workbook) -> (String, String) {
-    let now = gridcraft_calc::now_serial();
+    let now = gridcraft_core::date::serial_in_system(wb.date_system, gridcraft_calc::now_serial());
     let date = crate::display::format(&Value::Number(now.floor()), "m/d/yyyy", wb).text;
     let time = crate::display::format(&Value::Number(now), "h:mm AM/PM", wb).text;
     (date, time)
@@ -1027,6 +1027,21 @@ fn empty_for_overflow(sh: &Sheet, c: CellRef, merges: &[RangeRef]) -> bool {
     sh.value_ref(c).is_none_or(|v| v.is_empty()) && !merges.iter().any(|m| m.contains(c))
 }
 
+/// Unscaled width of the empty Center Across Selection cells right of `c`, which its text is centred over too.
+fn center_across_width(styles: &StyleTable, sh: &Sheet, c: CellRef, merges: &[RangeRef]) -> f32 {
+    let mut ext = 0.0;
+    let mut col = c.col + 1;
+    while col < MAX_COLS && ext < 20_000.0 {
+        let nc = CellRef::new(c.row, col);
+        if !empty_for_overflow(sh, nc, merges) || styles.get(sh.style_id(nc)).align.h != HAlign::CenterAcross {
+            break;
+        }
+        ext += sh.col_width(col);
+        col += 1;
+    }
+    ext
+}
+
 fn draw_text(pg: &mut Page, b: &Block, c: CellRef, l: &Look, rect: (f32, f32, f32, f32), merged: bool, merges: &[RangeRef], limits: (f32, f32)) {
     let (x, y, w, h) = rect;
     let sh = b.sh;
@@ -1110,8 +1125,11 @@ fn draw_text(pg: &mut Page, b: &Block, c: CellRef, l: &Look, rect: (f32, f32, f3
         VAlign::Bottom => y + h - pad - size * 0.22 - (n - 1.0) * line_h,
     };
     // Overflow into empty neighbours (single-line text, not merged).
-    let (mut clip_l, mut clip_r) = (x, x + w);
-    if !wrap && !merged && !is_num && rot.abs() != 90 && tw + 2.0 * pad + indent > w {
+    // Center Across Selection spans the empty Center Across cells to its right; the text stays within that run.
+    let spans = st.align.h == HAlign::CenterAcross && !wrap && !merged && rot == 0;
+    let across = if spans { center_across_width(&wb.styles, sh, c, merges) * b.k } else { 0.0 };
+    let (mut clip_l, mut clip_r) = (x, x + w + across);
+    if !wrap && !merged && !is_num && rot.abs() != 90 && across <= 0.0 && tw + 2.0 * pad + indent > w {
         let need = tw + 2.0 * pad + indent - w;
         let grow = |dir: i64, mut need: f32| -> f32 {
             let mut ext = 0.0;
@@ -1183,7 +1201,7 @@ fn draw_text(pg: &mut Page, b: &Block, c: CellRef, l: &Look, rect: (f32, f32, f3
         let lw = gridcraft_pdf::text_width(font, size, line);
         let lx = match h_align {
             HAlign::Right => x + w - pad - lw - indent,
-            HAlign::Center => x + (w - lw) / 2.0,
+            HAlign::Center => x + (w + across - lw) / 2.0,
             _ => x + pad + indent,
         };
         let ly = first_baseline + i as f32 * line_h;
@@ -1766,6 +1784,14 @@ mod tests {
     }
 
     #[test]
+    fn header_footer_date_follows_the_workbook_date_system() {
+        let mut wb = Workbook::new();
+        let date_1900 = hf_date_time(&wb).0;
+        wb.date_system = gridcraft_core::DateSystem::D1904;
+        assert_eq!(hf_date_time(&wb).0, date_1900);
+    }
+
+    #[test]
     fn header_footer_section_edits_are_undoable_and_views_are_per_sheet() {
         let mut s = s();
         s.execute("pageLayout.headerFooter", json!({"header": "&LLeft&RRight"})).unwrap();
@@ -2047,6 +2073,23 @@ mod tests {
     }
 
     #[test]
+    fn export_pdf_without_a_path_returns_bytes_and_never_opens_a_dialog() {
+        let mut s = s();
+        for params in [json!({}), json!({"path": ""}), json!({"path": null})] {
+            let r = s.execute("file.exportPdf", params).unwrap();
+            assert!(r.get("path").is_none(), "no file is written without a path");
+            let bytes = crate::io::base64_decode(r["base64"].as_str().unwrap()).unwrap();
+            assert!(bytes.starts_with(b"%PDF-"));
+        }
+        assert!(s.take_ui_requests().is_empty(), "a programmatic call never queues a dialog");
+        // Headless callers (CLI, MCP) get the same bytes, not an error.
+        assert!(s.execute_headless("file.exportPdf", json!({})).is_ok());
+        // With no workbook open it is a clear error, not a panic.
+        let mut none = Session::new();
+        assert!(none.execute("file.exportPdf", json!({})).is_err());
+    }
+
+    #[test]
     fn bands_unit() {
         let b = bands(0, 9, |_| 10.0, |_| 35.0, &[], 100);
         assert_eq!(b, vec![(0, 2), (3, 5), (6, 8), (9, 9)]);
@@ -2061,6 +2104,23 @@ mod tests {
         assert!(w.iter().all(|l| gridcraft_pdf::text_width(Font::Helvetica, 10.0, l) <= 50.0 || !l.contains(' ')));
         let w = wrap_lines("Supercalifragilistic", Font::Helvetica, 10.0, 20.0);
         assert!(w.len() > 2);
+    }
+
+    #[test]
+    fn center_across_spans_following_empty_center_across_cells() {
+        let mut styles = StyleTable::default();
+        let across = styles.intern(Style { align: Alignment { h: HAlign::CenterAcross, ..Alignment::default() }, ..Style::default() });
+        let mut sh = Sheet::new("S");
+        for col in 0..3 {
+            sh.set_style(CellRef::new(0, col), across);
+        }
+        sh.set_value(CellRef::new(0, 0), Value::Text("Title".into()));
+        let a1 = CellRef::new(0, 0);
+        assert_eq!(center_across_width(&styles, &sh, a1, &[]), sh.col_width(1) + sh.col_width(2));
+        sh.set_value(CellRef::new(0, 2), Value::Text("x".into()));
+        assert_eq!(center_across_width(&styles, &sh, a1, &[]), sh.col_width(1));
+        let merged = [RangeRef::new(CellRef::new(0, 1), CellRef::new(1, 1))];
+        assert_eq!(center_across_width(&styles, &sh, a1, &merged), 0.0);
     }
 
     #[test]

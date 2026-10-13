@@ -8,8 +8,9 @@
 //! them are skipped.
 //!
 //! **Round trip.** The recalculated workbook is written with GridCraft's XLSX writer, the package is
-//! validated (content types cover every part, every internal relationship target exists) and read
-//! back, and the two workbooks are compared feature by feature.
+//! validated (content types cover every part, every internal relationship target exists, no kind of
+//! relationship the source had is missing) and read back, and the two workbooks are compared feature
+//! by feature.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Cursor, Read as _};
@@ -38,6 +39,9 @@ const MAX_FILES: usize = 100_000;
 const MAX_XML_PART: u64 = 64 * 1024 * 1024;
 /// Most zip entries looked at while validating a written package.
 const MAX_ENTRIES: usize = 200_000;
+/// Relationship kinds (lower case) whose absence after a save isn't a loss: the calculation chain is
+/// a cache Excel rebuilds, and GridCraft never writes it.
+const REBUILT_KINDS: [&str; 1] = ["calcchain"];
 
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
@@ -97,6 +101,9 @@ pub struct CalcReport {
     /// aren't results, so every formula counts as no oracle.
     pub stale_cache: bool,
     pub volatile: usize,
+    /// Matched cells whose producer saved GridCraft's TRUE or FALSE as the number 1 or 0 (no
+    /// `t="b"`, as Business Central's Excel exports do); counted in `matched` too.
+    pub bool_as_number: usize,
     /// The first `max_report` mismatches, primary ones first.
     pub mismatches: Vec<Mismatch>,
     pub functions: BTreeMap<String, FnStat>,
@@ -286,7 +293,7 @@ fn check_inner(path: &str, bytes: &[u8], opts: &Options) -> FileReport {
     calc.recalc_all(&mut fresh);
     let trust_cache = !full_calc_on_load(bytes);
     report.calc = oracle(&cached, &fresh, &calc, trust_cache, opts);
-    report.round_trip = round_trip(&fresh, opts);
+    report.round_trip = round_trip(&fresh, bytes, opts);
     report
 }
 
@@ -345,6 +352,13 @@ fn formula_text(cell: &Cell) -> String {
 fn cell_name(wb: &Workbook, (sheet, c): Key) -> String {
     let name = wb.sheet(sheet).map(|s| s.name.as_str()).unwrap_or("?");
     format!("{}!{}", quote_sheet(name), c.a1())
+}
+
+/// Whether the producer cached GridCraft's logical result as the number 1 or 0. Excel types a
+/// logical result `t="b"`; a writer that leaves the type out (`<c><f>TRUE()</f><v>1</v></c>`, as
+/// Business Central's "Open in Excel" exports do) stores the same value, read back as a number.
+pub fn bool_cached_as_number(expected: &Value, actual: &Value) -> bool {
+    matches!((expected, actual), (Value::Number(n), Value::Bool(b)) if *n == if *b { 1.0 } else { 0.0 })
 }
 
 /// Whether GridCraft's `actual` agrees with the producer's `expected`.
@@ -458,7 +472,11 @@ pub fn oracle(cached: &Workbook, fresh: &Workbook, calc: &Calc, trust_cache: boo
                 }
                 None => vec!["(unparsed)".to_string()],
             };
-            let ok = values_match(&cell.value, &actual, opts.tolerance);
+            let bool_as_number = bool_cached_as_number(&cell.value, &actual);
+            let ok = bool_as_number || values_match(&cell.value, &actual, opts.tolerance);
+            if bool_as_number {
+                r.bool_as_number += 1;
+            }
             for n in &funcs {
                 let st = r.functions.entry(n.clone()).or_default();
                 st.checked += 1;
@@ -514,8 +532,9 @@ pub fn oracle(cached: &Workbook, fresh: &Workbook, calc: &Calc, trust_cache: boo
 
 // ---------------------------------------------------------------- round trip
 
-/// Writes `wb` with GridCraft's XLSX writer, validates the package, reads it back and compares.
-pub fn round_trip(wb: &Workbook, opts: &Options) -> RoundTrip {
+/// Writes `wb` with GridCraft's XLSX writer, validates the package against itself and against
+/// `source` (the file `wb` was read from), reads it back and compares.
+pub fn round_trip(wb: &Workbook, source: &[u8], opts: &Options) -> RoundTrip {
     let bytes = match gridcraft_engine::io::save_bytes(wb, "roundtrip.xlsx") {
         Ok(b) => b,
         Err(e) => return RoundTrip { error: Some(format!("write failed: {e}")), categories: vec![] },
@@ -524,6 +543,13 @@ pub fn round_trip(wb: &Workbook, opts: &Options) -> RoundTrip {
     match validate_package(&bytes) {
         Ok(issues) => issues.into_iter().for_each(|i| package.push(|| i)),
         Err(e) => package.push(|| e),
+    }
+    if let (Ok(before), Ok(after)) = (relationship_kinds(source), relationship_kinds(&bytes)) {
+        for (key, kind) in &before {
+            if !after.contains_key(key) && !REBUILT_KINDS.contains(&key.as_str()) {
+                package.push(|| format!("lost relationship {kind}"));
+            }
+        }
     }
     let back = match gridcraft_engine::io::open_bytes("roundtrip.xlsx", &bytes) {
         Ok((b, _)) => b,
@@ -557,6 +583,14 @@ fn diff_sets(d: &mut Diffs, sheet: &str, a: &BTreeSet<String>, b: &BTreeSet<Stri
     for x in b.difference(a) {
         d.push(|| format!("{sheet}: gained {x}"));
     }
+}
+
+/// A sheet's conditional-format rules in precedence order, as comparable text. The priority number
+/// itself is left out, so renumbering without changing the order isn't a difference.
+fn cond_format_list(s: &Sheet) -> Vec<String> {
+    let mut cfs: Vec<_> = s.cond_formats.iter().collect();
+    cfs.sort_by_key(|c| c.priority);
+    cfs.iter().map(|c| format!("{:?} {:?} stopIfTrue={}", c.ranges, c.rule, c.stop_if_true)).collect()
 }
 
 fn diff_count(d: &mut Diffs, sheet: &str, a: usize, b: usize) {
@@ -634,7 +668,12 @@ pub fn diff_workbooks(a: &Workbook, b: &Workbook, opts: &Options) -> Vec<Categor
                 .collect()
         };
         diff_sets(&mut tables, &name, &set(&table_list, sa), &set(&table_list, sb));
-        diff_count(&mut cond_formats, &name, sa.cond_formats.len(), sb.cond_formats.len());
+        let (cfa, cfb) = (cond_format_list(sa), cond_format_list(sb));
+        if cfa.len() != cfb.len() {
+            cond_formats.push(|| format!("{name}: {} → {}", cfa.len(), cfb.len()));
+        } else if let Some((x, y)) = cfa.iter().zip(&cfb).find(|(x, y)| x != y) {
+            cond_formats.push(|| format!("{name}: {x} → {y}"));
+        }
         diff_count(&mut validations, &name, sa.validations.len(), sb.validations.len());
         let chart_list = |s: &Sheet| s.charts.iter().map(|c| format!("{:?} ({} series)", c.kind, c.series.len())).collect::<Vec<_>>();
         let (ca, cb) = (chart_list(sa), chart_list(sb));
@@ -888,6 +927,77 @@ pub fn validate_package(bytes: &[u8]) -> Result<Vec<String>, String> {
     Ok(issues)
 }
 
+/// Every relationship kind (last segment of the type, the same in the transitional and strict
+/// namespaces) in the package's relationship parts, keyed in lower case. Relationships that carry
+/// nothing are left out, as a save may rightly drop them: a link to a place in the workbook
+/// (`#Sheet1!A1`, written as a cell's `location`) and a target part with nothing in it.
+fn relationship_kinds(bytes: &[u8]) -> Result<BTreeMap<String, String>, String> {
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| format!("not a zip package: {e}"))?;
+    let names = zip_names(&mut zip);
+    let by_key: HashMap<String, &String> = names.iter().map(|n| (part_key(n), n)).collect();
+    let mut kinds = BTreeMap::new();
+    for n in names.iter().filter(|n| part_key(n).ends_with(".rels")) {
+        let Some(src_dir) = rels_source_dir(&part_key(n)) else { continue };
+        let Ok(els) = read_zip_part(&mut zip, n).and_then(|xml| xml_elements(&xml)) else { continue };
+        for (_, attrs) in els.iter().filter(|(el, _)| el == "Relationship") {
+            let Some(kind) = attr(attrs, "Type").and_then(|t| t.rsplit('/').next()) else { continue };
+            let target = attr(attrs, "Target").unwrap_or("");
+            if kind.eq_ignore_ascii_case("hyperlink") && target.starts_with('#') {
+                continue;
+            }
+            let external = attr(attrs, "TargetMode").is_some_and(|m| m.eq_ignore_ascii_case("External"));
+            if !external
+                && let Some(part) = by_key.get(&resolve_target(&src_dir, target).to_ascii_lowercase())
+                && !holds_something(&mut zip, part, kind)
+            {
+                continue;
+            }
+            kinds.entry(kind.to_ascii_lowercase()).or_insert_with(|| kind.to_string());
+        }
+    }
+    Ok(kinds)
+}
+
+/// The directory of the part a rels part describes: `xl` for `xl/_rels/workbook.xml.rels`, the
+/// empty string for the package's `_rels/.rels`.
+fn rels_source_dir(key: &str) -> Option<String> {
+    let (dir, _) = key.strip_suffix(".rels")?.rsplit_once('/')?;
+    Some(dir.strip_suffix("_rels")?.trim_end_matches('/').to_string())
+}
+
+/// Whether a part has content: an element under its root, or for comments (whose authors list
+/// comes first) a comment, for VML a shape. Read only as far as needed; an unreadable part counts.
+fn holds_something(zip: &mut Zip<'_>, name: &str, kind: &str) -> bool {
+    use quick_xml::events::Event;
+    let Ok(f) = zip.by_name(name) else { return true };
+    let mut reader = quick_xml::Reader::from_reader(std::io::BufReader::new(f.take(MAX_XML_PART)));
+    let wanted: Option<&[u8]> = match kind.to_ascii_lowercase().as_str() {
+        "comments" => Some(b"comment"),
+        "vmldrawing" => Some(b"shape"),
+        _ => None,
+    };
+    let mut buf = Vec::new();
+    let mut in_root = false;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let found = match wanted {
+                    Some(w) => local_name(e.name().as_ref()) == w,
+                    None => in_root,
+                };
+                if found {
+                    return true;
+                }
+                in_root = true;
+            }
+            Ok(Event::Eof) => return false,
+            Ok(_) => {}
+            Err(_) => return true,
+        }
+        buf.clear();
+    }
+}
+
 // ---------------------------------------------------------------- output
 
 #[derive(Default)]
@@ -901,6 +1011,7 @@ struct Totals {
     mismatched: usize,
     no_oracle: usize,
     volatile: usize,
+    bool_as_number: usize,
     round_trip_failed: usize,
     round_trip_differing: usize,
     categories: BTreeMap<&'static str, usize>,
@@ -922,6 +1033,7 @@ fn totals(reports: &[FileReport]) -> Totals {
         t.mismatched += r.calc.mismatched;
         t.no_oracle += r.calc.no_oracle;
         t.volatile += r.calc.volatile;
+        t.bool_as_number += r.calc.bool_as_number;
         if r.round_trip.error.is_some() {
             t.round_trip_failed += 1;
         }
@@ -982,7 +1094,8 @@ pub fn report_json(reports: &[FileReport], opts: &Options) -> Json {
                 "warnings": r.warnings,
                 "calc": {
                     "formulaCells": c.formula_cells, "checked": c.checked, "matched": c.matched, "mismatched": c.mismatched,
-                    "noOracle": c.no_oracle, "staleCache": c.stale_cache, "volatile": c.volatile, "mismatches": mismatches, "functions": functions_json(&c.functions),
+                    "noOracle": c.no_oracle, "staleCache": c.stale_cache, "volatile": c.volatile, "boolAsNumber": c.bool_as_number,
+                    "mismatches": mismatches, "functions": functions_json(&c.functions),
                     "signatures": c.signatures,
                 },
                 "roundTrip": {"error": r.round_trip.error, "differing": r.round_trip.differing(), "categories": categories},
@@ -996,7 +1109,7 @@ pub fn report_json(reports: &[FileReport], opts: &Options) -> Json {
         "files": files,
         "totals": {
             "files": t.files, "opened": t.opened, "failedToOpen": t.failed, "formulaCells": t.formula_cells, "checked": t.checked,
-            "matched": t.matched, "mismatched": t.mismatched, "noOracle": t.no_oracle, "volatile": t.volatile,
+            "matched": t.matched, "mismatched": t.mismatched, "noOracle": t.no_oracle, "volatile": t.volatile, "boolAsNumber": t.bool_as_number,
             "roundTripFailed": t.round_trip_failed, "roundTripDiffering": t.round_trip_differing, "categoriesDiffering": t.categories,
         },
         "functions": functions_json(&t.functions),
@@ -1034,6 +1147,9 @@ fn print_human(reports: &[FileReport], opts: &Options) {
         );
         if c.stale_cache {
             outln!("  (the producer asked for a full recalculation on load: its cached values aren't results)");
+        }
+        if c.bool_as_number > 0 {
+            outln!("  ({} matched TRUE/FALSE results were saved by the producer as 1/0, without t=\"b\")", c.bool_as_number);
         }
         for m in &c.mismatches {
             let tag = if m.primary { "mismatch" } else { "  (downstream)" };
@@ -1131,6 +1247,9 @@ fn print_human(reports: &[FileReport], opts: &Options) {
         t.no_oracle,
         t.volatile
     );
+    if t.bool_as_number > 0 {
+        outln!("booleans saved as 1/0 by the producer: {} (counted as matched)", t.bool_as_number);
+    }
     let cats: Vec<String> = t.categories.iter().map(|(c, n)| format!("{c} {n}")).collect();
     outln!(
         "round trip: {} of {} files differ{}{}",
@@ -1235,6 +1354,31 @@ mod tests {
         assert_eq!(check(&wb, &Options { tolerance: 1e-12, ..Default::default() }).calc.mismatched, 1);
     }
 
+    /// Business Central writes TRUE and FALSE as `<c><f>TRUE()</f><v>1</v></c>`, without `t="b"`:
+    /// the cache holds the right value under a number type, so it matches and is counted apart.
+    #[test]
+    fn booleans_cached_as_numbers_match_and_are_counted_apart() {
+        let wb = book(&[
+            ("A1", "=TRUE()", n(1.0)),
+            ("B1", "=FALSE()", n(0.0)),
+            ("C1", "=TRUE()", Value::Bool(true)),
+            ("D1", "=1=1", n(0.0)),
+            ("E1", "=TRUE()+0", n(1.0)),
+        ]);
+        let r = check(&wb, &Options::default());
+        assert_eq!((r.calc.checked, r.calc.matched, r.calc.mismatched), (5, 4, 1));
+        // A cached 0 for TRUE is still a mismatch, and a number result is compared as a number.
+        assert_eq!(r.calc.mismatches[0].cell, "Sheet1!D1");
+        assert_eq!(r.calc.signatures.get("number → bool"), Some(&1));
+        assert_eq!(r.calc.bool_as_number, 2);
+        let v = report_json(std::slice::from_ref(&r), &Options::default());
+        assert_eq!((v["files"][0]["calc"]["boolAsNumber"].clone(), v["totals"]["boolAsNumber"].clone()), (json!(2), json!(2)));
+        assert!(bool_cached_as_number(&n(1.0), &Value::Bool(true)));
+        assert!(!bool_cached_as_number(&n(1.0), &Value::Bool(false)));
+        assert!(!bool_cached_as_number(&n(2.0), &Value::Bool(true)));
+        assert!(!bool_cached_as_number(&Value::Bool(true), &n(1.0)));
+    }
+
     #[test]
     fn missing_cached_values_and_volatile_formulas_are_skipped() {
         let wb =
@@ -1277,7 +1421,8 @@ mod tests {
     fn round_trip_of_a_simple_book_is_clean() {
         let mut wb = book(&[("A1", "2", n(2.0)), ("B1", "=A1*3", n(6.0)), ("A2", "x", Value::text("x"))]);
         wb.sheet_mut(0).unwrap().merges.push(gridcraft_engine::core::RangeRef::parse("C1:D2").unwrap());
-        let rt = round_trip(&wb, &Options::default());
+        let source = gridcraft_engine::io::save_bytes(&wb, "t.xlsx").unwrap();
+        let rt = round_trip(&wb, &source, &Options::default());
         assert_eq!(rt.error, None);
         assert!(rt.is_clean(), "{rt:?}");
         assert!(rt.categories.iter().any(|c| c.name == "package"));
@@ -1301,6 +1446,27 @@ mod tests {
         assert_eq!(get("merges").examples, ["Sheet1: lost C1:D2"]);
         assert_eq!(get("sheets").diffs, 1);
         assert_eq!(get("tables").diffs, 0);
+    }
+
+    #[test]
+    fn diff_detects_changed_cond_format_rule() {
+        use gridcraft_engine::model::{CfRule, CfValueKind, Color, CondFormat};
+        let bar = |gradient: bool, priority: u32| CondFormat {
+            ranges: vec![gridcraft_engine::core::RangeRef::parse("A1").unwrap()],
+            rule: CfRule::DataBar { min: CfValueKind::Min, max: CfValueKind::Max, color: Color::Rgb(0x638EC6), gradient, show_value: true },
+            priority,
+            stop_if_true: false,
+        };
+        let with = |cf: CondFormat| {
+            let mut wb = book(&[("A1", "2", n(2.0))]);
+            wb.sheet_mut(0).unwrap().cond_formats.push(cf);
+            wb
+        };
+        let diffs =
+            |a: &Workbook, b: &Workbook| diff_workbooks(a, b, &Options::default()).into_iter().find(|c| c.name == "condFormats").unwrap().diffs;
+        assert_eq!(diffs(&with(bar(false, 1)), &with(bar(true, 1))), 1);
+        assert_eq!(diffs(&with(bar(true, 1)), &with(bar(true, 1))), 0);
+        assert_eq!(diffs(&with(bar(true, 1)), &with(bar(true, 5))), 0);
     }
 
     fn zip_of(parts: &[(&str, &str)]) -> Vec<u8> {
@@ -1342,6 +1508,98 @@ mod tests {
         assert_eq!(validate_package(&own).unwrap(), Vec::<String>::new());
     }
 
+    const WB_RELS: &str = "xl/_rels/workbook.xml.rels";
+    const SHEET_RELS: &str = "xl/worksheets/_rels/sheet1.xml.rels";
+    const MADE_UP: &str = r#"<Relationship Id="rId90" Type="http://example.com/relationships/madeUp" Target="madeUp.xml"/>"#;
+    /// Not empty: an empty part isn't a loss.
+    const MADE_UP_PART: (&str, &str) = ("xl/madeUp.xml", "<madeUp><item/></madeUp>");
+
+    /// `bytes` with relationships added to rels parts (created when missing) and `parts` added.
+    fn with_rels(bytes: &[u8], rels: &[(&str, &str)], parts: &[(&str, &str)]) -> Vec<u8> {
+        let mut src = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let mut pending: Vec<(&str, &str)> = rels.to_vec();
+        for i in 0..src.len() {
+            let mut f = src.by_index(i).unwrap();
+            let name = f.name().to_string();
+            let mut body = String::new();
+            f.read_to_string(&mut body).unwrap();
+            if let Some(at) = pending.iter().position(|(r, _)| *r == name) {
+                body = body.replace("</Relationships>", &format!("{}</Relationships>", pending.remove(at).1));
+            }
+            out.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            out.write_all(body.as_bytes()).unwrap();
+        }
+        let created = pending.iter().map(|(r, extra)| {
+            (*r, format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{extra}</Relationships>"#))
+        });
+        for (name, body) in created.collect::<Vec<_>>().iter().map(|(n, b)| (*n, b.as_str())).chain(parts.iter().copied()) {
+            out.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            out.write_all(body.as_bytes()).unwrap();
+        }
+        out.finish().unwrap().into_inner()
+    }
+
+    /// The `package` examples of checking `source`.
+    fn package_of(source: &[u8]) -> Vec<String> {
+        let r = check_bytes("t.xlsx", source, &Options::default());
+        r.round_trip.categories.iter().find(|c| c.name == "package").unwrap().examples.clone()
+    }
+
+    fn plain() -> Vec<u8> {
+        gridcraft_engine::io::save_bytes(&book(&[("A1", "1", n(1.0))]), "t.xlsx").unwrap()
+    }
+
+    #[test]
+    fn package_reports_relationship_kinds_the_output_lost() {
+        // A kind GridCraft doesn't know is dropped on save; a calculation chain is never written
+        // (Excel rebuilds it), so its absence isn't a loss.
+        let calc_chain = r#"<Relationship Id="rId91" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain" Target="calcChain.xml"/>"#;
+        let source = with_rels(&plain(), &[(WB_RELS, &format!("{MADE_UP}{calc_chain}"))], &[MADE_UP_PART, ("xl/calcChain.xml", "<calcChain/>")]);
+        assert_eq!(package_of(&source), ["lost relationship madeUp"]);
+        assert!(check_bytes("t.xlsx", &plain(), &Options::default()).round_trip.is_clean());
+    }
+
+    // In the three tests below the made-up kind stays lost, so the comparison is known to run.
+
+    #[test]
+    fn an_internal_link_written_as_a_relationship_is_not_a_loss() {
+        // openpyxl writes `#Sheet1!B2` as an external relationship; GridCraft writes `location`.
+        let link = r##"<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="#Sheet1!B2" TargetMode="External"/>"##;
+        let source = with_rels(&plain(), &[(WB_RELS, MADE_UP), (SHEET_RELS, link)], &[MADE_UP_PART]);
+        assert_eq!(package_of(&source), ["lost relationship madeUp"]);
+    }
+
+    #[test]
+    fn comments_without_a_comment_are_not_a_loss() {
+        let rels = r#"<Relationship Id="rId6" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments1.xml"/><Relationship Id="rId7" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing" Target="../drawings/vmlDrawing1.vml"/>"#;
+        let comments = r#"<comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><authors><author>A</author></authors><commentList/></comments>"#;
+        let vml = r#"<xml xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office"><o:shapelayout><o:idmap data="1"/></o:shapelayout><v:shapetype id="_x0000_t202" path="m,l,21600r21600,l21600,xe"><v:path gradientshapeok="t"/></v:shapetype></xml>"#;
+        let source = with_rels(
+            &plain(),
+            &[(WB_RELS, MADE_UP), (SHEET_RELS, rels)],
+            &[MADE_UP_PART, ("xl/comments1.xml", comments), ("xl/drawings/vmlDrawing1.vml", vml)],
+        );
+        assert_eq!(package_of(&source), ["lost relationship madeUp"]);
+    }
+
+    #[test]
+    fn empty_drawings_and_person_lists_are_not_a_loss() {
+        let drawing = r#"<Relationship Id="rId8" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/>"#;
+        let person =
+            r#"<Relationship Id="rId92" Type="http://schemas.microsoft.com/office/2017/10/relationships/person" Target="persons/person.xml"/>"#;
+        let source = with_rels(
+            &plain(),
+            &[(WB_RELS, &format!("{MADE_UP}{person}")), (SHEET_RELS, drawing)],
+            &[
+                MADE_UP_PART,
+                ("xl/drawings/drawing1.xml", r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/>"#),
+                ("xl/persons/person.xml", r#"<personList xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments"/>"#),
+            ],
+        );
+        assert_eq!(package_of(&source), ["lost relationship madeUp"]);
+    }
+
     #[test]
     fn unopenable_files_are_reported() {
         let r = check_bytes("broken.xlsx", b"PK\x03\x04 not really", &Options::default());
@@ -1362,7 +1620,19 @@ mod tests {
         assert_eq!(keys(f), set(&["path", "opened", "error", "warnings", "calc", "roundTrip"]));
         assert_eq!(
             keys(&f["calc"]),
-            set(&["formulaCells", "checked", "matched", "mismatched", "noOracle", "staleCache", "volatile", "mismatches", "functions", "signatures"])
+            set(&[
+                "formulaCells",
+                "checked",
+                "matched",
+                "mismatched",
+                "noOracle",
+                "staleCache",
+                "volatile",
+                "boolAsNumber",
+                "mismatches",
+                "functions",
+                "signatures"
+            ])
         );
         assert_eq!(f["calc"]["signatures"], json!({"number → number": 1}));
         assert_eq!(keys(&f["calc"]["mismatches"][0]), set(&["cell", "formula", "expected", "actual", "kind", "functions", "primary"]));
@@ -1401,6 +1671,7 @@ mod tests {
                 "mismatched",
                 "noOracle",
                 "volatile",
+                "boolAsNumber",
                 "roundTripFailed",
                 "roundTripDiffering",
                 "categoriesDiffering"

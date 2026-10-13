@@ -1,7 +1,7 @@
 //! Language selection must affect UI entry, never the canonical engine/file boundary.
 use gridcraft_engine::{
     Session,
-    core::{CellRef, Value},
+    core::{CellError, CellRef, Value},
 };
 use gridcraft_ui_egui::{SheetApp, UiState, i18n::Language};
 use serde_json::json;
@@ -200,4 +200,22 @@ fn czech_interface_retains_its_canonical_formula_fallback() {
     assert!(!enter(&mut app, "=SUMA(1;2)"));
     let restored: UiState = serde_json::from_str(&serde_json::to_string(&app.ui).unwrap()).unwrap();
     assert_eq!(restored.language, Language::Cs);
+}
+
+#[test]
+fn user_defined_prefix_is_hidden_while_editing_and_kept_on_commit() {
+    // Excel shows `_xludf.EOMONTH()` as `=EOMONTH()`; the cell still holds the user-defined call
+    // (#726), and committing the edit unchanged must not turn it into the built-in.
+    let mut app = app();
+    app.run("cell.set", json!({"cell":"A1","input":"=_xludf.EOMONTH()&_xludf.CONCAT(\"_xludf.x\")"})).unwrap();
+    app.begin_edit(None, true);
+    assert_eq!(app.editor.as_ref().unwrap().text, "=EOMONTH()&CONCAT(\"_xludf.x\")");
+    assert!(app.commit_edit(0, 0, false, false));
+    assert_eq!(formula(&app), "_xludf.EOMONTH()&_xludf.CONCAT(\"_xludf.x\")");
+    assert_eq!(app.session.active().unwrap().wb.active().unwrap().value(CellRef::new(0, 0)), Value::Error(CellError::Name));
+    app.run("app.language.set", json!({"language":"es"})).unwrap();
+    app.begin_edit(None, true);
+    assert_eq!(app.editor.as_ref().unwrap().text, "=EOMONTH()&CONCAT(\"_xludf.x\")");
+    assert!(app.commit_edit(0, 0, false, false));
+    assert_eq!(formula(&app), "_xludf.EOMONTH()&_xludf.CONCAT(\"_xludf.x\")");
 }

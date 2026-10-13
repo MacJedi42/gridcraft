@@ -6,6 +6,7 @@ use std::sync::Arc;
 use gridcraft_core::date::{MONTHS, WEEKDAYS, datetime_from_serial, days_in_month, serial_from_ymd};
 use gridcraft_core::{CellRef, RangeRef, Value};
 use gridcraft_model::{Cell, Formula};
+use gridcraft_numfmt::{FormatKind, NumberFormat};
 
 use crate::Result;
 use crate::cmd::Ctx;
@@ -65,21 +66,25 @@ pub fn fill(cx: &mut Ctx, sheet: usize, src: RangeRef, target: RangeRef, mode: F
                 if forward { (src.end.col + 1..=target.end.col).collect() } else { (target.start.col..src.start.col).rev().collect() };
             cols.into_iter().map(|c| CellRef::new(lane, c)).collect()
         };
+        let fmt = |c: &(CellRef, Option<Cell>)| cx.wb.styles.get(c.1.as_ref().map(|c| c.style).unwrap_or_default()).num_fmt.as_str();
         let pattern = if matches!(mode, FillMode::Series | FillMode::Alternate) {
-            let detected = Pattern::detect(
-                &src_cells,
-                &custom,
-                cx.wb.date_system,
-                cx.wb.styles.get(src_cells.first().and_then(|c| c.1.as_ref()).map(|c| c.style).unwrap_or_default()).num_fmt.as_str(),
-            );
+            let detected = Pattern::detect(&src_cells, &custom, cx.wb.date_system, src_cells.first().map(fmt).unwrap_or_default());
             if mode == FillMode::Alternate { detected.alternate(&src_cells) } else { detected }
         } else {
             Pattern::Copy
         };
+        // A source with no common pattern (`Product 1`, `On backorder`): each cell continues its
+        // own series, one step per repeat of the source.
+        let per_cell: Vec<Pattern> = if mode == FillMode::Series && matches!(pattern, Pattern::Copy) && src_cells.len() > 1 {
+            src_cells.iter().map(|c| Pattern::detect(std::slice::from_ref(c), &custom, cx.wb.date_system, fmt(c))).collect()
+        } else {
+            Vec::new()
+        };
         for (k, t) in targets.iter().enumerate() {
             let step = k as i64 + 1;
             let idx = k % src_cells.len().max(1);
-            let (sc, scell) = src_cells.get(if forward { idx } else { src_cells.len() - 1 - idx }).cloned().unwrap_or((src.start, None));
+            let src_i = if forward { idx } else { src_cells.len() - 1 - idx };
+            let (sc, scell) = src_cells.get(src_i).cloned().unwrap_or((src.start, None));
             let mut cell = scell.clone().unwrap_or_default();
             match mode {
                 FillMode::Formats => {
@@ -96,7 +101,10 @@ pub fn fill(cx: &mut Ctx, sheet: usize, src: RangeRef, target: RangeRef, mode: F
                             cell.formula = Some(Arc::new(Formula::from_expr(shifted)));
                             cell.value = Value::Empty;
                         }
-                    } else if let Some(v) = pattern.value(step, forward, src_cells.len()) {
+                    } else if let Some(v) = match per_cell.get(src_i) {
+                        Some(p) => p.value(k as i64 / src_cells.len() as i64 + 1, forward, 1),
+                        None => pattern.value(step, forward, src_cells.len()),
+                    } {
                         cell.value = v;
                     }
                     cell.style = style;
@@ -173,8 +181,14 @@ impl Pattern {
             let last = nums.last().copied().unwrap_or(0.0);
             let is_date = fmt.contains('d') || fmt.contains('y') || (fmt.contains('m') && !fmt.contains('h'));
             if nums.len() == 1 {
-                // A single number copies; a single date increments by a day.
-                return if is_date { Pattern::Linear { last, first, step: 1.0 } } else { Pattern::Copy };
+                // A single number copies; a single date increments by a day, a single time by an hour.
+                return if is_date {
+                    Pattern::Linear { last, first, step: 1.0 }
+                } else if NumberFormat::parse(fmt).kind() == FormatKind::Time {
+                    Pattern::Linear { last, first, step: 1.0 / 24.0 }
+                } else {
+                    Pattern::Copy
+                };
             }
             // Dates that differ by whole months.
             if is_date && nums.len() >= 2 {
@@ -260,8 +274,12 @@ impl Pattern {
             Pattern::TextNum { prefix, suffix, last, first, step, width } => {
                 let base = if forward { *last } else { *first };
                 let n = base + step * k * sign;
-                let n = n.abs();
-                Some(Value::text(format!("{prefix}{n:0width$}{suffix}", width = *width)))
+                // `Qtr3`, `Quarter 3` wrap after 4 like `Q3`.
+                let quarter = suffix.is_empty()
+                    && (1..=4).contains(&base)
+                    && ["q", "qtr", "quarter"].contains(&prefix.trim_end().to_ascii_lowercase().as_str());
+                let n = if quarter { (n - 1).rem_euclid(4) + 1 } else { n.abs() };
+                Some(Value::text(format!("{prefix}{n:0width$}{}", ordinal_suffix(n, suffix), width = *width)))
             }
             Pattern::List { list, last, first, step, upper, lower } => {
                 let len = list.len() as i64;
@@ -309,6 +327,23 @@ fn round15(x: f64) -> f64 {
     if !p.is_finite() || p == 0.0 { x } else { (x * p).round() / p }
 }
 
+/// `1st Period` → `2nd Period`: an English ordinal ending is rewritten to suit the new number.
+fn ordinal_suffix(n: i64, suffix: &str) -> String {
+    let (Some(end), Some(rest)) = (suffix.get(..2), suffix.get(2..)) else { return suffix.to_string() };
+    if !["st", "nd", "rd", "th"].contains(&end.to_ascii_lowercase().as_str()) || rest.starts_with(char::is_alphanumeric) {
+        return suffix.to_string();
+    }
+    let new = match (n % 10, n % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    let new = if end.chars().all(|c| c.is_ascii_uppercase()) { new.to_ascii_uppercase() } else { new.to_string() };
+    format!("{new}{rest}")
+}
+
 /// `Item 007` → ("Item ", 7, "", 3); `3rd` style leading numbers → ("", 3, "rd", 1).
 fn split_num(t: &str) -> Option<(String, i64, String, usize)> {
     let chars: Vec<char> = t.chars().collect();
@@ -338,6 +373,7 @@ pub fn series(cx: &mut Ctx, sheet: usize, r: RangeRef, rows: bool, kind: &str, s
         let style = sh.style_id(first_cell);
         let mut v = start;
         for i in 1..len {
+            let prev = v;
             v = match kind {
                 "growth" => v * step,
                 "date" => {
@@ -350,7 +386,10 @@ pub fn series(cx: &mut Ctx, sheet: usize, r: RangeRef, rows: bool, kind: &str, s
                             let mut left = step.abs() as i64;
                             while left > 0 {
                                 n += step.signum();
-                                if datetime_from_serial(sys, n).is_some_and(|d| d.weekday != 0 && d.weekday != 6) {
+                                let Some(day) = datetime_from_serial(sys, n) else {
+                                    return Err(crate::EngineError::Other("The weekday series runs past the supported date range.".into()));
+                                };
+                                if day.weekday != 0 && day.weekday != 6 {
                                     left -= 1;
                                 }
                             }
@@ -361,8 +400,9 @@ pub fn series(cx: &mut Ctx, sheet: usize, r: RangeRef, rows: bool, kind: &str, s
                 }
                 _ => v + step,
             };
+            // The stop value bounds the series in the direction it runs (a growth by 0.5 falls).
             if let Some(s) = stop
-                && ((step >= 0.0 && v > s) || (step < 0.0 && v < s))
+                && ((v >= prev && v > s) || (v < prev && v < s))
             {
                 break;
             }
@@ -578,5 +618,38 @@ mod tests {
         assert_eq!(split_num("Item 7"), Some(("Item ".into(), 7, "".into(), 1)));
         assert_eq!(split_num("Q003x"), Some(("Q".into(), 3, "x".into(), 3)));
         assert_eq!(split_num("abc"), None);
+    }
+
+    #[test]
+    fn times_quarters_ordinals_and_mixed_sources() {
+        let mut s = crate::Session::new();
+        s.new_workbook();
+        let mut fill = |values: serde_json::Value, source: &str, target: &str| {
+            s.execute("range.setValues", serde_json::json!({"range": source.get(..2).unwrap(), "values": values})).unwrap();
+            s.execute("edit.autoFill", serde_json::json!({"source": source, "target": target})).unwrap();
+            let sh = s.doc().unwrap().wb.active().unwrap();
+            let r = RangeRef::parse(target).unwrap();
+            r.iter().map(|c| crate::display::cell_text(&s.doc().unwrap().wb, sh, c)).collect::<Vec<_>>()
+        };
+        assert_eq!(fill(serde_json::json!([["9:00"]]), "A1", "A1:A3"), ["9:00", "10:00", "11:00"]);
+        assert_eq!(fill(serde_json::json!([["Qtr3"]]), "B1", "B1:B3"), ["Qtr3", "Qtr4", "Qtr1"]);
+        assert_eq!(fill(serde_json::json!([["Quarter 4"]]), "C1", "C1:C2"), ["Quarter 4", "Quarter 1"]);
+        assert_eq!(fill(serde_json::json!([["1st Period"]]), "D1", "D1:D4"), ["1st Period", "2nd Period", "3rd Period", "4th Period"]);
+        assert_eq!(
+            fill(serde_json::json!([["Product 1"], ["On backorder"]]), "E1:E2", "E1:E6"),
+            ["Product 1", "On backorder", "Product 2", "On backorder", "Product 3", "On backorder"]
+        );
+    }
+
+    #[test]
+    fn falling_growth_series_stops_at_its_stop_value() {
+        let mut s = crate::Session::new();
+        s.new_workbook();
+        s.execute("cell.set", serde_json::json!({"cell": "A1", "input": "5"})).unwrap();
+        s.execute("edit.fillSeries", serde_json::json!({"range": "A1:A6", "type": "growth", "step": 0.5, "stop": 1})).unwrap();
+        let d = s.doc().unwrap();
+        let sh = d.wb.active().unwrap();
+        let growth: Vec<String> = (1..6).map(|r| crate::display::cell_text(&d.wb, sh, CellRef::new(r, 0))).collect();
+        assert_eq!(growth, ["2.5", "1.25", "", "", ""]);
     }
 }

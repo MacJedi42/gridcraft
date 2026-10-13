@@ -58,6 +58,72 @@ fn vertical_scrollbar_pages_and_drags_without_changing_selection() {
     assert_eq!(h.state().session.active().unwrap().selection.active, CellRef::new(0, 0));
 }
 
+/// The first column painted right of the frozen ones.
+fn first_scrolled_col(h: &egui_kittest::Harness<'static, SheetApp>) -> u32 {
+    let app = h.state();
+    let sheet = app.session.active().unwrap().wb.active().unwrap();
+    let geo = app.grid.geo.as_ref().unwrap();
+    geo.col_at(sheet, geo.cells.left() + geo.frozen_w + 0.5)
+}
+
+fn click(h: &mut egui_kittest::Harness<'static, SheetApp>, p: egui::Pos2) {
+    h.input_mut().events.push(Event::PointerMoved(p));
+    h.input_mut().events.push(Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+    h.run_steps(2);
+    h.input_mut().events.push(Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+    h.run_steps(2);
+}
+
+#[test]
+fn horizontal_scrollbar_pages_and_drags_across_a_wide_sheet() {
+    let mut wb = gridcraft_engine::model::Workbook::new();
+    let sh = wb.sheet_mut(0).unwrap();
+    for c in 0..26 {
+        sh.set_value(CellRef::new(0, c), Value::text(format!("col {}", c + 1)));
+    }
+    // Column A frozen: a page is the scrolling part only.
+    sh.freeze = Some((0, 1));
+    let mut s = Session::new();
+    s.add_document(gridcraft_engine::DocState::new(wb, None, "Book1".into()));
+    let mut h = harness(s);
+    let track = h.state().grid.hscroll.expect("the tab bar has a horizontal scrollbar");
+    assert!(track.width() >= 200.0, "the scrollbar gets a usable share of the tab bar: {track:?}");
+    assert_eq!(first_scrolled_col(&h), 1);
+
+    let page = {
+        let geo = h.state().grid.geo.as_ref().unwrap();
+        (geo.cells.width() - geo.frozen_w) / geo.z
+    };
+    click(&mut h, egui::pos2(track.right() - 6.0, track.center().y));
+    let scrolled = h.state().view().scroll.x;
+    assert!((scrolled - page).abs() < 0.5, "clicking the track right of the thumb scrolls one page: {scrolled} vs {page}");
+    assert!(first_scrolled_col(&h) > 1);
+    let geo = h.state().grid.geo.clone().unwrap();
+    let sheet = h.state().session.active().unwrap().wb.active().unwrap().clone();
+    assert_eq!(geo.x(&sheet, 0), geo.cells.left(), "the frozen column stays put");
+    click(&mut h, egui::pos2(track.right() - 6.0, track.center().y));
+    let further = h.state().view().scroll.x;
+    click(&mut h, egui::pos2(track.left() + 2.0, track.center().y));
+    assert!(h.state().view().scroll.x < further, "clicking left of the thumb scrolls back");
+
+    h.state_mut().view_mut().unwrap().scroll.x = 0.0;
+    h.run_steps(2);
+    let start = egui::pos2(track.left() + 6.0, track.center().y);
+    h.input_mut().events.push(Event::PointerMoved(start));
+    h.input_mut().events.push(Event::PointerButton { pos: start, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+    h.run_steps(2);
+    let end = start + egui::vec2(120.0, 0.0);
+    h.input_mut().events.push(Event::PointerMoved(end));
+    h.run_steps(2);
+    let dragged = h.state().view().scroll.x;
+    assert!(first_scrolled_col(&h) > 1, "dragging the thumb right changes the first visible column");
+    h.run_steps(3);
+    assert_eq!(h.state().view().scroll.x, dragged, "holding the thumb still must not keep scrolling");
+    h.input_mut().events.push(Event::PointerButton { pos: end, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+    h.run_steps(2);
+    assert_eq!(h.state().session.active().unwrap().selection.active, CellRef::new(0, 0));
+}
+
 fn key(h: &mut egui_kittest::Harness<'static, SheetApp>, k: Key, m: Modifiers) {
     h.input_mut().events.push(Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: m });
     h.input_mut().events.push(Event::Key { key: k, physical_key: None, pressed: false, repeat: false, modifiers: m });
@@ -192,6 +258,25 @@ fn arrows_escape_and_undo() {
 }
 
 #[test]
+fn shift_arrows_in_point_mode_extend_from_the_pointed_cell() {
+    let mut s = blank();
+    s.execute("selection.set", json!({"cell": "A11"})).unwrap();
+    let mut h = harness(s);
+    text(&mut h, "=SUM(");
+    key(&mut h, Key::ArrowUp, Modifiers::NONE);
+    let edited = |h: &egui_kittest::Harness<'static, SheetApp>| h.state().editor.as_ref().map(|e| e.text.clone());
+    assert_eq!(edited(&h).as_deref(), Some("=SUM(A10"));
+    // Shift is held down, as on a real keyboard: the backend reports it before the arrow keys.
+    h.input_mut().events.push(Event::ModifiersChanged(Modifiers::SHIFT));
+    for expected in ["=SUM(A9:A10", "=SUM(A8:A10", "=SUM(A7:A10"] {
+        key(&mut h, Key::ArrowUp, Modifiers::SHIFT);
+        assert_eq!(edited(&h).as_deref(), Some(expected));
+    }
+    key(&mut h, Key::ArrowDown, Modifiers::SHIFT);
+    assert_eq!(edited(&h).as_deref(), Some("=SUM(A8:A10"), "Shift+Down shrinks back towards the anchor");
+}
+
+#[test]
 fn shortcuts_format_and_extend() {
     let mut s = blank();
     s.execute("range.setValues", json!({"range": "A1", "values": [[1, 2], [3, 4]]})).unwrap();
@@ -221,6 +306,25 @@ fn delete_key_removes_the_selected_chart() {
 
     assert!(h.state().session.active().unwrap().wb.active().unwrap().charts.is_empty());
     assert_eq!(h.state().selected_chart, None);
+    assert_eq!(value(&h, "A1"), Value::Number(1.0));
+}
+
+#[test]
+fn inserted_chart_is_selected_so_delete_removes_it() {
+    // #668, #256: after Insert › Chart the selection stayed on the source cells, so Delete
+    // cleared the data and left the chart behind.
+    let mut session = blank();
+    session.execute("range.setValues", json!({"range": "A1:B2", "values": [[1, 2], [3, 4]]})).unwrap();
+    session.execute("selection.set", json!({"range": "A1:B2"})).unwrap();
+    let mut h = harness(session);
+
+    let id = h.state_mut().run("insert.chart", json!({"type": "column"})).unwrap()["chart"].as_u64().unwrap() as u32;
+    h.run_steps(2);
+    assert_eq!(h.state().selected_chart, Some(id), "the new chart is selected");
+
+    key(&mut h, Key::Delete, Modifiers::NONE);
+
+    assert!(h.state().session.active().unwrap().wb.active().unwrap().charts.is_empty());
     assert_eq!(value(&h, "A1"), Value::Number(1.0));
 }
 
@@ -277,6 +381,45 @@ fn language_switch_translates_the_ribbon_and_persists() {
     assert_eq!(restored.language, Language::Cs);
     h.state_mut().run("app.language.set", json!({"language": "en"})).unwrap();
     assert_eq!(h.state().ui.language, Language::En);
+}
+
+#[test]
+fn pivot_fields_pane_follows_the_interface_language() {
+    // #858: the PivotTable Fields pane and its field menus stayed in English after switching to Spanish.
+    let mut h = harness(blank());
+    h.state_mut().run("range.setValues", json!({"range": "A1:B3", "values": [["Region", "Sales"], ["North", 10], ["South", 20]]})).unwrap();
+    h.state_mut().run("insert.pivotTable", json!({"source": "Sheet1!$A$1:$B$3", "rows": ["Region"]})).unwrap();
+    h.state_mut().run("app.language.set", json!({"language": "es"})).unwrap();
+    h.run_steps(4);
+    for label in ["Campos de tabla dinámica", "Filas", "Valores", "Actualizar", "Campo calculado…"] {
+        assert!(h.query_by_label(label).is_some(), "the pane shows `{label}`");
+    }
+    assert!(h.query_by_label("PivotTable Fields").is_none());
+    h.get_by_label("Region ▾").click();
+    h.run_steps(2);
+    for label in ["Mover a rótulos de columna", "Agrupar por años", "Quitar campo"] {
+        assert!(h.query_by_label(label).is_some(), "the field menu shows `{label}`");
+    }
+    assert!(h.query_by_label("Remove Field").is_none());
+}
+
+#[test]
+fn format_cells_draws_its_labels_in_the_interface_language() {
+    let mut h = harness(blank());
+    h.state_mut().run("app.language.set", json!({"language": "de"})).unwrap();
+    h.state_mut().open_dialog("formatCells", json!({"tab": "Number"}));
+    h.run_steps(2);
+    assert!(h.query_by_label("Wissenschaftlich").is_some(), "the Number tab's categories are translated");
+    assert!(h.query_by_label("Scientific").is_none(), "no English category is left");
+    h.get_by_label("Wissenschaftlich").click();
+    h.run_steps(2);
+    let style = &h.state().dialog.as_ref().unwrap().values["style"];
+    assert_eq!(style["num_fmt"], json!("0.00E+00"), "a translated category still applies its code");
+    h.state_mut().dialog = None;
+    h.state_mut().run("app.language.set", json!({"language": "en"})).unwrap();
+    h.state_mut().open_dialog("formatCells", json!({"tab": "Number"}));
+    h.run_steps(2);
+    assert!(h.query_by_label("Scientific").is_some(), "English is unchanged");
 }
 
 #[test]
@@ -461,6 +604,33 @@ fn solver_dialog_loads_the_saved_model_and_results_can_restore() {
 }
 
 #[test]
+fn solver_results_write_the_chosen_reports() {
+    let mut s = blank();
+    for (c, v) in [("A1", "0"), ("A2", "0"), ("B1", "=3*A1+5*A2"), ("B2", "=2*A2"), ("B3", "=3*A1+2*A2")] {
+        s.execute("cell.set", json!({"cell": c, "input": v})).unwrap();
+    }
+    let r = s
+        .execute(
+            "data.solver",
+            json!({"objective": "B1", "variables": "A1:A2", "constraints": ["A1 <= 4", "B2 <= 12", "B3 <= 18"], "method": "simplex"}),
+        )
+        .unwrap();
+    let mut h = harness(s);
+    // Restore Original Values with the Answer and Limits reports: the cells go back, the reports stay.
+    h.state_mut().open_dialog("solverResults", r);
+    for key in ["restore", "answerReport", "limitsReport"] {
+        h.state_mut().dialog.as_mut().unwrap().values.insert(key.into(), json!(true));
+    }
+    h.run_steps(2);
+    key(&mut h, Key::Enter, Modifiers::NONE);
+    assert!(h.state().dialog.is_none());
+    assert!(h.state().message.is_none(), "{:?}", h.state().message);
+    let names: Vec<String> = h.state().session.active().unwrap().wb.sheets.iter().map(|s| s.name.clone()).collect();
+    assert_eq!(names, ["Answer Report 1", "Limits Report 1", "Sheet1"]);
+    assert_eq!(value(&h, "B1"), Value::Number(0.0));
+}
+
+#[test]
 fn about_renders_every_tab() {
     let mut h = harness(blank());
     for tab in ["About", "Contributors", "Models"] {
@@ -483,6 +653,98 @@ fn column_autocomplete_completes_on_enter() {
     text(&mut h, "Ea"); // ambiguous: East / Eastern
     key(&mut h, Key::Enter, Modifiers::NONE);
     assert_eq!(value(&h, "A5"), Value::from("Ea"));
+}
+
+fn completion(h: &egui_kittest::Harness<'static, SheetApp>) -> (String, Option<String>) {
+    let ed = h.state().editor.as_ref().expect("still editing");
+    (ed.text.clone(), ed.completion.clone())
+}
+
+#[test]
+fn column_autocomplete_backspace_and_escape_drop_only_the_proposal() {
+    let mut s = blank();
+    s.execute("range.setValues", json!({"range": "A1", "values": [["Apple"], ["Banana"]]})).unwrap();
+    s.execute("selection.set", json!({"cell": "A3"})).unwrap();
+    let mut h = harness(s);
+    text(&mut h, "ap");
+    assert_eq!(completion(&h), ("ap".into(), Some("Apple".into())), "\"ple\" is proposed after the caret");
+    key(&mut h, Key::Enter, Modifiers::NONE);
+    assert_eq!(value(&h, "A3"), Value::from("Apple"), "Enter accepts it, with the entry's own case");
+    text(&mut h, "ba");
+    key(&mut h, Key::Tab, Modifiers::NONE);
+    assert_eq!(value(&h, "A4"), Value::from("Banana"), "Tab accepts it too");
+
+    // Backspace removes the proposal, not the typed "a".
+    h.state_mut().run("selection.set", json!({"cell": "A5"})).unwrap();
+    h.run_steps(2);
+    text(&mut h, "ba");
+    key(&mut h, Key::Backspace, Modifiers::NONE);
+    assert_eq!(completion(&h), ("ba".into(), None));
+    key(&mut h, Key::Enter, Modifiers::NONE);
+    assert_eq!(value(&h, "A5"), Value::from("ba"));
+
+    // Escape dismisses the proposal and keeps the edit; a second Escape cancels it.
+    text(&mut h, "ap");
+    key(&mut h, Key::Escape, Modifiers::NONE);
+    assert_eq!(completion(&h), ("ap".into(), None));
+    key(&mut h, Key::Escape, Modifiers::NONE);
+    assert!(h.state().editor.is_none());
+    assert_eq!(value(&h, "A6"), Value::Empty);
+}
+
+#[test]
+fn column_autocomplete_skips_ambiguous_prefixes_and_numbers() {
+    let mut s = blank();
+    s.execute("range.setValues", json!({"range": "A1", "values": [["Apricot"], ["Apple"], ["12 Main St"]]})).unwrap();
+    s.execute("selection.set", json!({"cell": "A4"})).unwrap();
+    let mut h = harness(s);
+    text(&mut h, "ap");
+    assert_eq!(completion(&h), ("ap".into(), None), "Apricot and Apple both match");
+    text(&mut h, "p");
+    assert_eq!(completion(&h), ("app".into(), Some("Apple".into())), "one more letter settles it");
+    h.state_mut().cancel_edit();
+    text(&mut h, "12");
+    assert_eq!(completion(&h), ("12".into(), None), "a number is not completed");
+}
+
+#[test]
+fn column_autocomplete_folds_case_beyond_ascii() {
+    let mut s = blank();
+    s.execute("range.setValues", json!({"range": "A1", "values": [["Ébène"], ["Ébano"], ["ébano"], ["STRAẞENBAHN"]]})).unwrap();
+    s.execute("selection.set", json!({"cell": "A5"})).unwrap();
+    let mut h = harness(s);
+    text(&mut h, "éba");
+    assert_eq!(completion(&h), ("éba".into(), Some("ébano".into())), "Ébano and ébano are one entry, Ébène doesn't match");
+    h.state_mut().cancel_edit();
+    text(&mut h, "éb");
+    assert_eq!(completion(&h).1, None, "Ébène and Ébano differ past the prefix");
+    h.state_mut().cancel_edit();
+    // "ß" is two bytes, "ẞ" three: the proposed rest starts after the fifth character, not the sixth byte.
+    text(&mut h, "straß");
+    assert_eq!(completion(&h), ("straß".into(), Some("STRAẞENBAHN".into())));
+    let painted = h.output().shapes.iter().any(|c| matches!(&c.shape, egui::Shape::Text(t) if t.galley.job.text == "ENBAHN"));
+    assert!(painted, "the rest \"ENBAHN\" is drawn after the caret");
+}
+
+#[test]
+fn column_autocomplete_can_be_turned_off() {
+    assert!(gridcraft_ui_egui::UiState::default().autocomplete);
+    let old: gridcraft_ui_egui::UiState = serde_json::from_str(r#"{"dark": true}"#).unwrap();
+    assert!(old.autocomplete, "a ui.json written before the setting existed keeps it on");
+
+    let mut s = blank();
+    s.execute("range.setValues", json!({"range": "A1", "values": [["North"]]})).unwrap();
+    s.execute("selection.set", json!({"cell": "A2"})).unwrap();
+    let mut h = harness(s);
+    assert_eq!(h.state_mut().run("options.autoComplete", json!({"on": false})), Ok(json!({"on": false})));
+    assert!(h.state().dialog.is_none());
+    text(&mut h, "No");
+    assert_eq!(completion(&h), ("No".into(), None));
+    text(&mut h, "r");
+    assert_eq!(completion(&h), ("Nor".into(), None), "typing on doesn't bring it back");
+    key(&mut h, Key::Enter, Modifiers::NONE);
+    assert_eq!(value(&h, "A2"), Value::from("Nor"));
+    assert_eq!(h.state_mut().run("options.autoComplete", json!({})), Ok(json!({"on": true})), "no parameters: it toggles");
 }
 
 /// An .xlsm carrying a VBA project, saved to bytes.

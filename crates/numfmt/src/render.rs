@@ -1,7 +1,7 @@
 //! Rendering a value with a parsed section.
 
 use gridcraft_core::DateSystem;
-use gridcraft_core::date::{MONTHS, WEEKDAYS, datetime_from_serial};
+use gridcraft_core::date::{MONTHS, WEEKDAYS, datetime_from_serial, max_serial};
 
 use crate::decimal::{decimal_digits, fixed, fixed_from_digits, format_general_fit};
 use crate::parse::{DatePart, Section, Tok};
@@ -11,6 +11,8 @@ use crate::parse::{DatePart, Section, Tok};
 pub(crate) struct Out {
     pub text: String,
     pub fill: Option<(char, usize)>,
+    /// True when every digit shown is zero (a number section that rounded to zero).
+    pub zero: bool,
 }
 
 impl Out {
@@ -58,7 +60,7 @@ pub(crate) fn render_general(sec: &Section, v: f64, width: usize) -> Out {
 
 /// Renders a date/time. `None` when the serial is outside the supported range.
 pub(crate) fn render_date(sec: &Section, v: f64, sys: DateSystem) -> Option<Out> {
-    if !v.is_finite() || !(0.0..2_958_466.0).contains(&v) {
+    if !v.is_finite() || !(0.0..max_serial(sys) as f64 + 1.0).contains(&v) {
         return None;
     }
     let sub_digits = sec.toks.iter().filter_map(|t| if let Tok::Date(DatePart::SubSec(n)) = t { Some(*n) } else { None }).max().unwrap_or(0).min(3);
@@ -231,7 +233,9 @@ fn digit_indices(toks: &[Tok], range: std::ops::Range<usize>) -> Vec<usize> {
 /// Renders a non-negative number through a number section.
 pub(crate) fn render_number(sec: &Section, v: f64) -> Out {
     let mut x = v.abs();
-    if sec.percent > 0 {
+    // Observed: `%` in a scientific section is only a literal (`#%e+#` shows 123456.789 as
+    // `1%e+5`).
+    if sec.percent > 0 && !sec.exp {
         x *= 100f64.powi(sec.percent.min(20));
     }
     if sec.scale > 0 {
@@ -247,6 +251,7 @@ pub(crate) fn render_number(sec: &Section, v: f64) -> Out {
     let mut pieces: Vec<String> = vec![String::new(); n];
     let mut before: Vec<String> = vec![String::new(); n + 1];
     let mut lits: Vec<Option<String>> = Vec::new();
+    let mut zero = false;
     if sec.fraction {
         lits = vec![None; n];
         render_fraction(sec, x, &mut pieces, &mut lits);
@@ -264,7 +269,9 @@ pub(crate) fn render_number(sec: &Section, v: f64) -> Out {
             let exp_idx = digit_indices(toks, e_at + 1..n);
             let step = int_idx.len().max(1) as i32;
             let (mut e, int_s, frac_s) = if x == 0.0 {
-                (0i32, String::new(), "0".repeat(frac_idx.len()))
+                // Observed: zero shows `0` in every integer placeholder, `#` and `?` too
+                // (`#.#E+#` gives `0.E+0`, `####.####E+#` gives `0000.E+0`).
+                (0i32, "0".repeat(int_idx.len()), "0".repeat(frac_idx.len()))
             } else {
                 let (digits, xe) = decimal_digits(x);
                 let mut e = xe - xe.rem_euclid(step);
@@ -283,26 +290,30 @@ pub(crate) fn render_number(sec: &Section, v: f64) -> Out {
             if int_s.is_empty() && frac_s.chars().all(|c| c == '0') {
                 e = 0;
             }
-            let mut head = String::from(if upper { "E" } else { "e" });
-            if e < 0 {
-                head.push('-');
+            let head = if upper { "E" } else { "e" };
+            let sign = if e < 0 {
+                "-"
             } else if plus {
-                head.push('+');
-            }
-            let width = exp_idx.iter().filter(|&&i| matches!(toks.get(i), Some(Tok::Digit('0')))).count().min(20);
-            let digits = format!("{:0w$}", e.unsigned_abs(), w = width);
+                "+"
+            } else {
+                ""
+            };
+            let digits = e.unsigned_abs().to_string();
+            // The sign sits right before the exponent digits, after any literal that follows the
+            // `E` (observed: `|0|e+|0|` shows `|1|e|+5|`); `?` pads the digits with spaces.
             match exp_idx.first() {
                 Some(&first) => {
                     if let Some(p) = pieces.get_mut(e_at) {
-                        *p = head;
+                        *p = head.to_string();
                     }
-                    if let Some(p) = pieces.get_mut(first) {
-                        *p = digits;
+                    if let Some(b) = before.get_mut(first) {
+                        *b = sign.to_string();
                     }
+                    fill_int(toks, &exp_idx, &digits, false, false, &mut pieces);
                 }
                 None => {
                     if let Some(p) = pieces.get_mut(e_at) {
-                        *p = head + &digits;
+                        *p = format!("{head}{sign}{digits}");
                     }
                 }
             }
@@ -310,6 +321,7 @@ pub(crate) fn render_number(sec: &Section, v: f64) -> Out {
         } else {
             fixed(x, frac_idx.len())
         };
+        zero = int_s.chars().chain(frac_s.chars()).all(|c| c == '0');
         fill_int(toks, &int_idx, &int_s, sec.thousands, false, &mut pieces);
         if int_idx.is_empty()
             && !int_s.is_empty()
@@ -338,6 +350,7 @@ pub(crate) fn render_number(sec: &Section, v: f64) -> Out {
             _ => out.push(pieces.get(i).map(String::as_str).unwrap_or("")),
         }
     }
+    out.zero = zero;
     out
 }
 
@@ -496,7 +509,9 @@ fn render_fraction(sec: &Section, x: f64, pieces: &mut [String], lits: &mut [Opt
         // Denominator digits are zero padded to the `0` placeholders, then left aligned; `?`
         // pads with spaces after them.
         let zeros = den_idx.iter().filter(|&&i| toks.get(i) == Some(&Tok::Digit('0'))).count();
-        let padded = format!("{den_s:0>zeros$}");
+        // No `{:0>zeros$}`: a format width above u16::MAX panics.
+        let mut padded = "0".repeat(zeros.saturating_sub(den_s.chars().count()));
+        padded.push_str(&den_s);
         let dc: Vec<char> = padded.chars().collect();
         let count = den_idx.len();
         for (k, &ti) in den_idx.iter().enumerate() {

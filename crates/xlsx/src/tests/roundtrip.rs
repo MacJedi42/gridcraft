@@ -204,9 +204,9 @@ fn sample() -> Workbook {
             security_descriptor: None,
         },
     ];
-    s.hyperlinks.insert(at("A2"), Hyperlink { target: "https://example.com/?a=1&b=2".into(), tooltip: Some("go".into()) });
-    s.hyperlinks.insert(at("A3"), Hyperlink { target: "'Data & Stuff'!B2".into(), tooltip: None });
-    s.hyperlinks.insert(at("A4"), Hyperlink { target: "mailto:me@example.com".into(), tooltip: None });
+    s.hyperlinks.insert(at("A2"), Hyperlink { target: "https://example.com/?a=1&b=2".into(), tooltip: Some("go".into()), external: true });
+    s.hyperlinks.insert(at("A3"), Hyperlink { target: "'Data & Stuff'!B2".into(), tooltip: None, external: false });
+    s.hyperlinks.insert(at("A4"), Hyperlink { target: "mailto:me@example.com".into(), tooltip: None, external: true });
     s.comments.insert(
         at("B2"),
         Comment {
@@ -290,9 +290,23 @@ fn sample() -> Workbook {
         header_row: true,
         totals_row: true,
         columns: vec![
-            TableColumn { name: "Region".into(), totals: TotalsFn::None, totals_label: Some("Total".into()), formula: None },
-            TableColumn { name: "Amount".into(), totals: TotalsFn::Sum, totals_label: None, formula: None },
-            TableColumn { name: "Tax".into(), totals: TotalsFn::Custom, totals_label: Some("SUM(R2:R4)".into()), formula: Some("Q2*0.1".into()) },
+            TableColumn {
+                name: "Region".into(),
+                totals: TotalsFn::None,
+                totals_label: Some("Total".into()),
+                formula: None,
+                unique_name: None,
+                xml: None,
+            },
+            TableColumn { name: "Amount".into(), totals: TotalsFn::Sum, totals_label: None, formula: None, unique_name: None, xml: None },
+            TableColumn {
+                name: "Tax".into(),
+                totals: TotalsFn::Custom,
+                totals_label: Some("SUM(R2:R4)".into()),
+                formula: Some("Q2*0.1".into()),
+                unique_name: None,
+                xml: None,
+            },
         ],
         style: "TableStyleLight9".into(),
         banded_rows: true,
@@ -304,6 +318,8 @@ fn sample() -> Workbook {
             (0, FilterCriterion::Values { values: vec!["East".into()], blanks: false }),
             (1, FilterCriterion::Icon { set: "3TrafficLights1".into(), id: Some(1) }),
         ],
+        table_type: None,
+        connection_id: None,
     });
     let png = b"\x89PNG\r\n\x1a\n0000IHDRfake".to_vec();
     s.images.push(Image {
@@ -691,8 +707,8 @@ fn writing_repairs_invalid_models() {
         header_row: true,
         totals_row: false,
         columns: vec![
-            TableColumn { name: "X".into(), totals: TotalsFn::None, totals_label: None, formula: None },
-            TableColumn { name: "x".into(), totals: TotalsFn::None, totals_label: None, formula: None },
+            TableColumn { name: "X".into(), totals: TotalsFn::None, totals_label: None, formula: None, unique_name: None, xml: None },
+            TableColumn { name: "x".into(), totals: TotalsFn::None, totals_label: None, formula: None, unique_name: None, xml: None },
         ],
         style: String::new(),
         banded_rows: true,
@@ -701,6 +717,8 @@ fn writing_repairs_invalid_models() {
         last_col: false,
         filter_button: true,
         filter: vec![],
+        table_type: None,
+        connection_id: None,
     });
     s.cells.set(at("B2"), Cell { value: Value::Number(1.0), formula: None, style: StyleId(9999) });
     let (back, _) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
@@ -962,7 +980,7 @@ fn table_newline_column_and_backslash_name_survive() {
     s.set_value(at("A1"), Value::text("Handle\nBars"));
     s.set_value(at("B1"), Value::text("Name"));
     s.set_value(at("B2"), Value::text("x"));
-    let col = |n: &str| TableColumn { name: n.into(), totals: TotalsFn::None, totals_label: None, formula: None };
+    let col = |n: &str| TableColumn { name: n.into(), totals: TotalsFn::None, totals_label: None, formula: None, unique_name: None, xml: None };
     s.tables.push(Table {
         id: 1,
         name: "\\_Prime.1".into(),
@@ -977,6 +995,8 @@ fn table_newline_column_and_backslash_name_survive() {
         last_col: false,
         filter_button: true,
         filter: vec![],
+        table_type: None,
+        connection_id: None,
     });
     s.cells.set(at("D1"), Cell::formula(Formula::new("COUNTA(\\_Prime.1[Name])")));
     let (back, _) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
@@ -986,6 +1006,51 @@ fn table_newline_column_and_backslash_name_survive() {
     assert_eq!(s.value(at("A1")), Value::text("Handle\nBars"));
     assert_eq!(s.cell(at("D1")).and_then(|c| c.formula.as_ref()).map(|f| f.text.as_str()), Some("COUNTA(\\_Prime.1[Name])"));
     assert!(gridcraft_formula::parse("COUNTA(\\_Prime.1[Name])").is_ok(), "backslash table name parses as a structured reference");
+}
+
+/// A table that is only a header row and a totals row (Insert Table on one row, then Total
+/// Row) is written like the header-only and one-data-row shapes, not dropped on save.
+#[test]
+fn header_and_totals_table_without_data_row_survives() {
+    let mut wb = Workbook::new();
+    let s = wb.sheet_mut(0).unwrap();
+    s.tables.push(Table {
+        id: 1,
+        name: "Table1".into(),
+        range: rr("A1:B2"),
+        header_row: true,
+        totals_row: true,
+        columns: vec![
+            TableColumn {
+                name: "Name".into(),
+                totals: TotalsFn::None,
+                totals_label: Some("Total".into()),
+                formula: None,
+                unique_name: None,
+                xml: None,
+            },
+            TableColumn { name: "Amount".into(), totals: TotalsFn::Sum, totals_label: None, formula: None, unique_name: None, xml: None },
+        ],
+        style: "TableStyleMedium2".into(),
+        banded_rows: true,
+        banded_cols: false,
+        first_col: true,
+        last_col: true,
+        filter_button: true,
+        filter: vec![],
+        table_type: None,
+        connection_id: None,
+    });
+    let (back, report) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    let tables = &back.sheet(0).unwrap().tables;
+    assert_eq!(tables.len(), 1);
+    let t = &tables[0];
+    assert_eq!((t.name.as_str(), t.range.a1(), t.header_row, t.totals_row), ("Table1", "A1:B2".to_string(), true, true));
+    assert_eq!((t.style.as_str(), t.banded_rows, t.first_col, t.last_col), ("TableStyleMedium2", true, true, true));
+    assert_eq!(t.columns[0].totals_label.as_deref(), Some("Total"));
+    assert_eq!(t.columns[1].totals, TotalsFn::Sum);
+    assert_eq!(back.sheet(0).unwrap().value(at("A1")), Value::text("Name"));
 }
 
 /// Templates and macro-enabled files differ from `.xlsx` only in the workbook part's content
@@ -1013,4 +1078,89 @@ fn package_kind_sets_workbook_content_type() {
         assert_eq!(back.sheet(0).unwrap().value(at("A1")), Value::Number(7.0));
     }
     assert_eq!(crate::XlsxKind::from_path("noext"), crate::XlsxKind::Workbook);
+}
+
+/// The workbook's default font (`fonts[0]`, the Normal style's) is what every default-formatted
+/// cell shows, typed or empty; saving keeps it instead of resetting it to Calibri 11 (#805).
+#[test]
+fn default_font_survives_a_round_trip() {
+    let styles = |font0: &str| {
+        format!(
+            r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font>{font0}</font><font><b/><sz val="14"/><color theme="1"/><name val="Arial"/><family val="2"/></font></fonts>
+            <fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
+            <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+            <cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>
+            <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+        )
+    };
+    let rels = r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>"#;
+    let body = r#"<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>typed text</t></is></c><c r="B1" s="1"><v>1</v></c></row></sheetData>"#;
+    let font0 = |bytes: &[u8]| {
+        let mut pkg = Package::open(bytes).unwrap();
+        let st = pkg.read_xml("xl/styles.xml").unwrap().unwrap();
+        let f = st.child("fonts").unwrap().kids("font").next().unwrap().clone();
+        let val = |n: &str| f.child(n).and_then(|e| e.attr("val")).map(str::to_string);
+        (val("sz"), val("name"), val("family"), val("scheme"))
+    };
+
+    let file =
+        super::minimal(body, &[("xl/styles.xml", &styles(r#"<sz val="10"/><color theme="1"/><name val="Arial"/><family val="2"/>"#))], rels, "");
+    let (wb, _) = read_xlsx(&file).unwrap();
+    let saved = write_xlsx(&wb).unwrap();
+    assert_eq!(font0(&saved), (Some("10".into()), Some("Arial".into()), Some("2".into()), None));
+    let (back, _) = read_xlsx(&saved).unwrap();
+    let normal = &back.styles.get(StyleId::DEFAULT).font;
+    assert_eq!((normal.name.as_str(), normal.size), ("Arial", 10.0), "empty cells and new input take the Normal font");
+    let s = back.sheet(0).unwrap();
+    assert_eq!(s.cell(at("A1")).unwrap().style, StyleId::DEFAULT);
+    let b1 = &back.styles.get(s.cell(at("B1")).unwrap().style).font;
+    assert!(b1.bold && b1.size == 14.0, "an explicit font is still its own: {b1:?}");
+
+    // Excel's own Normal font follows the theme's body font; the scheme link survives too.
+    let file = super::minimal(
+        body,
+        &[("xl/styles.xml", &styles(r#"<name val="Calibri"/><family val="2"/><color theme="1"/><sz val="12"/><scheme val="minor"/>"#))],
+        rels,
+        "",
+    );
+    let saved = write_xlsx(&read_xlsx(&file).unwrap().0).unwrap();
+    assert_eq!(font0(&saved), (Some("12".into()), Some("Calibri".into()), Some("2".into()), Some("minor".into())));
+}
+
+#[test]
+fn solid_data_bar_survives_with_sparklines_and_gradient_neighbours() {
+    let mut wb = Workbook::new();
+    let s = wb.sheet_mut(0).unwrap();
+    s.set_value(at("A1"), Value::Number(1.0));
+    let bar =
+        |gradient: bool, max: CfValueKind| CfRule::DataBar { min: CfValueKind::Min, max, color: Color::Rgb(0x638EC6), gradient, show_value: true };
+    let rules = [(true, "A1", CfValueKind::Max), (false, "B1", CfValueKind::Formula("$C$1".into())), (false, "D1:D3", CfValueKind::Number(9.0))];
+    for (i, (gradient, range, max)) in rules.into_iter().enumerate() {
+        s.cond_formats.push(CondFormat { ranges: vec![rr(range)], rule: bar(gradient, max), priority: i as u32 + 1, stop_if_true: false });
+    }
+    s.sparklines.push(Sparkline { cell: at("F1"), source: "A1:C1".into(), kind: SparklineKind::Line, color: Color::Rgb(0x376092), markers: false });
+    let bytes = write_xlsx(&wb).unwrap();
+    // x14 cfvo values are `xm:f` children; a `val` attribute there is not valid x14.
+    let (xml, _) = sheet1_xml(&bytes);
+    assert!(xml.contains("<x14:cfvo type=\"num\"><xm:f>9</xm:f></x14:cfvo>"), "{xml}");
+    let (back, rep) = read_xlsx(&bytes).unwrap();
+    assert!(rep.warnings.is_empty(), "{:?}", rep.warnings);
+    let b = &back.sheets[0];
+    assert_eq!(b.cond_formats, wb.sheets[0].cond_formats);
+    assert_eq!(b.sparklines.len(), 1);
+}
+
+#[test]
+fn doc_props_keep_boundary_whitespace() {
+    let mut wb = Workbook::new();
+    wb.props = DocProps {
+        title: "  Title  ".into(),
+        subject: "\n".into(),
+        author: "\tMe\t".into(),
+        company: " Co ".into(),
+        keywords: " a, b ".into(),
+        description: "\n  d\n".into(),
+    };
+    let (back, _) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
+    assert_eq!(back.props, wb.props);
 }

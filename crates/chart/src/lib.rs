@@ -124,6 +124,9 @@ impl Measure for ApproxMeasure {
 pub struct ChartData {
     pub categories: Vec<String>,
     pub series: Vec<SeriesData>,
+    /// Workbook-theme colours for the points of pie-like charts, repeating (point `j` uses entry `j % len`); empty uses the default theme.
+    #[serde(default)]
+    pub palette: Vec<Rgba>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

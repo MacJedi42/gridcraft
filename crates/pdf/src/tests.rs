@@ -157,3 +157,123 @@ fn hostile_inputs_never_panic() {
     let pdf = d.finish();
     check_xref(&pdf);
 }
+
+fn page_content(d: &PdfDoc) -> &str {
+    &d.pages[0].content
+}
+
+#[test]
+fn text_width_does_not_overflow() {
+    // 8,000,000 x 556 units exceeds u32::MAX: a u32 sum panics in debug builds.
+    let long = "a".repeat(8_000_000);
+    let w = text_width(Font::Helvetica, 10.0, &long);
+    assert!(w.is_finite() && w > 0.0);
+    assert!(w > text_width(Font::Helvetica, 10.0, &"a".repeat(7_000_000)));
+}
+
+#[test]
+fn all_zero_dash_is_drawn_solid() {
+    let mut d = PdfDoc::new();
+    let p = d.add_page(100.0, 100.0);
+    p.stroke_line_dashed(0.0, 0.0, 50.0, 0.0, 1.0, [0, 0, 0], &[0.0, 0.0]);
+    p.polyline(&[[0.0, 0.0], [5.0, 5.0]], 1.0, [0, 0, 0], &[0.0, 0.0001, f32::NAN]);
+    p.stroke_line_dashed(0.0, 0.0, 50.0, 0.0, 1.0, [0, 0, 0], &[3.0, 2.0]);
+    let c = page_content(&d);
+    assert_eq!(c.matches("[] 0 d").count(), 2);
+    assert!(!c.contains("[0 0]"));
+    assert!(c.contains("[3 2] 0 d"));
+}
+
+#[test]
+fn negative_and_nan_stroke_widths_become_zero() {
+    let mut d = PdfDoc::new();
+    let p = d.add_page(100.0, 100.0);
+    p.rect_stroke(1.0, 1.0, 10.0, 10.0, -3.0, [0, 0, 0]);
+    p.stroke_line(0.0, 0.0, 5.0, 5.0, f32::NAN, [0, 0, 0]);
+    p.polygon(&[[0.0, 0.0], [5.0, 0.0], [5.0, 5.0]], None, Some(([0, 0, 0], -1.0)));
+    p.circle(20.0, 20.0, 5.0, None, Some(([0, 0, 0], f32::NEG_INFINITY)));
+    let c = page_content(&d);
+    assert_eq!(c.matches("\n0 w ").count(), 4);
+    assert!(!c.contains("-1 w") && !c.contains("-3 w"));
+}
+
+#[test]
+fn non_finite_image_size_stores_nothing() {
+    let mut d = PdfDoc::new();
+    let p = d.add_page(200.0, 200.0);
+    let px = [255u8; 16];
+    for (w, h) in [(f32::NAN, 10.0), (10.0, f32::NAN), (f32::INFINITY, 10.0), (-1.0, 10.0)] {
+        p.image_rgba(0.0, 0.0, w, h, &px, 2, 2);
+    }
+    p.image_rgba(f32::NAN, 0.0, 10.0, 10.0, &px, 2, 2);
+    assert!(p.images.is_empty());
+    assert!(p.content.is_empty());
+}
+
+#[test]
+fn every_draw_method_survives_hostile_numbers() {
+    let bad = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -7.0, 0.0, 1.0e30, -1.0e30];
+    let px = [200u8; 16];
+    let mut d = PdfDoc::new();
+    let p = d.add_page(300.0, 300.0);
+    for &a in &bad {
+        for &b in &bad {
+            p.clip_rect(a, b, a, b);
+            p.fill_rect(a, b, b, a, [1, 2, 3]);
+            p.rect_stroke(a, b, a, b, a, [1, 2, 3]);
+            p.stroke_line(a, b, b, a, a, [1, 2, 3]);
+            p.stroke_line_dashed(a, b, b, a, b, [1, 2, 3], &[a, b, 0.0]);
+            p.polyline(&[[a, b], [b, a], [1.0, 1.0]], a, [1, 2, 3], &[b, a]);
+            p.polygon(&[[a, b], [b, a], [1.0, 1.0]], Some([1, 2, 3]), Some(([4, 5, 6], a)));
+            p.circle(a, b, b, Some([1, 2, 3]), Some(([4, 5, 6], a)));
+            p.text(a, b, a, Font::Helvetica, [0, 0, 0], "x");
+            p.text_rotated(a, b, 10.0, Font::TimesRoman, [0, 0, 0], "y", b);
+            p.image_rgba(a, b, b, a, &px, 2, 2);
+        }
+    }
+    p.stroke_line_dashed(0.0, 0.0, 1.0, 1.0, 1.0, [0, 0, 0], &[0.0; 100]);
+    let c = page_content(&d);
+    assert!(!c.contains("NaN") && !c.contains("inf"));
+    let pdf = d.finish();
+    check_xref(&pdf);
+}
+
+/// Decodes the `<FEFF…>` hex string following `key` in the file bytes.
+fn utf16_entry(pdf: &[u8], key: &str) -> String {
+    let at = find(pdf, key.as_bytes()).unwrap() + key.len();
+    let rest = std::str::from_utf8(&pdf[at..at + 9000.min(pdf.len() - at)]).unwrap_or("");
+    let hex = rest.trim_start().strip_prefix("<FEFF").unwrap();
+    let hex = &hex[..hex.find('>').unwrap()];
+    let units: Vec<u16> = (0..hex.len()).step_by(4).map(|i| u16::from_str_radix(&hex[i..i + 4], 16).unwrap()).collect();
+    String::from_utf16(&units).unwrap()
+}
+
+#[test]
+fn info_strings_with_non_ascii_are_utf16be() {
+    let mut doc = PdfDoc::new();
+    doc.add_page(200.0, 200.0);
+    doc.info.title = "Übersicht €5 – “Q1” 日本 😀".into();
+    doc.info.author = "Müller & Søn".into();
+    let pdf = doc.finish();
+    assert_eq!(utf16_entry(&pdf, "/Title"), "Übersicht €5 – “Q1” 日本 😀");
+    assert_eq!(utf16_entry(&pdf, "/Author"), "Müller & Søn");
+}
+
+#[test]
+fn ascii_info_strings_stay_literal_and_escaped() {
+    let mut doc = PdfDoc::new();
+    doc.add_page(200.0, 200.0);
+    doc.info.title = r"Q1 (draft) a\b".into();
+    let pdf = doc.finish();
+    assert!(find(&pdf, br"/Title (Q1 \(draft\) a\\b)").is_some());
+    assert!(find(&pdf, b"/Producer (GridCraft PDF)").is_some());
+}
+
+#[test]
+fn info_strings_are_capped() {
+    let mut doc = PdfDoc::new();
+    doc.add_page(200.0, 200.0);
+    doc.info.title = "日".repeat(100_000);
+    let pdf = doc.finish();
+    assert_eq!(utf16_entry(&pdf, "/Title").chars().count(), MAX_INFO_CHARS);
+}

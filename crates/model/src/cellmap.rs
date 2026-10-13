@@ -43,7 +43,7 @@ mod tests {
                 dates: vec![],
             },
         );
-        s.hyperlinks.insert(c3, Hyperlink { target: "Sheet1!A1".into(), tooltip: Some("jump".into()) });
+        s.hyperlinks.insert(c3, Hyperlink { target: "Sheet1!A1".into(), tooltip: Some("jump".into()), external: false });
         let json = serde_json::to_string(&s).expect("serialize");
         let back: Sheet = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.comments, s.comments);

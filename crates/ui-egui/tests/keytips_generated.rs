@@ -1062,7 +1062,7 @@ fn keytip_hv_() {
 fn keytip_hvp_() {
     let mut h = harness(blank());
     sequence(&mut h, "HVP", false);
-    assert!(h.state().message.is_some() || h.state().toast.is_some(), "HVP must invoke edit.pasteSpecial and surface its missing-params error");
+    assert!(h.state().message.is_some() || h.state().toast.is_some(), "HVP must invoke edit.paste and surface its missing-params error");
 }
 
 #[test]

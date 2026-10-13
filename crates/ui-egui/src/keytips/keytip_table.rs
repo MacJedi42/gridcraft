@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn item_letter_is_one_level_deep() {
         assert_eq!(item_letter("HV", "dialog:pasteSpecial"), Some("HVS"));
-        assert_eq!(item_letter("HV", "edit.pasteSpecial"), Some("HVP"));
+        assert_eq!(item_letter("HV", "edit.paste"), Some("HVP"));
         assert_eq!(item_letter("H", "dialog:pasteSpecial"), None, "the item badge waits for its group letter");
         assert_eq!(item_letter("HO", "home.autofitColumnWidth"), Some("HOI"));
     }

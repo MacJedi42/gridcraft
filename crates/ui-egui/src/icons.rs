@@ -113,6 +113,8 @@ pub enum Icon {
     /// Light/dark appearance: a circle, its right half filled.
     Appearance,
     Sheet,
+    /// All Sheets navigator next to the sheet tabs: a list of rows with a bullet each.
+    SheetList,
     Book,
     Folder,
     /// Header & Footer: a page with its top / bottom band marked.
@@ -418,6 +420,12 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32) {
         Icon::Home => {
             g.line(&[(2.0, 8.0), (8.0, 2.5), (14.0, 8.0)], c, 1.2);
             g.line(&[(4.0, 6.5), (4.0, 13.5), (12.0, 13.5), (12.0, 6.5)], c, 1.2);
+        }
+        Icon::SheetList => {
+            for y in [4.0, 8.0, 12.0] {
+                g.rect(2.5, y - 1.0, 2.0, 2.0, Some(c), None);
+                g.stroke(&[(6.5, y), (13.5, y)], c);
+            }
         }
         Icon::More => {
             for x in [4.0, 8.0, 12.0] {

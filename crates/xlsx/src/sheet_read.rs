@@ -9,6 +9,7 @@ use gridcraft_formula::Expr;
 use gridcraft_model::{
     AutoFilter, Cell, CfOperator, CfRule, CfValueKind, Comment, CondFormat, EditRange, ErrorStyle, FilterCriterion, Formula, Hyperlink, LineInfo,
     Orientation, PasswordHash, Sheet, SheetProtection, Sparkline, SparklineKind, Table, TableColumn, TotalsFn, Validation, ValidationKind,
+    XmlColumnPr,
 };
 
 use crate::IoError;
@@ -60,6 +61,7 @@ pub fn read_sheet(cx: &mut Ctx<'_>, part: &str, name: &str) -> Result<Sheet, IoE
     drop(bytes);
 
     let mut fit_to_page = false;
+    cx.cf_ext_ids.clear();
     for e in &root.children {
         match e.name.as_str() {
             "sheetPr" => {
@@ -104,7 +106,7 @@ pub fn read_sheet(cx: &mut Ctx<'_>, part: &str, name: &str) -> Result<Sheet, IoE
                     }
                 }
             }
-            "hyperlinks" => read_hyperlinks(e, &rels, &mut sheet),
+            "hyperlinks" => read_hyperlinks(cx, name, e, &rels, &mut sheet),
             "autoFilter" => sheet.autofilter = read_autofilter(cx, e),
             "printOptions" => {
                 sheet.print.gridlines = e.flag("gridLines", false);
@@ -541,7 +543,7 @@ pub fn parse_iso_datetime(s: &str, sys: DateSystem) -> Option<f64> {
 }
 
 pub fn parse_sqref(s: Option<&str>) -> Vec<RangeRef> {
-    s.unwrap_or("").split_whitespace().filter_map(RangeRef::parse).take(10_000).collect()
+    s.unwrap_or("").split_whitespace().filter_map(RangeRef::parse).collect()
 }
 
 fn cf_op(s: Option<&str>) -> CfOperator {
@@ -596,6 +598,9 @@ fn read_cf(cx: &mut Ctx<'_>, e: &El, sheet: &mut Sheet) {
         let formulas: Vec<String> = r.kids("formula").map(|f| from_file(f.text.trim())).collect();
         let f0 = formulas.first().cloned().unwrap_or_default();
         let text = r.attr("text").unwrap_or("").to_string();
+        // The x14 id that links a data bar to its Excel 2010 extension (solid fill lives there).
+        let ext_id =
+            r.child("extLst").and_then(|l| l.kids("ext").find_map(|x| x.child("id"))).map(|i| i.text.trim().to_string()).filter(|i| !i.is_empty());
         let rule = match r.attr("type").unwrap_or("") {
             "cellIs" => CfRule::CellIs { op: cf_op(r.attr("operator")), a: f0, b: formulas.get(1).cloned(), style },
             "expression" => CfRule::Expression { formula: f0, style },
@@ -649,6 +654,9 @@ fn read_cf(cx: &mut Ctx<'_>, e: &El, sheet: &mut Sheet) {
                 continue;
             }
         };
+        if let Some(id) = ext_id {
+            cx.cf_ext_ids.push((id, sheet.cond_formats.len()));
+        }
         sheet.cond_formats.push(CondFormat {
             ranges: ranges.clone(),
             rule,
@@ -709,11 +717,13 @@ fn read_validation(v: &El) -> Option<Validation> {
     })
 }
 
-fn read_hyperlinks(e: &El, rels: &[Rel], sheet: &mut Sheet) {
+fn read_hyperlinks(cx: &mut Ctx<'_>, name: &str, e: &El, rels: &[Rel], sheet: &mut Sheet) {
     let mut cells = 0u64;
     for h in e.kids("hyperlink") {
         let Some(range) = h.attr("ref").and_then(RangeRef::parse) else { continue };
         let mut target = h.attr("id").and_then(|id| rels.iter().find(|r| r.id == id)).map(|r| r.target.clone()).unwrap_or_default();
+        // A relationship is a file or web page; a bare `location` is a place in this workbook.
+        let external = !target.is_empty();
         if let Some(loc) = h.attr("location").filter(|l| !l.is_empty()) {
             if target.is_empty() {
                 target = loc.trim_start_matches('#').to_string();
@@ -724,9 +734,10 @@ fn read_hyperlinks(e: &El, rels: &[Rel], sheet: &mut Sheet) {
         if target.is_empty() {
             continue;
         }
-        let link = Hyperlink { target, tooltip: h.attr("tooltip").map(str::to_string) };
+        let link = Hyperlink { target, tooltip: h.attr("tooltip").map(str::to_string), external };
         for c in range.iter() {
             if cells >= MAX_HYPERLINK_CELLS {
+                cx.warn(format!("sheet \"{name}\": hyperlinks past the first {MAX_HYPERLINK_CELLS} cells were dropped"));
                 return;
             }
             cells += 1;
@@ -821,12 +832,24 @@ pub fn read_table(cx: &mut Ctx<'_>, x: &El) -> Option<Table> {
                         totals,
                         totals_label,
                         formula: c.child("calculatedColumnFormula").map(|f| from_file(f.text.trim())),
+                        unique_name: c.attr("uniqueName").map(str::to_string),
+                        xml: c.child("xmlColumnPr").and_then(|x| {
+                            Some(XmlColumnPr {
+                                map_id: x.attr_u32("mapId")?,
+                                xpath: x.attr("xpath")?.to_string(),
+                                data_type: x.attr("xmlDataType").unwrap_or("string").to_string(),
+                                denormalized: x.flag("denormalized", false),
+                            })
+                        }),
                     }
                 })
                 .collect()
         })
         .unwrap_or_default();
     let si = x.child("tableStyleInfo");
+    // Only XML tables are kept as such: a query table's definition hangs off the table part, which
+    // is rewritten, so it would lose it.
+    let xml_table = x.attr("tableType") == Some("xml");
     Some(Table {
         id: x.attr_u32("id").unwrap_or(0),
         name,
@@ -841,6 +864,8 @@ pub fn read_table(cx: &mut Ctx<'_>, x: &El) -> Option<Table> {
         last_col: si.is_some_and(|s| s.flag("showLastColumn", false)),
         filter_button: x.child("autoFilter").is_some(),
         filter: x.child("autoFilter").and_then(|e| read_autofilter(cx, e)).map(|af| af.criteria).unwrap_or_default(),
+        table_type: xml_table.then(|| "xml".to_string()),
+        connection_id: x.attr_u32("connectionId").filter(|_| xml_table),
     })
 }
 
@@ -953,7 +978,23 @@ fn read_ext(cx: &mut Ctx<'_>, e: &El, sheet: &mut Sheet) {
                         }
                     }
                 }
-                "conditionalFormattings" => cx.warn("some Excel 2010 conditional format extensions were skipped"),
+                "conditionalFormattings" => {
+                    let mut skipped = false;
+                    for r in c.kids("conditionalFormatting").flat_map(|f| f.kids("cfRule")) {
+                        let idx = r.attr("id").and_then(|id| cx.cf_ext_ids.iter().find(|(i, _)| i == id)).map(|(_, n)| *n);
+                        match (idx.and_then(|n| sheet.cond_formats.get_mut(n)), r.child("dataBar")) {
+                            (Some(CondFormat { rule: CfRule::DataBar { gradient, .. }, .. }), Some(db)) => {
+                                *gradient = db.flag("gradient", true);
+                                // Only the fill style is modelled; borders, lengths, axis or negative colours are lost.
+                                skipped |= db.attrs.iter().any(|(k, _)| k != "gradient") || db.children.iter().any(|k| k.name != "cfvo");
+                            }
+                            _ => skipped = true,
+                        }
+                    }
+                    if skipped {
+                        cx.warn("some Excel 2010 conditional format extensions were skipped");
+                    }
+                }
                 _ => {}
             }
         }
@@ -972,5 +1013,13 @@ mod tests {
         assert_eq!(parse_iso_datetime("06:00:00", DateSystem::D1900), Some(0.25));
         assert_eq!(parse_iso_datetime("garbage", DateSystem::D1900), None);
         assert_eq!(parse_iso_datetime("2024-13-01", DateSystem::D1900), None);
+    }
+
+    #[test]
+    fn sqref_keeps_more_than_ten_thousand_ranges() {
+        let sq = (1..=12_000).map(|r| format!("A{r}")).collect::<Vec<_>>().join(" ");
+        let ranges = parse_sqref(Some(&sq));
+        assert_eq!(ranges.len(), 12_000);
+        assert_eq!(ranges.last().copied(), RangeRef::parse("A12000"));
     }
 }

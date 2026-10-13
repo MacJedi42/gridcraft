@@ -278,6 +278,63 @@ Check this</t></r></text></comment></commentList></comments>"#;
     assert_eq!(s.sparklines[0].kind, gridcraft_model::SparklineKind::Column);
 }
 
+/// The sheet's hyperlinks as written: cell, relationship target (external only), location.
+fn written_links(bytes: &[u8]) -> Vec<(String, Option<String>, Option<String>)> {
+    let mut pkg = crate::package::Package::open(bytes).unwrap();
+    let rels = pkg.rels("xl/worksheets/sheet1.xml").unwrap();
+    let sheet = pkg.read_xml("xl/worksheets/sheet1.xml").unwrap().unwrap();
+    let Some(links) = sheet.child("hyperlinks") else { return vec![] };
+    links
+        .kids("hyperlink")
+        .map(|h| {
+            let rel = h.attr("id").map(|id| rels.iter().find(|r| r.id == id).unwrap());
+            let target = rel.map(|r| {
+                assert!(r.external && r.kind == "hyperlink", "{r:?}");
+                r.target.clone()
+            });
+            (h.attr("ref").unwrap().to_string(), target, h.attr("location").map(str::to_string))
+        })
+        .collect()
+}
+
+/// A link to another file is a relationship (`TargetMode="External"`) in the file, with the place in
+/// it as `location`. Saved as a bare `location`, Excel takes it for a place in this workbook and the
+/// link no longer opens the file (#800). C16 is Apache POI's `WithMoreVariousData.xlsx`.
+#[test]
+fn hyperlink_to_another_file_stays_external() {
+    let body = r#"<sheetData/><hyperlinks><hyperlink ref="C16" r:id="rId2"/><hyperlink ref="C17" r:id="rId3" location="Sheet1!A2"/>
+      <hyperlink ref="C18" r:id="rId4"/><hyperlink ref="C19" location="Data!B2"/><hyperlink ref="C20" r:id="rId5"/></hyperlinks>"#;
+    let rel = |id: &str, target: &str| {
+        format!(
+            r#"<Relationship Id="{id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="{target}" TargetMode="External"/>"#
+        )
+    };
+    let sheet_rels = format!(
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{}{}{}{}</Relationships>"#,
+        rel("rId2", "WithVariousData.xlsx"),
+        rel("rId3", "Source.xlsx"),
+        rel("rId4", r"..\Reports\Q1.xlsx"),
+        rel("rId5", "https://example.com/a.xlsx"),
+    );
+    let bytes = minimal(body, &[("xl/worksheets/_rels/sheet1.xml.rels", &sheet_rels)], "", "");
+    let (wb, _) = read_xlsx(&bytes).unwrap();
+    let s = wb.sheet(0).unwrap();
+    assert!(s.hyperlinks[&at("C16")].external && !s.hyperlinks[&at("C19")].external);
+
+    let some = |s: &str| Some(s.to_string());
+    let links = written_links(&crate::write_xlsx(&wb).unwrap());
+    assert_eq!(
+        links,
+        vec![
+            ("C16".into(), some("WithVariousData.xlsx"), None),
+            ("C17".into(), some("Source.xlsx"), some("Sheet1!A2")),
+            ("C18".into(), some(r"..\Reports\Q1.xlsx"), None),
+            ("C19".into(), None, some("Data!B2")),
+            ("C20".into(), some("https://example.com/a.xlsx"), None),
+        ]
+    );
+}
+
 #[test]
 fn drawing_with_picture_and_chart() {
     let png: &[u8] = b"\x89PNG\r\n\x1a\nfakeimagedata";
@@ -494,4 +551,29 @@ fn text_box_formatting_is_read_and_written() {
     assert_eq!(rgb(g.text_color), rgb(f.text_color));
     assert_eq!(rgb(g.text_outline.map(|o| o.0)), rgb(f.text_outline.map(|o| o.0)));
     assert_eq!(g.text_outline.map(|o| o.1), Some(1.5));
+}
+
+/// `_xludf.` marks a user-defined call even when a built-in has the same name; dropping it turns
+/// the call into the built-in, and `_xludf.EOMONTH()` into a call Excel repairs away (#726).
+#[test]
+fn user_defined_function_prefix_round_trips() {
+    let cases =
+        [("A1", "_xludf.EOMONTH()"), ("A2", "_xludf.CONCAT(\"a\",\"b\")"), ("A3", "_xludf.SUM(1,2)"), ("A4", "MYUDF(1)"), ("A5", "_xludf.MYUDF(1)")];
+    let rows: String = cases
+        .iter()
+        .enumerate()
+        .map(|(i, (a, f))| format!(r#"<row r="{}"><c r="{a}"><f>{}</f></c></row>"#, i + 1, f.replace('"', "&quot;")))
+        .collect();
+    let (wb, _) = read_xlsx(&minimal(&format!("<sheetData>{rows}</sheetData>"), &[], "", "")).unwrap();
+    let s = wb.sheet(0).unwrap();
+    for (a, f) in cases {
+        assert_eq!(s.cell(at(a)).unwrap().formula.as_ref().unwrap().text, f, "read {a}");
+    }
+    let bytes = crate::write_xlsx(&wb).unwrap();
+    let mut pkg = crate::package::Package::open(&bytes).unwrap();
+    let sheet = pkg.read_xml("xl/worksheets/sheet1.xml").unwrap().unwrap();
+    for (a, f) in cases {
+        let cell = sheet.child("sheetData").unwrap().kids("row").flat_map(|r| r.kids("c")).find(|c| c.attr("r") == Some(a)).unwrap();
+        assert_eq!(cell.child("f").unwrap().text, f, "written {a}");
+    }
 }

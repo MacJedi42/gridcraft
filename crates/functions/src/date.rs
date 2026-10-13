@@ -1,6 +1,6 @@
 //! Date and time functions.
 
-use gridcraft_core::date::{DateTime, datetime_from_serial, days_in_month, days_in_month_in, is_leap, serial_from_ymd};
+use gridcraft_core::date::{DateTime, datetime_from_serial, days_in_month, is_leap, serial_from_ymd, serial_in_system};
 use gridcraft_core::parse::parse_input;
 use gridcraft_core::{CellError, DateSystem, Value};
 
@@ -98,10 +98,10 @@ fn second(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
 }
 
 fn now(_a: &[Arg], c: &mut dyn Ctx) -> R<Value> {
-    num_val(c.now_serial())
+    num_val(serial_in_system(c.date_system(), c.now_serial()))
 }
 fn today(_a: &[Arg], c: &mut dyn Ctx) -> R<Value> {
-    num_val(c.now_serial().floor())
+    num_val(serial_in_system(c.date_system(), c.now_serial()).floor())
 }
 
 fn weekday(a: &[Arg], c: &mut dyn Ctx) -> R<Value> {
@@ -164,7 +164,9 @@ fn edate(a: &[Arg], c: &mut dyn Ctx) -> R<Value> {
     if !(1900..=9999).contains(&y) {
         return Err(CellError::Num);
     }
-    let dd = (d.day.max(1) as i64).min(days_in_month_in(sys, y as i32, mo as u32) as i64);
+    // Excel keeps serial 0's day 0 and gives February 1900 its real 28 days here, though the
+    // sheet's calendar has a 29 February 1900 (serial 60).
+    let dd = (d.day as i64).min(days_in_month(y as i32, mo as u32) as i64);
     num_val(ymd_serial(sys, y, mo, dd)? as f64)
 }
 
@@ -177,7 +179,8 @@ fn eomonth(a: &[Arg], c: &mut dyn Ctx) -> R<Value> {
     if !(1900..=9999).contains(&y) {
         return Err(CellError::Num);
     }
-    num_val(ymd_serial(sys, y, mo, days_in_month_in(sys, y as i32, mo as u32) as i64)? as f64)
+    // Like EDATE, February 1900 ends on the 28th (serial 59).
+    num_val(ymd_serial(sys, y, mo, days_in_month(y as i32, mo as u32) as i64)? as f64)
 }
 
 fn datedif(a: &[Arg], c: &mut dyn Ctx) -> R<Value> {
@@ -680,15 +683,33 @@ mod tests {
         close(ev("DATEVALUE", vec![t("2/29/1900")]), 60.0);
         close(ev("DATEVALUE", vec![t("3/1/1900")]), 61.0);
         is_err(ev("DATEVALUE", vec![t("2/29/1901")]), CellError::Value);
-        // EDATE and EOMONTH land on it as the end of February 1900.
-        close(ev("EOMONTH", vec![n(d(1900.0, 1.0, 15.0)), n(1.0)]), 60.0);
-        close(ev("EOMONTH", vec![n(60.0), n(0.0)]), 60.0);
-        close(ev("EOMONTH", vec![n(d(1900.0, 3.0, 15.0)), n(-1.0)]), 60.0);
+        // EDATE and EOMONTH read it as 29 February, but end February 1900 on the 28th.
+        close(ev("EOMONTH", vec![n(d(1900.0, 1.0, 15.0)), n(1.0)]), 59.0);
+        close(ev("EOMONTH", vec![n(60.0), n(0.0)]), 59.0);
+        close(ev("EOMONTH", vec![n(d(1900.0, 3.0, 15.0)), n(-1.0)]), 59.0);
         close(ev("EOMONTH", vec![n(60.0), n(12.0)]), d(1901.0, 2.0, 28.0));
-        close(ev("EDATE", vec![n(d(1900.0, 1.0, 31.0)), n(1.0)]), 60.0);
-        close(ev("EDATE", vec![n(d(1900.0, 3.0, 31.0)), n(-1.0)]), 60.0);
+        close(ev("EDATE", vec![n(d(1900.0, 1.0, 31.0)), n(1.0)]), 59.0);
+        close(ev("EDATE", vec![n(d(1900.0, 3.0, 31.0)), n(-1.0)]), 59.0);
         close(ev("EDATE", vec![n(60.0), n(1.0)]), d(1900.0, 3.0, 29.0));
         close(ev("EDATE", vec![n(60.0), n(12.0)]), d(1901.0, 2.0, 28.0));
+    }
+
+    #[test]
+    fn edate_eomonth_early_1900() {
+        // Excel 365: serial 0 is 0 January 1900 and February 1900 has 28 days here.
+        close(ev("EDATE", vec![n(0.0), n(0.0)]), 0.0);
+        close(ev("EDATE", vec![n(0.0), n(1.0)]), 31.0);
+        close(ev("EDATE", vec![n(0.0), n(12.0)]), 366.0);
+        close(ev("EOMONTH", vec![n(0.0), n(1.0)]), 59.0);
+        close(ev("EDATE", vec![n(31.0), n(1.0)]), 59.0);
+        close(ev("EOMONTH", vec![n(59.0), n(0.0)]), 59.0);
+        // Unchanged, and the same as Excel.
+        close(ev("EOMONTH", vec![n(0.0), n(0.0)]), 31.0);
+        is_err(ev("EOMONTH", vec![n(0.0), n(-1.0)]), CellError::Num);
+        close(ev("EDATE", vec![n(59.0), n(1.0)]), 88.0);
+        close(ev("EDATE", vec![n(60.0), n(1.0)]), 89.0);
+        close(ev("EDATE", vec![n(61.0), n(-1.0)]), 32.0);
+        close(ev("EOMONTH", vec![n(31.0), n(0.0)]), 31.0);
     }
 
     #[test]
@@ -794,6 +815,11 @@ mod tests {
         close(crate::call(spec, &[n(0.0)], &mut ctx), 6.0);
         let spec = crate::lookup("YEAR").unwrap();
         close(crate::call(spec, &[n(0.0)], &mut ctx), 1904.0);
+        // The clock is 2026-10-07 12:00; in the 1904 system that is serial 44840.5.
+        close(crate::call(crate::lookup("NOW").unwrap(), &[], &mut ctx), 44840.5);
+        let today = crate::call(crate::lookup("TODAY").unwrap(), &[], &mut ctx);
+        close(today.clone(), 44840.0);
+        close(crate::call(spec, &[crate::Arg::val(today)], &mut ctx), 2026.0);
         // No fictitious day here: 1904 is a real leap year and 1900 is before the epoch.
         let spec = crate::lookup("DATE").unwrap();
         close(crate::call(spec, &[n(1904.0), n(2.0), n(29.0)], &mut ctx), 59.0);

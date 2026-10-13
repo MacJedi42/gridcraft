@@ -321,7 +321,8 @@ fn mirr(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
             neg += x / (1.0 + fr).powi(i as i32);
         }
     }
-    if pos == 0.0 || neg == 0.0 {
+    // No positive flow is not an error in Excel: the formula below gives -1.
+    if neg == 0.0 {
         return Err(CellError::Div0);
     }
     let r = (-pos * (1.0 + rr).powf(n - 1.0) / neg).powf(1.0 / (n - 1.0)) - 1.0;
@@ -1813,6 +1814,8 @@ mod tests {
         close_tol(ev("MIRR", vec![rf(m), n(0.1), n(0.12)]), 0.1260943, 1e-6);
         close_tol(ev("MIRR", vec![rf(col(&[-120000.0, 39000.0, 30000.0, 21000.0])), n(0.1), n(0.12)]), -0.048044655, 1e-7);
         is_err(ev("MIRR", vec![rf(col(&[1.0, 2.0])), n(0.1), n(0.1)]), CellError::Div0);
+        // Excel 365 gives -1 when every flow is negative: the positive flows are worth nothing.
+        close_tol(ev("MIRR", vec![rf(col(&[-10000.0, -3400.0, -6500.0, -1000.0])), n(0.07), n(0.01)]), -1.0, 1e-12);
         close(ev("FVSCHEDULE", vec![n(1.0), av(row(&[0.09, 0.11, 0.1]))]), 1.33089);
         close(ev("EFFECT", vec![n(0.0525), n(4.0)]), 0.0535426673707584);
         is_err(ev("EFFECT", vec![n(-0.1), n(4.0)]), CellError::Num);

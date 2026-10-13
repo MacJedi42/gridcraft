@@ -377,6 +377,12 @@ impl Default for StyleTable {
 }
 
 impl StyleTable {
+    /// A table whose default (Normal) style is `normal`, such as a file's own Normal font.
+    pub fn with_default(normal: Style) -> Self {
+        let mut index = HashMap::new();
+        index.insert(normal.clone(), StyleId::DEFAULT);
+        StyleTable { styles: vec![normal], index }
+    }
     pub fn get(&self, id: StyleId) -> &Style {
         self.styles.get(id.0 as usize).or_else(|| self.styles.first()).unwrap_or(&DEFAULT_STYLE)
     }

@@ -4,8 +4,13 @@
 //! A navigation column on the left picks a page (Home, New, Open, Info, Save As, Print, Export,
 //! Options); Save and Close act at once. Every action runs an existing command through
 //! [`SheetApp::run`] or an existing dialog through [`SheetApp::open_dialog`]; the state here is
-//! UI-only and never saved. Recent workbooks are listed by path only: nothing on disk is touched
-//! until the user picks one.
+//! UI-only and never saved. Recent workbooks are listed by path, with when each was last changed:
+//! that is asked of the file system on a thread of its own, never while drawing, and only the
+//! files' metadata is read. No workbook is opened until the user picks one.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use egui::{Align2, Color32, Key, Modifiers, Rect, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use serde_json::{Value as Json, json};
@@ -109,6 +114,8 @@ pub struct Backstage {
     preview: Option<((u64, u64, bool, bool), Json)>,
     /// Save As: the chosen file type (an extension from [`SAVE_TYPES`]).
     pub save_format: &'static str,
+    /// Home and Open: when the recent workbooks were last changed.
+    recent: RecentFiles,
 }
 
 /// Save As file types: (extension, label). The first is the workbook itself; the others are
@@ -118,7 +125,16 @@ pub const SAVE_TYPES: [(&str, &str); 4] =
 
 impl Backstage {
     pub fn new(page: Page) -> Backstage {
-        Backstage { page, props: Default::default(), print_all: false, fit_to_page: false, preview_page: 0, preview: None, save_format: "xlsx" }
+        Backstage {
+            page,
+            props: Default::default(),
+            print_all: false,
+            fit_to_page: false,
+            preview_page: 0,
+            preview: None,
+            save_format: "xlsx",
+            recent: RecentFiles::default(),
+        }
     }
 }
 
@@ -187,9 +203,9 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui) {
                 ui.label(RichText::new(lang.tr(bs.page.label())).font(theme::ui_font(28.0)).color(t.text));
                 ui.add_space(18.0);
                 match bs.page {
-                    Page::Home => home(app, ui, &mut out),
+                    Page::Home => home(app, ui, &mut bs, &mut out),
                     Page::New => new_page(app, ui, &mut out),
-                    Page::Open => open_page(app, ui, &mut out),
+                    Page::Open => open_page(app, ui, &mut bs, &mut out),
                     Page::Info => info(app, ui, &mut bs),
                     Page::SaveAs => save_as(app, ui, &mut bs, &mut out),
                     Page::Print => print(app, ui, &mut bs, &mut out),
@@ -325,7 +341,7 @@ fn new_tiles(app: &mut SheetApp, ui: &mut Ui, out: &mut Outcome) {
     });
 }
 
-/// File name and folder of a recent path, split as text (nothing on disk is read).
+/// File name and folder of a recent path, split as text.
 fn split_path(path: &str) -> (String, String) {
     let p = std::path::Path::new(path);
     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or(path).to_string();
@@ -333,8 +349,12 @@ fn split_path(path: &str) -> (String, String) {
     (name, folder)
 }
 
-/// Recent workbooks, newest first. Opening one is the user's explicit choice.
-fn recent_list(app: &mut SheetApp, ui: &mut Ui, out: &mut Outcome, limit: usize) {
+/// Width of the column that tells when a recent workbook was last changed.
+const MODIFIED_W: f32 = 150.0;
+
+/// Recent workbooks, newest first, each with when it was last changed. Opening one is the user's
+/// explicit choice.
+fn recent_list(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, out: &mut Outcome, limit: usize) {
     let t = Tokens::get(ui.ctx());
     let lang = app.ui.language;
     if app.ui.recent.is_empty() {
@@ -342,6 +362,21 @@ fn recent_list(app: &mut SheetApp, ui: &mut Ui, out: &mut Outcome, limit: usize)
         return;
     }
     let width = ui.available_width().min(CONTENT_W);
+    // What the file system has said so far; the rest arrives in later frames (see `RecentFiles`).
+    let known = bs.recent.known(ui.ctx(), &app.ui.recent);
+    // The web build has no files to ask about, and a narrow window leaves the names their room.
+    let modified_w = if cfg!(target_arch = "wasm32") || width < 420.0 { 0.0 } else { MODIFIED_W };
+    if modified_w > 0.0 {
+        let (head, _) = ui.allocate_exact_size(vec2(width, 20.0), Sense::hover());
+        ui.painter().text(
+            pos2(head.right() - modified_w, head.center().y),
+            Align2::LEFT_CENTER,
+            lang.tr("Modified"),
+            theme::ui_font(11.5),
+            t.text_dim,
+        );
+    }
+    let now = crate::now_ms() / 1000.0;
     for path in app.ui.recent.iter().take(limit).cloned().collect::<Vec<_>>() {
         let (name, folder) = split_path(&path);
         let (rect, resp) = ui.allocate_exact_size(vec2(width, 44.0), Sense::click());
@@ -351,8 +386,19 @@ fn recent_list(app: &mut SheetApp, ui: &mut Ui, out: &mut Outcome, limit: usize)
             p.rect_filled(rect, 4.0, t.hover);
         }
         icons::paint(p, Rect::from_center_size(pos2(rect.left() + 20.0, rect.center().y), vec2(20.0, 20.0)), Icon::Book, t.text);
-        p.text(pos2(rect.left() + 42.0, rect.center().y - 8.0), Align2::LEFT_CENTER, &name, theme::ui_font(13.5), t.text);
-        p.text(pos2(rect.left() + 42.0, rect.center().y + 9.0), Align2::LEFT_CENTER, &folder, theme::ui_font(11.5), t.text_dim);
+        // A long name or folder stops short of the column instead of running under it.
+        let room = if modified_w > 0.0 { rect.right() - modified_w - 14.0 } else { rect.right() };
+        let text = p.with_clip_rect(Rect::from_min_max(rect.min, pos2(room, rect.bottom())).intersect(p.clip_rect()));
+        text.text(pos2(rect.left() + 42.0, rect.center().y - 8.0), Align2::LEFT_CENTER, &name, theme::ui_font(13.5), t.text);
+        text.text(pos2(rect.left() + 42.0, rect.center().y + 9.0), Align2::LEFT_CENTER, &folder, theme::ui_font(11.5), t.text_dim);
+        if modified_w > 0.0 {
+            let (words, color) = match known.get(&path) {
+                Some(Modified::At(seconds)) => (age(lang, now - seconds), t.text_dim),
+                Some(Modified::Unknown) => (lang.tr("Not available").to_string(), t.text_disabled),
+                None => (String::new(), t.text_dim),
+            };
+            p.text(pos2(rect.right() - modified_w, rect.center().y), Align2::LEFT_CENTER, words, theme::ui_font(12.0), color);
+        }
         let resp = resp.on_hover_text(&path);
         if resp.clicked() {
             app.open_path(&path);
@@ -360,6 +406,98 @@ fn recent_list(app: &mut SheetApp, ui: &mut Ui, out: &mut Outcome, limit: usize)
                 out.close = true;
             }
         }
+    }
+}
+
+/// What the file system said about a recent workbook.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Modified {
+    /// When it was last changed, in seconds since 1970.
+    At(f64),
+    /// It can't be reached: moved, deleted, or on a drive that is away.
+    Unknown,
+}
+
+/// One thread at a time asks about recent workbooks, so a drive that never answers holds up one
+/// thread, not one for every time the view is opened.
+static ASKING: AtomicBool = AtomicBool::new(false);
+
+/// When the listed workbooks were last changed, as far as the file system has answered.
+///
+/// Asking can take long (a network drive that is asleep, a share that is away), so it is never
+/// done while drawing: a thread asks, and the list shows each answer as it comes back. Only the
+/// files' metadata is read. A view opened anew asks anew.
+#[derive(Clone, Debug, Default)]
+pub struct RecentFiles {
+    /// The list the answers are for.
+    asked: Vec<String>,
+    found: Arc<Mutex<HashMap<String, Modified>>>,
+}
+
+impl RecentFiles {
+    /// What is known this frame about the files in `recent`; starts asking when the list is new.
+    fn known(&mut self, ctx: &egui::Context, recent: &[String]) -> HashMap<String, Modified> {
+        if self.asked != recent && !ASKING.swap(true, Ordering::SeqCst) {
+            self.asked = recent.to_vec();
+            if !ask(ctx.clone(), recent.to_vec(), self.found.clone()) {
+                ASKING.store(false, Ordering::SeqCst);
+            }
+        }
+        self.found.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+}
+
+/// Starts the thread that asks. Returns whether it started.
+#[cfg(not(target_arch = "wasm32"))]
+fn ask(ctx: egui::Context, paths: Vec<String>, found: Arc<Mutex<HashMap<String, Modified>>>) -> bool {
+    /// Lets the next list ask, however the thread ends.
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            ASKING.store(false, Ordering::SeqCst);
+        }
+    }
+    let asking = std::thread::Builder::new().name("gridcraft-recent-files".into()).spawn(move || {
+        let _done = Done;
+        for path in paths {
+            let changed = std::fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok());
+            let answer = changed.map_or(Modified::Unknown, |since| Modified::At(since.as_secs_f64()));
+            found.lock().unwrap_or_else(PoisonError::into_inner).insert(path, answer);
+            ctx.request_repaint();
+        }
+    });
+    asking.is_ok()
+}
+
+/// The web build has no file system to ask.
+#[cfg(target_arch = "wasm32")]
+fn ask(_ctx: egui::Context, _paths: Vec<String>, _found: Arc<Mutex<HashMap<String, Modified>>>) -> bool {
+    false
+}
+
+/// How long ago, in words. The clock's time zone isn't known here, so the list tells ages rather
+/// than dates, which could be a day out. From two days on the counts are never one, so each
+/// language needs one form of "days", "weeks", "months" and "years".
+fn age(lang: Language, seconds: f64) -> String {
+    const DAY: f64 = 86_400.0;
+    let s = if seconds.is_finite() { seconds.max(0.0) } else { 0.0 };
+    let counted = |pattern: &str, n: f64| lang.tr(pattern).replace("{n}", &(n.floor() as u64).to_string());
+    if s < 60.0 {
+        lang.tr("Just now").to_string()
+    } else if s < 3600.0 {
+        counted("{n} min ago", s / 60.0)
+    } else if s < DAY {
+        counted("{n} h ago", s / 3600.0)
+    } else if s < 2.0 * DAY {
+        lang.tr("Yesterday").to_string()
+    } else if s < 14.0 * DAY {
+        counted("{n} days ago", s / DAY)
+    } else if s < 61.0 * DAY {
+        counted("{n} weeks ago", s / (7.0 * DAY))
+    } else if s < 731.0 * DAY {
+        counted("{n} months ago", s / (30.44 * DAY))
+    } else {
+        counted("{n} years ago", s / (365.25 * DAY))
     }
 }
 
@@ -395,13 +533,13 @@ fn square_button(ui: &mut Ui, icon: Icon, label: &str) -> egui::Response {
 
 // ---------------------------------------------------------------- pages
 
-fn home(app: &mut SheetApp, ui: &mut Ui, out: &mut Outcome) {
+fn home(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, out: &mut Outcome) {
     let lang = app.ui.language;
     section(ui, lang, "New");
     new_tiles(app, ui, out);
     ui.add_space(22.0);
     section(ui, lang, "Recent");
-    recent_list(app, ui, out, 8);
+    recent_list(app, ui, bs, out, 8);
     if app.ui.recent.len() > 8 {
         ui.add_space(6.0);
         if ui.link(lang.tr("More workbooks")).clicked() {
@@ -414,7 +552,7 @@ fn new_page(app: &mut SheetApp, ui: &mut Ui, out: &mut Outcome) {
     new_tiles(app, ui, out);
 }
 
-fn open_page(app: &mut SheetApp, ui: &mut Ui, out: &mut Outcome) {
+fn open_page(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, out: &mut Outcome) {
     let lang = app.ui.language;
     if square_button(ui, Icon::OpenFolder, lang.tr("Browse…")).clicked() {
         let before = app.session.active().map(|d| d.uid);
@@ -426,7 +564,7 @@ fn open_page(app: &mut SheetApp, ui: &mut Ui, out: &mut Outcome) {
     }
     ui.add_space(22.0);
     section(ui, lang, "Recent");
-    recent_list(app, ui, out, usize::MAX);
+    recent_list(app, ui, bs, out, usize::MAX);
 }
 
 /// Review › Protect Workbook and File › Info › Protect Workbook: the protect dialog (with an
@@ -824,6 +962,12 @@ fn options(app: &mut SheetApp, ui: &mut Ui) {
         app.run_or_alert("view.formulaBar", json!({"on": formula_bar}));
     }
     ui.add_space(18.0);
+    section(ui, lang, "Options|Editing");
+    let mut autocomplete = app.ui.autocomplete;
+    if ui.checkbox(&mut autocomplete, lang.tr("Enable AutoComplete for cell values")).changed() {
+        app.run_or_alert("options.autoComplete", json!({"on": autocomplete}));
+    }
+    ui.add_space(18.0);
     section(ui, lang, "Options|Save");
     let mut autosave = app.grid.autosave();
     if ui.checkbox(&mut autosave, lang.tr("Save .xlsx workbooks automatically after every change")).changed() {
@@ -855,6 +999,76 @@ fn options(app: &mut SheetApp, ui: &mut Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ages_are_told_in_words() {
+        const DAY: f64 = 86_400.0;
+        for (seconds, words) in [
+            (0.0, "Just now"),
+            (59.9, "Just now"),
+            (60.0, "1 min ago"),
+            (150.0, "2 min ago"),
+            (3600.0, "1 h ago"),
+            (23.9 * 3600.0, "23 h ago"),
+            (DAY, "Yesterday"),
+            (1.99 * DAY, "Yesterday"),
+            // From here on a count is never one.
+            (2.0 * DAY, "2 days ago"),
+            (13.9 * DAY, "13 days ago"),
+            (14.0 * DAY, "2 weeks ago"),
+            (60.9 * DAY, "8 weeks ago"),
+            (61.0 * DAY, "2 months ago"),
+            (730.9 * DAY, "24 months ago"),
+            (731.0 * DAY, "2 years ago"),
+            (4000.0 * DAY, "10 years ago"),
+            // A clock that is behind the file's, or a number that isn't one.
+            (-5.0, "Just now"),
+            (f64::NAN, "Just now"),
+            (f64::NEG_INFINITY, "Just now"),
+            (f64::INFINITY, "Just now"),
+        ] {
+            assert_eq!(age(Language::En, seconds), words, "{seconds}");
+        }
+        assert!(age(Language::En, f64::MAX).ends_with(" years ago"));
+        // Other languages put the count where their own words want it.
+        assert_eq!(age(Language::Ja, 3.0 * DAY), "3 日前");
+        assert_eq!(age(Language::De, 3.0 * DAY), "vor 3 Tagen");
+        assert_eq!(age(Language::Fr, 90.0), "il y a 1 min");
+        for lang in Language::ALL {
+            for seconds in [10.0, 600.0, 7200.0, 1.5 * DAY, 5.0 * DAY, 30.0 * DAY, 200.0 * DAY, 2000.0 * DAY] {
+                let words = age(lang, seconds);
+                assert!(!words.is_empty() && !words.contains('{'), "{lang:?} {seconds}: {words}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_recent_list_learns_when_its_files_were_last_changed() {
+        let dir = std::env::temp_dir().join(format!("gridcraft-recent-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let there = dir.join("There.xlsx").to_string_lossy().into_owned();
+        let gone = dir.join("Gone.xlsx").to_string_lossy().into_owned();
+        std::fs::write(&there, b"a file, if not a workbook").unwrap();
+        let ctx = egui::Context::default();
+        let recent = vec![there.clone(), gone.clone()];
+        let mut files = RecentFiles::default();
+        // Nothing is read while drawing: the answers arrive from a thread, in later frames.
+        let mut known = HashMap::new();
+        for _ in 0..2_000 {
+            known = files.known(&ctx, &recent);
+            if known.len() == recent.len() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(matches!(known.get(&there), Some(Modified::At(seconds)) if *seconds > 1.0e9), "{known:?}");
+        assert_eq!(known.get(&gone), Some(&Modified::Unknown));
+        // The same list is not asked about twice; an empty one is never asked about.
+        assert_eq!(files.known(&ctx, &recent), known);
+        assert!(RecentFiles::default().known(&ctx, &[]).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn page_ids_round_trip_and_unknown_ids_are_refused() {

@@ -87,7 +87,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Move Field",
             [],
             None,
-            "{pivot?, field, from: rows|columns|values|filters, to: rows|columns|values|filters, position?: index, replace?}",
+            "{pivot?, field (\"Σ Values\" moves the value fields between rows and columns; in columns it stays after the last field), from: rows|columns|values|filters, to: rows|columns|values|filters, position?: index, replace?}",
             has_doc,
             move_field
         ),
@@ -333,6 +333,71 @@ fn in_axes(pt: &PivotTable, field: &str) -> bool {
     pt.rows.iter().chain(pt.columns.iter()).any(|f| f.source_col.eq_ignore_ascii_case(field))
 }
 
+/// Name of the Σ Values pseudo-field (where the value fields sit when there are two or more).
+const VALUES_FIELD: &str = "Σ Values";
+
+/// Whether `field` names Σ Values: `Σ Values`, or `Values` unless a source field has that name.
+fn is_values_field(src: &pv::Source, field: &str) -> bool {
+    let f = field.trim();
+    f == VALUES_FIELD || (f.eq_ignore_ascii_case("values") && src.col(f).is_none())
+}
+
+/// Keeps Σ Values in place after a field left (`inserted` false) or arrived at index `i` of
+/// Rows (`rows`) or Columns.
+fn shift_values(pt: &mut PivotTable, rows: bool, i: usize, inserted: bool) {
+    if pt.values_on_rows != rows {
+        return;
+    }
+    let Some(p) = pt.values_position else { return };
+    // Σ Values stays just ahead of the field it preceded.
+    let p = match inserted {
+        true if i <= p => p + 1,
+        false if i < p => p - 1,
+        _ => p,
+    };
+    let n = if rows { pt.rows.len() } else { pt.columns.len() };
+    pt.values_position = (p < n).then_some(p);
+}
+
+/// Takes `field` out of Rows and Columns (Σ Values keeps its place); returns its first entry.
+fn take_from_axes(pt: &mut PivotTable, field: &str) -> Option<PivotField> {
+    let mut first = None;
+    for rows in [true, false] {
+        loop {
+            let list = if rows { &mut pt.rows } else { &mut pt.columns };
+            let Some(i) = list.iter().position(|f| f.source_col.eq_ignore_ascii_case(field)) else { break };
+            let f = list.remove(i);
+            shift_values(pt, rows, i, false);
+            first.get_or_insert(f);
+        }
+    }
+    first
+}
+
+/// Inserts `f` into Rows (`rows`) or Columns at `position` (default: the end).
+fn insert_axis_field(pt: &mut PivotTable, rows: bool, f: PivotField, position: Option<usize>) {
+    let list = if rows { &mut pt.rows } else { &mut pt.columns };
+    let at = position.unwrap_or(list.len()).min(list.len());
+    list.insert(at, f);
+    shift_values(pt, rows, at, true);
+}
+
+/// Moves Σ Values between Rows and Columns, or within Rows, to `position` (default: the end).
+/// In Columns it always comes after the last column field: the column layout doesn't place it
+/// anywhere else yet.
+fn move_values_field(cmd: &str, pt: &mut PivotTable, from: &str, to: &str, position: Option<usize>) -> Result<Json> {
+    let current = if pt.values_on_rows { "rows" } else { "columns" };
+    if from != current {
+        return Err(bad(cmd, format!("`{VALUES_FIELD}` isn't in the {from} area")));
+    }
+    if !matches!(to, "rows" | "columns") {
+        return Err(other("The field you are moving cannot be placed in that PivotTable area."));
+    }
+    pt.values_on_rows = to == "rows";
+    pt.values_position = position.filter(|p| pt.values_on_rows && *p < pt.rows.len());
+    Ok(json!({"field": VALUES_FIELD, "to": to}))
+}
+
 /// The canonical source field name for `field`.
 fn canonical(cmd: &str, src: &pv::Source, field: &str) -> Result<String> {
     src.col(field).and_then(|c| src.headers.get(c).cloned()).ok_or_else(|| bad(cmd, format!("no field `{field}` in the source data")))
@@ -384,21 +449,11 @@ fn add_to_area(
             if pt.rows.len() + pt.columns.len() >= pv::MAX_AXIS_FIELDS && !in_axes(pt, &field) {
                 return Err(other(format!("A PivotTable can have at most {} row and column fields.", pv::MAX_AXIS_FIELDS)));
             }
-            let existing = pt
-                .rows
-                .iter()
-                .chain(pt.columns.iter())
-                .find(|f| f.source_col.eq_ignore_ascii_case(&field))
-                .cloned()
-                .unwrap_or_else(|| PivotField { source_col: field.clone(), ..Default::default() });
-            pt.rows.retain(|f| !f.source_col.eq_ignore_ascii_case(&field));
-            pt.columns.retain(|f| !f.source_col.eq_ignore_ascii_case(&field));
+            let existing = take_from_axes(pt, &field).unwrap_or_else(|| PivotField { source_col: field.clone(), ..Default::default() });
             // A report filter that selects nothing in particular goes away; a selection stays
             // as the field's hidden items.
             pt.filters.retain(|f| !(f.source_col.eq_ignore_ascii_case(&field) && f.selected.is_none()));
-            let list = if area == "rows" { &mut pt.rows } else { &mut pt.columns };
-            let at = position.unwrap_or(list.len()).min(list.len());
-            list.insert(at, existing);
+            insert_axis_field(pt, area == "rows", existing, position);
         }
         "values" => {
             if pt.values.len() >= pv::MAX_VALUE_FIELDS {
@@ -421,8 +476,7 @@ fn add_to_area(
             pt.values.insert(at, v);
         }
         _ => {
-            pt.rows.retain(|f| !f.source_col.eq_ignore_ascii_case(&field));
-            pt.columns.retain(|f| !f.source_col.eq_ignore_ascii_case(&field));
+            take_from_axes(pt, &field);
             let existing = pt.filters.iter().position(|f| f.source_col.eq_ignore_ascii_case(&field));
             let entry = match existing {
                 Some(i) => pt.filters.remove(i),
@@ -439,12 +493,14 @@ fn add_to_area(
 fn remove_from_area(cmd: &str, pt: &mut PivotTable, field: &str, area: &str) -> Result<String> {
     match area {
         "rows" | "columns" => {
-            let list = if area == "rows" { &mut pt.rows } else { &mut pt.columns };
+            let rows = area == "rows";
+            let list = if rows { &mut pt.rows } else { &mut pt.columns };
             let i = list
                 .iter()
                 .position(|f| f.source_col.eq_ignore_ascii_case(field))
                 .ok_or_else(|| bad(cmd, format!("`{field}` isn't in the {area} area")))?;
             let f = list.remove(i);
+            shift_values(pt, rows, i, false);
             pt.filters.retain(|x| !x.source_col.eq_ignore_ascii_case(&f.source_col));
             Ok(f.source_col)
         }
@@ -699,6 +755,8 @@ fn pivot_json(wb: &Workbook, si: usize, pt: &PivotTable) -> Json {
         "style": pt.style,
         "showHeaders": pt.show_headers,
         "calculatedFields": pt.calculated_fields.iter().map(|c| json!({"name": c.name, "formula": c.formula})).collect::<Vec<_>>(),
+        "valuesOnRows": pt.values_on_rows,
+        "valuesPosition": pt.values_position,
     })
 }
 
@@ -890,18 +948,22 @@ fn move_field(s: &mut Session, p: &Json) -> Result<Json> {
     let to = area_param(C, str_param(p, "to"))?;
     let pos = position_param(p);
     update(s, p, |pt, src, _| {
+        if is_values_field(src, &field) {
+            return move_values_field(C, pt, from, to, pos);
+        }
         if from == to {
             // Reorder within the area.
             match from {
                 "rows" | "columns" => {
-                    let list = if from == "rows" { &mut pt.rows } else { &mut pt.columns };
+                    let rows = from == "rows";
+                    let list = if rows { &mut pt.rows } else { &mut pt.columns };
                     let i = list
                         .iter()
                         .position(|f| f.source_col.eq_ignore_ascii_case(&field))
                         .ok_or_else(|| bad(C, format!("`{field}` isn't in the {from} area")))?;
                     let f = list.remove(i);
-                    let at = pos.unwrap_or(list.len()).min(list.len());
-                    list.insert(at, f);
+                    shift_values(pt, rows, i, false);
+                    insert_axis_field(pt, rows, f, pos);
                 }
                 "values" => {
                     let i = pt
@@ -1270,8 +1332,20 @@ fn change_source(s: &mut Session, p: &Json) -> Result<Json> {
             }
             ok
         };
-        pt.rows.retain(|f| keep(&f.source_col, &mut dropped));
-        pt.columns.retain(|f| keep(&f.source_col, &mut dropped));
+        // Axis fields leave one by one so Σ Values keeps its place among the rest.
+        for rows in [true, false] {
+            let mut i = 0;
+            loop {
+                let list = if rows { &mut pt.rows } else { &mut pt.columns };
+                let Some(f) = list.get(i) else { break };
+                if keep(&f.source_col, &mut dropped) {
+                    i += 1;
+                } else {
+                    list.remove(i);
+                    shift_values(pt, rows, i, false);
+                }
+            }
+        }
         pt.values.retain(|f| keep(&f.source_col, &mut dropped));
         pt.filters.retain(|f| keep(&f.source_col, &mut dropped));
         Ok(json!({"source": source, "dropped": dropped}))
@@ -1723,6 +1797,167 @@ mod tests {
     }
 
     #[test]
+    fn values_on_rows_layouts() {
+        let mut s = sales();
+        s.execute("insert.pivotTable", json!({"rows": ["Region"], "values": ["Sales", "Units"]})).unwrap();
+        assert_eq!(text(&s, "C3"), "Sum of Units");
+        // Σ Values after Region: each region holds one line per value field.
+        s.execute("pivot.moveField", json!({"field": "Σ Values", "from": "columns", "to": "rows"})).unwrap();
+        let p = pt(&s);
+        assert!(p.values_on_rows);
+        assert_eq!(p.values_position, None);
+        let r = p.last_range.unwrap();
+        assert_eq!(r.width(), 2);
+        // header + 3 × (region + 2 values) + 2 grand totals
+        assert_eq!(r.height(), 1 + 9 + 2);
+        assert_eq!(text(&s, "A4"), "East");
+        assert_eq!(val(&s, "B4"), Value::Empty);
+        assert_eq!(text(&s, "A5"), "Sum of Sales");
+        assert_eq!(val(&s, "B5"), Value::Number(415.0));
+        assert_eq!(text(&s, "A6"), "Sum of Units");
+        assert_eq!(val(&s, "B6"), Value::Number(33.0));
+        assert_eq!(text(&s, "A13"), "Total Sum of Sales");
+        assert_eq!(val(&s, "B13"), Value::Number(TOTAL));
+        assert_eq!(text(&s, "A14"), "Total Sum of Units");
+        assert_eq!(val(&s, "B14"), Value::Number(72.0));
+        // Tabular, no column field: "Total" heads the data column, as Excel saves it.
+        s.execute("pivot.layout", json!({"layout": "tabular"})).unwrap();
+        assert_eq!(text(&s, "A3"), "Region");
+        assert_eq!(text(&s, "B3"), "Values");
+        assert_eq!(text(&s, "C3"), "Total");
+        s.execute("pivot.layout", json!({"layout": "compact"})).unwrap();
+        // Σ Values before Region: the value fields are the outer items.
+        s.execute("pivot.moveField", json!({"field": "Values", "from": "rows", "to": "rows", "position": 0})).unwrap();
+        assert_eq!(pt(&s).values_position, Some(0));
+        assert_eq!(text(&s, "A4"), "Sum of Sales");
+        assert_eq!(val(&s, "B4"), Value::Empty);
+        assert_eq!(text(&s, "A5"), "East");
+        assert_eq!(val(&s, "B5"), Value::Number(415.0));
+        assert_eq!(text(&s, "A8"), "Sum of Units");
+        assert_eq!(text(&s, "A9"), "East");
+        assert_eq!(val(&s, "B9"), Value::Number(33.0));
+        assert_eq!(text(&s, "A12"), "Total Sum of Sales");
+        assert_eq!(val(&s, "B13"), Value::Number(72.0));
+        // Adding a row field in front keeps Σ Values ahead of Region.
+        s.execute("pivot.addField", json!({"field": "Product", "area": "rows", "position": 0})).unwrap();
+        assert_eq!(pt(&s).values_position, Some(1));
+        s.execute("pivot.removeField", json!({"field": "Product", "area": "rows"})).unwrap();
+        assert_eq!(pt(&s).values_position, Some(0));
+        // No row field: one line per value field and no grand total.
+        s.execute("pivot.removeField", json!({"field": "Region", "area": "rows"})).unwrap();
+        let r = pt(&s).last_range.unwrap();
+        assert_eq!(r.height(), 1 + 2);
+        assert_eq!(text(&s, "A4"), "Sum of Sales");
+        assert_eq!(val(&s, "B4"), Value::Number(TOTAL));
+        assert_eq!(text(&s, "A5"), "Sum of Units");
+        assert_eq!(val(&s, "B5"), Value::Number(72.0));
+        // Back to Columns.
+        s.execute("pivot.moveField", json!({"field": "Σ Values", "from": "rows", "to": "columns"})).unwrap();
+        assert!(!pt(&s).values_on_rows);
+        assert_eq!(text(&s, "A3"), "Sum of Sales");
+        assert_eq!(text(&s, "B3"), "Sum of Units");
+        assert!(s.execute("pivot.moveField", json!({"field": "Σ Values", "from": "columns", "to": "filters"})).is_err());
+        assert!(s.execute("pivot.moveField", json!({"field": "Σ Values", "from": "rows", "to": "columns"})).is_err());
+    }
+
+    #[test]
+    fn collapsed_item_puts_values_in_the_values_column() {
+        let mut s = sales();
+        s.execute("insert.pivotTable", json!({"rows": ["Region", "Product"], "values": ["Sales", "Units"]})).unwrap();
+        s.execute("pivot.moveField", json!({"field": "Σ Values", "from": "columns", "to": "rows"})).unwrap();
+        s.execute("pivot.collapse", json!({"field": "Region", "items": ["East"]})).unwrap();
+        for layout in ["tabular", "outline"] {
+            s.execute("pivot.layout", json!({"layout": layout})).unwrap();
+            assert_eq!(text(&s, "C3"), "Values", "{layout}");
+            let east = (4..20).find(|r| text(&s, &format!("A{r}")) == "East").unwrap();
+            let first = if layout == "tabular" { east } else { east + 1 };
+            assert_eq!(text(&s, &format!("B{first}")), "", "{layout}");
+            assert_eq!(text(&s, &format!("C{first}")), "Sum of Sales", "{layout}");
+            assert_eq!(val(&s, &format!("D{first}")), Value::Number(415.0), "{layout}");
+            assert_eq!(text(&s, &format!("C{}", first + 1)), "Sum of Units", "{layout}");
+        }
+    }
+
+    #[test]
+    fn values_stay_last_in_columns() {
+        let mut s = sales();
+        s.execute("insert.pivotTable", json!({"rows": ["Product"], "columns": ["Region"], "values": ["Sales", "Units"]})).unwrap();
+        s.execute("pivot.moveField", json!({"field": "Σ Values", "from": "columns", "to": "columns", "position": 0})).unwrap();
+        let p = pt(&s);
+        assert!(!p.values_on_rows);
+        assert_eq!(p.values_position, None);
+        // Σ Values to Rows and back with a position: still last in Columns.
+        s.execute("pivot.moveField", json!({"field": "Σ Values", "from": "columns", "to": "rows"})).unwrap();
+        s.execute("pivot.moveField", json!({"field": "Σ Values", "from": "rows", "to": "columns", "position": 0})).unwrap();
+        assert_eq!(pt(&s).values_position, None);
+        assert_eq!(text(&s, "B5"), "Sum of Sales");
+        assert_eq!(text(&s, "C5"), "Sum of Units");
+    }
+
+    #[test]
+    fn change_source_keeps_values_ahead_of_its_field() {
+        let mut s = sales();
+        s.execute("insert.pivotTable", json!({"rows": ["Region", "Product"], "values": ["Sales", "Units"]})).unwrap();
+        s.execute("pivot.moveField", json!({"field": "Σ Values", "from": "columns", "to": "rows", "position": 1})).unwrap();
+        // The new source has no Region: Σ Values stays ahead of Product.
+        s.execute("pivot.changeSource", json!({"source": "Sheet1!B1:E13"})).unwrap();
+        let p = pt(&s);
+        assert_eq!(p.rows.len(), 1);
+        assert_eq!(p.values_position, Some(0));
+        assert_eq!(text(&s, "A4"), "Sum of Sales");
+        assert_eq!(text(&s, "A5"), "Apples");
+    }
+
+    #[test]
+    fn values_on_rows_between_row_fields() {
+        let mut s = sales();
+        s.execute("insert.pivotTable", json!({"rows": ["Region", "Product"], "values": ["Sales", "Units"]})).unwrap();
+        s.execute("pivot.moveField", json!({"field": "Σ Values", "from": "columns", "to": "rows", "position": 1})).unwrap();
+        // Compact: East, then per value field its products, then per-value subtotals of East.
+        assert_eq!(text(&s, "A4"), "East");
+        assert_eq!(text(&s, "A5"), "Sum of Sales");
+        assert_eq!(text(&s, "A6"), "Apples");
+        assert_eq!(val(&s, "B6"), Value::Number(160.0));
+        assert_eq!(text(&s, "A9"), "Sum of Units");
+        assert_eq!(text(&s, "A10"), "Apples");
+        assert_eq!(val(&s, "B10"), Value::Number(16.0));
+        assert_eq!(text(&s, "A13"), "East Sum of Sales");
+        assert_eq!(val(&s, "B13"), Value::Number(415.0));
+        assert_eq!(text(&s, "A14"), "East Sum of Units");
+        assert_eq!(val(&s, "B14"), Value::Number(33.0));
+        let d = s.doc().unwrap();
+        let sh = d.wb.active().unwrap();
+        assert_eq!(d.wb.styles.get(sh.style_id(CellRef::parse("A5").unwrap())).align.indent, 1);
+        assert_eq!(d.wb.styles.get(sh.style_id(CellRef::parse("A6").unwrap())).align.indent, 2);
+        // Outline: one column per level, "Values" heads the Σ Values column.
+        s.execute("pivot.layout", json!({"layout": "outline"})).unwrap();
+        assert_eq!(pt(&s).last_range.unwrap().width(), 4);
+        assert_eq!(text(&s, "A3"), "Region");
+        assert_eq!(text(&s, "B3"), "Values");
+        assert_eq!(text(&s, "C3"), "Product");
+        assert_eq!(text(&s, "B5"), "Sum of Sales");
+        assert_eq!(text(&s, "C6"), "Apples");
+        assert_eq!(val(&s, "D6"), Value::Number(160.0));
+        // Tabular: labels start on their parent's row; totals per value field below each group.
+        s.execute("pivot.layout", json!({"layout": "tabular"})).unwrap();
+        assert_eq!(text(&s, "A4"), "East");
+        assert_eq!(text(&s, "B4"), "Sum of Sales");
+        assert_eq!(text(&s, "C4"), "Apples");
+        assert_eq!(val(&s, "D4"), Value::Number(160.0));
+        assert_eq!(text(&s, "B7"), "Sum of Units");
+        assert_eq!(text(&s, "C7"), "Apples");
+        assert_eq!(val(&s, "D7"), Value::Number(16.0));
+        assert_eq!(text(&s, "A10"), "East Sum of Sales");
+        assert_eq!(val(&s, "D10"), Value::Number(415.0));
+        assert_eq!(text(&s, "A11"), "East Sum of Units");
+        let r = pt(&s).last_range.unwrap();
+        let last = r.end.row + 1;
+        assert_eq!(text(&s, &format!("A{}", last - 1)), "Total Sum of Sales");
+        assert_eq!(text(&s, &format!("A{last}")), "Total Sum of Units");
+        assert_eq!(val(&s, &format!("D{last}")), Value::Number(72.0));
+    }
+
+    #[test]
     fn refresh_after_source_edits() {
         let mut s = sales();
         s.execute("insert.pivotTable", json!({"rows": ["Region"], "values": ["Sales"]})).unwrap();
@@ -2038,5 +2273,39 @@ mod tests {
         let e = s.execute("insert.pivotTable", json!({"source": "A1:B2"})).unwrap_err().to_string();
         assert!(e.contains("field name is not valid"), "{e}");
         assert!(s.execute("insert.pivotTable", json!({"source": "NoSuchTable"})).is_err());
+    }
+
+    #[test]
+    fn too_many_value_columns_are_refused() {
+        let mut s = Session::new();
+        s.new_workbook();
+        let mut records: Vec<Json> = vec![json!(["Cat", "Sub", "V"])];
+        for r in 0..64 {
+            for c in 0..64 {
+                records.push(json!([format!("c{r}"), format!("s{c}"), 1.0]));
+            }
+        }
+        s.execute("range.setValues", json!({"range": "A1", "values": records})).unwrap();
+        let req = |n: usize| {
+            let values: Vec<Json> = (0..n).map(|_| json!({"field": "V"})).collect();
+            json!({"source": "A1:C4097", "rows": ["Cat"], "columns": ["Sub"], "values": values})
+        };
+        let e = s.execute("insert.pivotTable", req(256)).unwrap_err().to_string();
+        assert!(e.contains("will not fit"), "{e}");
+        assert!(s.execute("insert.pivotTable", req(128)).is_ok());
+    }
+
+    #[test]
+    fn collapsed_column_items_count_as_one_column_group() {
+        let mut s = Session::new();
+        s.new_workbook();
+        let mut records: Vec<Json> = vec![json!(["Grp", "Sub", "V"])];
+        records.extend((0..64).map(|c| json!(["g", format!("s{c}"), 1.0])));
+        s.execute("range.setValues", json!({"range": "A1", "values": records})).unwrap();
+        let values: Vec<Json> = (0..256).map(|_| json!({"field": "V"})).collect();
+        s.execute("insert.pivotTable", json!({"source": "A1:C65", "columns": ["Grp"], "values": values})).unwrap();
+        s.execute("pivot.collapse", json!({"field": "Grp"})).unwrap();
+        // 64 Sub items under the collapsed "g" show as one column group: (1 + grand total) x 256 columns fit.
+        s.execute("pivot.addField", json!({"field": "Sub", "area": "columns"})).unwrap();
     }
 }

@@ -28,6 +28,8 @@ pub struct Ctx<'a> {
     pub num_fmts: std::collections::HashMap<u32, String>,
     /// Value metadata blocks, indexed by the worksheet's one-based `vm` attribute.
     pub cell_pictures: Vec<Option<Arc<CellPicture>>>,
+    /// x14 conditional-format ids of the current sheet's data bars, with the index of the rule in `cond_formats`.
+    pub cf_ext_ids: Vec<(String, usize)>,
 }
 
 impl Ctx<'_> {
@@ -79,6 +81,7 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
         next_id: 1,
         num_fmts: Default::default(),
         cell_pictures: vec![],
+        cf_ext_ids: vec![],
     };
     let root_rels = cx.pkg.rels("")?;
     let wb_part = find_rel(&root_rels, "officeDocument").map(|r| r.target.clone()).unwrap_or_else(|| "xl/workbook.xml".into());
@@ -120,6 +123,10 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
         if let Some(x) = cx.optional_xml(&r.target)? {
             let StylesIn { xfs, dxfs, palette, named, num_fmts } = read_styles(&x, &checkboxes);
             cx.num_fmts = num_fmts;
+            // Cell format 0 is the Normal style: its font is what every unformatted cell shows.
+            if let Some(normal) = xfs.first() {
+                cx.styles = StyleTable::with_default(Style { font: normal.font.clone(), ..Style::default() });
+            }
             cx.xf_map = xfs.into_iter().enumerate().map(|(i, s)| if i == 0 { StyleId::DEFAULT } else { cx.styles.intern(s) }).collect();
             cx.dxfs = dxfs;
             cx.palette = palette;
@@ -201,6 +208,11 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
             file_to_model.push(None);
             continue;
         };
+        if rel.kind == "chartsheet" {
+            // Kept as it is and written back in place (see `passthrough`); nothing to model.
+            file_to_model.push(None);
+            continue;
+        }
         if rel.kind != "worksheet" {
             cx.warn(format!("sheet \"{name}\" is a {} and was skipped", rel.kind));
             file_to_model.push(None);
@@ -301,7 +313,7 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
     if let Some(r) = find_rel(&root_rels, "core-properties").cloned()
         && let Ok(Some(x)) = cx.pkg.read_xml(&r.target)
     {
-        let get = |n: &str| x.child(n).map(|e| e.text.trim().to_string()).unwrap_or_default();
+        let get = |n: &str| x.child(n).map(|e| e.text.clone()).unwrap_or_default();
         wb.props.title = get("title");
         wb.props.subject = get("subject");
         wb.props.author = get("creator");
@@ -311,7 +323,7 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
     if let Some(r) = find_rel(&root_rels, "extended-properties").cloned()
         && let Ok(Some(x)) = cx.pkg.read_xml(&r.target)
     {
-        wb.props.company = x.child("Company").map(|e| e.text.trim().to_string()).unwrap_or_default();
+        wb.props.company = x.child("Company").map(|e| e.text.clone()).unwrap_or_default();
     }
 
     // A VBA project is carried through unchanged: GridCraft never runs macros, but preserving the
@@ -327,7 +339,7 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
             Err(e) => cx.warn(format!("macros (VBA project) could not be read and were dropped: {e}")),
         }
     }
-    wb.preserved = kept.workbook(&mut cx, &wb_part, &wb_xml);
+    wb.preserved = kept.workbook(&mut cx, &wb_part, &wb_xml, &file_to_model);
     // Calls of LAMBDA names are spelled like the names (the parser upper-cases them).
     wb.apply_name_call_case();
     wb.styles = cx.styles;

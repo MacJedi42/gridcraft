@@ -560,6 +560,8 @@ struct Line {
     values: bool,
     /// (column, value, indent, number format)
     labels: Vec<(usize, Value, u8, Option<String>)>,
+    /// The value field of the line when Σ Values sits in Rows (`None`: one per data column).
+    vi: Option<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -579,6 +581,10 @@ struct Ctx<'a> {
     rows: Vec<&'a PivotField>,
     row_items: Vec<FieldItems>,
     row_fmts: Vec<String>,
+    /// Depth of Σ Values among the row fields when it sits in Rows (two or more value fields).
+    vpos: Option<usize>,
+    /// Value field captions.
+    val_names: Vec<String>,
 }
 
 impl Ctx<'_> {
@@ -588,26 +594,105 @@ impl Ctx<'_> {
         (it.value.clone(), fmt, it.label.clone())
     }
 
-    fn flatten(&self, nodes: &[Node], depth: usize, prefix: &mut Vec<u32>, out: &mut Vec<Line>) {
+    /// (column, indent) of a row level (Σ Values counts as a level) in Compact/Outline form.
+    fn level_cell(&self, level: usize) -> (usize, u8) {
+        if self.pt.layout == PivotLayout::Outline { (level, 0) } else { (0, level.min(250) as u8) }
+    }
+
+    /// Σ Values comes right here, at row field depth `depth` (`vi`: the value field already chosen above).
+    fn values_here(&self, depth: usize, vi: Option<usize>) -> bool {
+        vi.is_none() && self.vpos == Some(depth)
+    }
+
+    /// Per-value subtotal lines of an item with Σ Values below it ("East Sum of Sales").
+    fn value_subtotals(&self, col: usize, indent: u8, label: &str, prefix: &[u32], out: &mut Vec<Line>) {
+        for (vi, name) in self.val_names.iter().enumerate() {
+            out.push(Line {
+                kind: LineKind::Subtotal,
+                leaf: false,
+                path: prefix.to_vec(),
+                values: true,
+                labels: vec![(col, Value::text(format!("{label} {name}")), indent, None)],
+                vi: Some(vi),
+            });
+        }
+    }
+
+    /// The Σ Values level at row field depth `depth`: one item per value field, each followed by
+    /// the row fields below it (`nodes`) or, innermost, holding that value.
+    fn flatten_values(&self, nodes: &[Node], depth: usize, prefix: &mut Vec<u32>, out: &mut Vec<Line>) {
+        let (col, indent) = self.level_cell(depth);
+        for (vi, name) in self.val_names.iter().enumerate() {
+            let labels = vec![(col, Value::text(name.as_str()), indent, None)];
+            let leaf = nodes.is_empty();
+            out.push(Line { kind: LineKind::Item(!leaf), leaf, path: prefix.clone(), values: leaf, labels, vi: Some(vi) });
+            if !leaf {
+                self.flatten(nodes, depth, Some(vi), prefix, out);
+            }
+        }
+    }
+
+    fn flatten(&self, nodes: &[Node], depth: usize, vi: Option<usize>, prefix: &mut Vec<u32>, out: &mut Vec<Line>) {
+        if self.values_here(depth, vi) {
+            self.flatten_values(nodes, depth, prefix, out);
+            return;
+        }
         let n = self.rows.len();
-        let outline = self.pt.layout == PivotLayout::Outline;
+        // Σ Values still to come below this level: totals need one line per value field.
+        let values_below = vi.is_none() && self.vpos.is_some();
+        let (col, indent) = self.level_cell(depth + usize::from(vi.is_some() && self.vpos.is_some()));
         for node in nodes {
             prefix.push(node.item);
             let (v, fmt, label) = self.label_cell(depth, node.item);
-            let (col, indent) = if outline { (depth, 0) } else { (0, depth.min(250) as u8) };
             let collapsed = depth + 1 < n && self.rows.get(depth).is_some_and(|f| is_collapsed(f, &label));
-            if depth + 1 >= n || collapsed || node.children.is_empty() {
+            let leaf = depth + 1 >= n || collapsed || node.children.is_empty();
+            if leaf && !values_below {
                 out.push(Line {
                     kind: LineKind::Item(depth + 1 < n),
                     leaf: true,
                     path: prefix.clone(),
                     values: true,
                     labels: vec![(col, v, indent, fmt)],
+                    vi,
                 });
+            } else if leaf {
+                out.push(Line {
+                    kind: LineKind::Item(true),
+                    leaf: false,
+                    path: prefix.clone(),
+                    values: false,
+                    labels: vec![(col, v, indent, fmt)],
+                    vi,
+                });
+                // Outline gives each level its own column, so the captions go in the Values
+                // column even when the levels between are collapsed away.
+                let level = if self.pt.layout == PivotLayout::Outline { self.vpos.unwrap_or(depth + 1) } else { depth + 1 };
+                self.flatten_values(&[], level, prefix, out);
+            } else if values_below {
+                // Subtotals per value field, below the group (one line can't hold them all).
+                out.push(Line {
+                    kind: LineKind::Item(true),
+                    leaf: false,
+                    path: prefix.clone(),
+                    values: false,
+                    labels: vec![(col, v, indent, fmt)],
+                    vi,
+                });
+                self.flatten(&node.children, depth + 1, None, prefix, out);
+                if self.pt.subtotals {
+                    self.value_subtotals(col, indent, &label, prefix, out);
+                }
             } else {
                 let top = self.pt.subtotals && self.pt.subtotals_top;
-                out.push(Line { kind: LineKind::Item(true), leaf: false, path: prefix.clone(), values: top, labels: vec![(col, v, indent, fmt)] });
-                self.flatten(&node.children, depth + 1, prefix, out);
+                out.push(Line {
+                    kind: LineKind::Item(true),
+                    leaf: false,
+                    path: prefix.clone(),
+                    values: top,
+                    labels: vec![(col, v, indent, fmt)],
+                    vi,
+                });
+                self.flatten(&node.children, depth + 1, vi, prefix, out);
                 if self.pt.subtotals && !self.pt.subtotals_top {
                     out.push(Line {
                         kind: LineKind::Subtotal,
@@ -615,6 +700,7 @@ impl Ctx<'_> {
                         path: prefix.clone(),
                         values: true,
                         labels: vec![(col, Value::text(format!("{label} Total")), indent, None)],
+                        vi,
                     });
                 }
             }
@@ -622,7 +708,8 @@ impl Ctx<'_> {
         }
     }
 
-    fn flatten_tabular(
+    /// Tabular form of [`Self::flatten_values`]: the first line also carries the parents' labels.
+    fn flatten_tabular_values(
         &self,
         nodes: &[Node],
         depth: usize,
@@ -630,24 +717,57 @@ impl Ctx<'_> {
         pending: &[(usize, Value, u8, Option<String>)],
         out: &mut Vec<Line>,
     ) {
+        for (vi, name) in self.val_names.iter().enumerate() {
+            let mut labels: Vec<(usize, Value, u8, Option<String>)> = if vi == 0 { pending.to_vec() } else { vec![] };
+            labels.push((depth, Value::text(name.as_str()), 0, None));
+            if nodes.is_empty() {
+                out.push(Line { kind: LineKind::Item(false), leaf: true, path: prefix.clone(), values: true, labels, vi: Some(vi) });
+            } else {
+                self.flatten_tabular(nodes, depth, Some(vi), prefix, &labels, out);
+            }
+        }
+    }
+
+    fn flatten_tabular(
+        &self,
+        nodes: &[Node],
+        depth: usize,
+        vi: Option<usize>,
+        prefix: &mut Vec<u32>,
+        pending: &[(usize, Value, u8, Option<String>)],
+        out: &mut Vec<Line>,
+    ) {
+        if self.values_here(depth, vi) {
+            self.flatten_tabular_values(nodes, depth, prefix, pending, out);
+            return;
+        }
         let n = self.rows.len();
+        let values_below = vi.is_none() && self.vpos.is_some();
+        let col = depth + usize::from(vi.is_some() && self.vpos.is_some());
         for (i, node) in nodes.iter().enumerate() {
             prefix.push(node.item);
             let (v, fmt, label) = self.label_cell(depth, node.item);
             let mut labels: Vec<(usize, Value, u8, Option<String>)> = if i == 0 { pending.to_vec() } else { vec![] };
-            labels.push((depth, v, 0, fmt));
+            labels.push((col, v, 0, fmt));
             let collapsed = depth + 1 < n && self.rows.get(depth).is_some_and(|f| is_collapsed(f, &label));
             if depth + 1 >= n || collapsed || node.children.is_empty() {
-                out.push(Line { kind: LineKind::Item(false), leaf: true, path: prefix.clone(), values: true, labels });
+                if values_below {
+                    self.flatten_tabular_values(&[], self.vpos.unwrap_or(depth + 1), prefix, &labels, out);
+                } else {
+                    out.push(Line { kind: LineKind::Item(false), leaf: true, path: prefix.clone(), values: true, labels, vi });
+                }
             } else {
-                self.flatten_tabular(&node.children, depth + 1, prefix, &labels, out);
-                if self.pt.subtotals {
+                self.flatten_tabular(&node.children, depth + 1, vi, prefix, &labels, out);
+                if self.pt.subtotals && values_below {
+                    self.value_subtotals(col, 0, &label, prefix, out);
+                } else if self.pt.subtotals {
                     out.push(Line {
                         kind: LineKind::Subtotal,
                         leaf: false,
                         path: prefix.clone(),
                         values: true,
-                        labels: vec![(depth, Value::text(format!("{label} Total")), 0, None)],
+                        labels: vec![(col, Value::text(format!("{label} Total")), 0, None)],
+                        vi,
                     });
                 }
             }
@@ -691,6 +811,12 @@ enum ValSrc {
     Col(usize),
     /// A calculated field (index into the PivotTable's calculated fields).
     Calc(usize),
+}
+
+/// True when `col_groups` distinct column leaves (plus the grand-total column) times `values` value fields
+/// (at least one data column per group) already exceed the sheet width. This is a lower bound on the final column count.
+fn data_cols_exceed_sheet(col_groups: usize, grand_total: bool, values: usize) -> bool {
+    (col_groups + usize::from(grand_total)).saturating_mul(values.max(1)) > MAX_COLS as usize
 }
 
 /// Computes a PivotTable report from the workbook.
@@ -745,6 +871,14 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
 
     let k = vals.len();
     let empty = rows.is_empty() && cols.is_empty() && vals.is_empty();
+    // Σ Values in Rows (it exists with two or more value fields): its depth among the row fields
+    // found in the source.
+    let vpos: Option<usize> = (pt.values_on_rows && k > 1).then(|| {
+        let p = pt.values_position.unwrap_or(pt.rows.len());
+        pt.rows.iter().take(p).filter(|f| src.col(&f.source_col).is_some()).count()
+    });
+    let on_rows = vpos.is_some();
+    let row_levels = rows.len() + usize::from(on_rows);
 
     // ---- aggregate
     let mut row_items: Vec<FieldItems> = rows.iter().map(|_| FieldItems::default()).collect();
@@ -752,6 +886,7 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
     let mut aggs: AggMap = HashMap::new();
     let mut row_set: HashSet<Vec<u32>> = HashSet::new();
     let mut col_set: HashSet<Vec<u32>> = HashSet::new();
+    let mut col_leaves: HashSet<Vec<u32>> = HashSet::new();
     let filter_fmts: Vec<String> = filters.iter().map(|f| fmt_of(f.0)).collect();
     let row_fmts: Vec<String> = rows.iter().map(|(c, _)| fmt_of(*c)).collect();
     let col_fmts: Vec<String> = cols.iter().map(|(c, _)| fmt_of(*c)).collect();
@@ -788,8 +923,22 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
                 }
             }
         }
+        // The column leaf this record lands in: its path cut after the first collapsed item (as in `flatten_cols`).
+        let shown = cols
+            .iter()
+            .zip(col_items.iter())
+            .zip(cp.iter())
+            .position(|(((_, f), fi), &it)| !f.collapsed_items.is_empty() && is_collapsed(f, &fi.label(it)))
+            .map_or(cp.len(), |d| d + 1);
+        if !col_leaves.contains(&cp[..shown]) {
+            col_leaves.insert(cp[..shown].to_vec());
+        }
         row_set.insert(rp);
         col_set.insert(cp);
+        // Refuse a report that cannot fit before the accumulators for more column groups are allocated.
+        if !cols.is_empty() && data_cols_exceed_sheet(col_leaves.len(), pt.grand_totals_rows, k) {
+            return Err("The PivotTable report will not fit on the sheet.".into());
+        }
         if aggs.len() > 5_000_000 {
             return Err("The PivotTable report is too large.".into());
         }
@@ -806,24 +955,32 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
     collect_siblings(&row_tree, &mut Vec::new(), &mut siblings);
     let level0: Vec<u32> = row_tree.iter().map(|n| n.item).collect();
 
-    let ctx = Ctx { pt, rows: row_fields.clone(), row_items, row_fmts: row_fmts.clone() };
+    let val_names: Vec<String> = vals.iter().map(|(_, v)| v.name.clone()).collect();
+    let ctx = Ctx { pt, rows: row_fields.clone(), row_items, row_fmts: row_fmts.clone(), vpos, val_names: val_names.clone() };
     let mut lines: Vec<Line> = Vec::new();
-    if rows.is_empty() {
-        lines.push(Line { kind: LineKind::Item(false), leaf: true, path: vec![], values: true, labels: vec![] });
+    if row_levels == 0 {
+        lines.push(Line { kind: LineKind::Item(false), leaf: true, path: vec![], values: true, labels: vec![], vi: None });
     } else {
         if pt.layout == PivotLayout::Tabular {
-            ctx.flatten_tabular(&row_tree, 0, &mut Vec::new(), &[], &mut lines);
+            ctx.flatten_tabular(&row_tree, 0, None, &mut Vec::new(), &[], &mut lines);
         } else {
-            ctx.flatten(&row_tree, 0, &mut Vec::new(), &mut lines);
+            ctx.flatten(&row_tree, 0, None, &mut Vec::new(), &mut lines);
         }
-        if pt.grand_totals_cols {
-            lines.push(Line {
+        // With only Σ Values in Rows its items are the totals already.
+        if pt.grand_totals_cols && !rows.is_empty() {
+            let grand = |text: String, vi: Option<usize>| Line {
                 kind: LineKind::Grand,
                 leaf: false,
                 path: vec![],
                 values: true,
-                labels: vec![(0, Value::text("Grand Total"), 0, None)],
-            });
+                labels: vec![(0, Value::text(text), 0, None)],
+                vi,
+            };
+            if on_rows {
+                lines.extend(val_names.iter().enumerate().map(|(vi, name)| grand(format!("Total {name}"), Some(vi))));
+            } else {
+                lines.push(grand("Grand Total".into(), None));
+            }
         }
     }
     let mut specs: Vec<ColSpec> = Vec::new();
@@ -837,7 +994,10 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
     }
     let mut data_cols: Vec<(usize, Option<usize>)> = Vec::new();
     for (si, _) in specs.iter().enumerate() {
-        if k == 0 {
+        if on_rows {
+            // Each line names its value field; one data column per column item.
+            data_cols.push((si, None));
+        } else if k == 0 {
             if !cols.is_empty() {
                 data_cols.push((si, None));
             }
@@ -852,12 +1012,12 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
     }
 
     let compact = pt.layout == PivotLayout::Compact;
-    let l = if rows.is_empty() && cols.is_empty() {
+    let l = if row_levels == 0 && cols.is_empty() {
         0
     } else if compact {
         1
     } else {
-        rows.len().max(1)
+        row_levels.max(1)
     };
     let mut width = l + data_cols.len();
     if !shown_filters.is_empty() {
@@ -903,14 +1063,19 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
     let val_name = |vi: usize| vals.get(vi).map(|(_, v)| v.name.clone()).unwrap_or_default();
     let headers_on = pt.show_headers;
     let row_header = |g: &mut Grid, r: usize| {
-        if rows.is_empty() || !headers_on {
+        if row_levels == 0 || !headers_on {
             return;
         }
         if compact {
             g.set(r, 0, Value::text("Row Labels"), CellKind::Header, 0, None);
         } else {
-            for (i, f) in row_fields.iter().enumerate() {
-                g.set(r, i, Value::text(f.source_col.as_str()), CellKind::Header, 0, None);
+            // One column per row field, Σ Values ("Values") at its place.
+            let mut names: Vec<&str> = row_fields.iter().map(|f| f.source_col.as_str()).collect();
+            if let Some(p) = vpos {
+                names.insert(p.min(names.len()), "Values");
+            }
+            for (i, name) in names.into_iter().enumerate() {
+                g.set(r, i, Value::text(name), CellKind::Header, 0, None);
             }
         }
     };
@@ -920,8 +1085,11 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
         let r = g.push_row(RowKind::Header)?;
         row_header(&mut g, r);
         for (j, (_, vi)) in data_cols.iter().enumerate() {
-            if let Some(vi) = vi {
-                g.set(r, l + j, Value::text(val_name(*vi)), CellKind::Header, 0, None);
+            match vi {
+                Some(vi) => g.set(r, l + j, Value::text(val_name(*vi)), CellKind::Header, 0, None),
+                // Values on rows, no column field: the one data column is the grand total.
+                None if on_rows => g.set(r, l + j, Value::text("Total"), CellKind::Header, 0, None),
+                None => {}
             }
         }
     } else {
@@ -933,7 +1101,7 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
             let caption = if compact { "Column Labels".to_string() } else { col_fields.first().map(|f| f.source_col.clone()).unwrap_or_default() };
             g.set(cap, l, Value::text(caption), CellKind::Header, 0, None);
         }
-        let levels = cols.len() + usize::from(k > 1);
+        let levels = cols.len() + usize::from(k > 1 && !on_rows);
         let first_level = g.rows.len();
         for _ in 0..levels {
             g.push_row(RowKind::Header)?;
@@ -1048,17 +1216,19 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
                 && (k > 1 || parts.is_empty())
             {
                 parts.push(val_name(*vi));
+            } else if parts.is_empty() {
+                parts.push("Total".into());
             }
             Some(((l + j) as u32, parts.join(" - ")))
         })
         .filter(|_| k > 0)
         .collect();
-    let label_col = if rows.is_empty() {
+    let label_col = if row_levels == 0 {
         None
     } else if compact {
         Some(0)
     } else {
-        Some(rows.len().saturating_sub(1) as u32)
+        Some(row_levels.saturating_sub(1) as u32)
     };
     for line in &lines {
         let rk = match line.kind {
@@ -1082,8 +1252,9 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
             continue;
         }
         let rp = line.path.as_slice();
-        for (j, (si, vi)) in data_cols.iter().enumerate() {
-            let (Some(spec), Some(vi)) = (specs.get(*si), vi) else { continue };
+        for (j, (si, col_vi)) in data_cols.iter().enumerate() {
+            let line_vi = col_vi.or(line.vi);
+            let (Some(spec), Some(vi)) = (specs.get(*si), &line_vi) else { continue };
             let Some((_, vdef)) = vals.get(*vi) else { continue };
             let cp = spec.path.as_slice();
             let Some(raw) = get(rp, cp, *vi) else { continue };
@@ -1426,5 +1597,19 @@ pub fn clear_output(wb: &mut Workbook, sheet: usize, idx: usize) {
     shm.take_cells(r);
     if let Some(p) = shm.pivots.get_mut(idx) {
         p.last_range = None;
+    }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::data_cols_exceed_sheet;
+
+    #[test]
+    fn column_budget_counts_value_fields_and_grand_total() {
+        assert!(!data_cols_exceed_sheet(64, true, 128));
+        assert!(data_cols_exceed_sheet(64, true, 256));
+        assert!(!data_cols_exceed_sheet(64, false, 256));
+        assert!(!data_cols_exceed_sheet(16_384, false, 0));
+        assert!(data_cols_exceed_sheet(16_385, false, 0));
     }
 }

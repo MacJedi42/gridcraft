@@ -3,10 +3,11 @@
 //! On read, the raw bytes of unmodelled parts are kept with their content type and their
 //! relationship graph, per owner: the package root (custom document properties, ribbon
 //! customisation, add-in task panes), the workbook (custom XML, links to external workbooks with
-//! their `<externalReferences>`, data connections) and each sheet (query tables, form controls,
-//! ActiveX controls, OLE objects, the sheet background and printer settings, with the sheet's
-//! `<picture>`, `<oleObjects>` and `<controls>` XML, the `r:id` of `<pageSetup>` and the legacy
-//! VML shapes those controls need).
+//! their `<externalReferences>`, data connections, XML maps) and each sheet (query tables, cells
+//! mapped to XML elements, form controls, ActiveX controls, OLE objects, the sheet background and
+//! printer settings, with the sheet's `<picture>`, `<oleObjects>` and `<controls>` XML, the `r:id`
+//! of `<pageSetup>` and the legacy VML shapes those controls need). The workbook also keeps its
+//! `<fileVersion>` and the calcFeatures extension, which Excel needs to trust the saved values.
 //!
 //! On write, kept parts get fresh part names where needed and new relationship ids; the `r:id`s in
 //! kept XML are rewritten to match. Kept content is conservative:
@@ -14,19 +15,21 @@
 //!   drawings, charts, tables, PivotTables, comments, slicers…) is not kept: it would point at
 //!   content that no longer exists in the same form.
 //! - External relationship targets (the path of a linked workbook) are kept as text and never
-//!   opened, followed or refreshed.
+//!   opened, followed or refreshed. A relative path to a linked workbook is rewritten when the
+//!   workbook is saved into another folder ([`rebase_links`]), so it still names the same file.
 //! - Sheet content lives on the sheet: deleting the sheet drops it, Copy Sheet doesn't copy it.
-//!   Cell references inside kept parts (a control's linked cell, a query table's range) are kept
-//!   as they were, not adjusted to inserted or deleted rows.
+//!   Cell references inside kept parts (a control's linked cell, a query table's range, a cell
+//!   mapped to an XML element) are kept as they were, not adjusted to inserted or deleted rows.
 //! - Strict Open XML files are not passed through (their namespaces differ from what we write).
 //! - Sizes are bounded: per part and per workbook.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
+use std::path::{Component, Path};
 use std::sync::Arc;
 
-use gridcraft_model::{Preserved, PreservedPart, PreservedRel, PreservedXml, Sheet, Workbook};
+use gridcraft_model::{Preserved, PreservedPart, PreservedRel, PreservedSheet, PreservedXml, Sheet, Visibility, Workbook};
 use quick_xml::events::attributes::Attribute;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::QName;
@@ -78,11 +81,16 @@ const CT_VML: &str = "application/vnd.openxmlformats-officedocument.vmlDrawing";
 /// Relationship kinds (last segment of the type) kept from the package root.
 const PACKAGE_ROOTS: &[&str] = &["custom-properties", "extensibility", "webextensiontaskpanes"];
 /// Relationship kinds kept from the workbook without a workbook element.
-const WORKBOOK_ROOTS: &[&str] = &["customXml", "connections"];
+const WORKBOOK_ROOTS: &[&str] = &["customXml", "connections", "xmlMaps"];
 /// Relationship kinds kept from a sheet without a sheet element.
-const SHEET_ROOTS: &[&str] = &["queryTable"];
+const SHEET_ROOTS: &[&str] = &["queryTable", "tableSingleCells"];
 /// Sheet relationship kinds that mean the sheet XML may hold elements worth keeping.
 const SHEET_ELEMENT_KINDS: &[&str] = &["oleObject", "ctrlProp", "control", "image", "package", "printerSettings"];
+/// Attributes of `<fileVersion>` (CT_FileVersion).
+const FILE_VERSION_ATTRS: &[&str] = &["appName", "lastEdited", "lowestEdited", "rupBuild", "codeName"];
+/// The workbook extension listing the calculation features the saved values were computed with.
+const CALC_FEATURES_URI: &str = "{B58B0392-4F1F-4190-BB64-5DF3571DCE5F}";
+const NS_CALC_FEATURES: &str = "http://schemas.microsoft.com/office/spreadsheetml/2018/calcfeatures";
 /// Kept sheet elements, in schema order (all after `<legacyDrawing>`, before `<tableParts>`).
 const SHEET_SLOTS: &[&str] = &["picture", "oleObjects", "controls"];
 
@@ -131,6 +139,10 @@ const REWRITTEN: &[&str] = &[
     "powerpivotdata",
 ];
 
+/// Relationship kinds a chart sheet reaches that are otherwise rewritten: its drawing, chart and
+/// their style, colour and shape parts are kept byte for byte (the chart sheet is not modelled).
+const CHART_SHEET_GRAPH: &[&str] = &["chartsheet", "drawing", "chart", "chartex", "chartstyle", "chartcolorstyle", "chartusershapes"];
+
 /// Part-name prefixes (lower case) GridCraft's writer never produces: kept parts there keep their
 /// original names. Anything else is renamed so it can't collide with written parts.
 const OWN_DIRS: &[&str] = &[
@@ -139,6 +151,7 @@ const OWN_DIRS: &[&str] = &[
     "customui/",
     "xl/externallinks/",
     "xl/connections.xml",
+    "xl/xmlmaps.xml",
     "xl/querytables/",
     "xl/ctrlprops/",
     "xl/embeddings/",
@@ -194,6 +207,21 @@ fn raw_rels(cx: &mut Ctx<'_>, part: &str) -> Result<Vec<PreservedRel>, String> {
 }
 
 // ---------------------------------------------------------------- reading
+
+/// The `<sheet>` entries of the workbook that are chart sheets, each with the number of worksheets
+/// (model sheets) before it.
+fn chart_sheet_entries<'a>(wb_xml: &'a xml::El, wb_rels: &[PreservedRel], file_to_model: &[Option<usize>]) -> Vec<(usize, &'a xml::El)> {
+    let mut out = vec![];
+    let mut worksheets = 0usize;
+    for (i, se) in wb_xml.child("sheets").into_iter().flat_map(|s| s.kids("sheet")).enumerate() {
+        if file_to_model.get(i).copied().flatten().is_some() {
+            worksheets += 1;
+        } else if se.attr("id").and_then(|id| wb_rels.iter().find(|r| r.id == id)).is_some_and(|r| is_kind(r, &["chartsheet"])) {
+            out.push((worksheets, se));
+        }
+    }
+    out
+}
 
 /// Collects kept content while a package is read.
 pub struct KeptReader {
@@ -251,11 +279,12 @@ impl KeptReader {
 
     /// The parts reachable from `root` that aren't in `seen` yet. Fails (and keeps nothing) when the
     /// graph reaches rewritten content, a missing or damaged part, or a size limit.
-    fn closure(&mut self, cx: &mut Ctx<'_>, root: &PreservedRel, seen: &HashSet<String>) -> Result<Vec<PreservedPart>, String> {
+    fn closure(&mut self, cx: &mut Ctx<'_>, root: &PreservedRel, seen: &HashSet<String>, through: &[&str]) -> Result<Vec<PreservedPart>, String> {
         if root.external {
             return Ok(vec![]);
         }
-        if rewritten(root) {
+        let blocked = |r: &PreservedRel| rewritten(r) && !through.iter().any(|k| k.eq_ignore_ascii_case(kind(&r.rel_type)));
+        if blocked(root) {
             return Err(format!("it refers to {}", kind(&root.rel_type)));
         }
         let mut parts = vec![];
@@ -285,7 +314,7 @@ impl KeptReader {
             }
             let rels = raw_rels(cx, &name)?;
             for r in rels.iter().filter(|r| !r.external) {
-                if rewritten(r) {
+                if blocked(r) {
                     return Err(format!("it refers to {}", kind(&r.rel_type)));
                 }
                 queue.push_back((r.target.clone(), depth + 1));
@@ -299,10 +328,22 @@ impl KeptReader {
 
     /// Keeps a set of relationships (all or nothing) and the parts behind them.
     fn keep(&mut self, cx: &mut Ctx<'_>, p: &mut Preserved, roots: &[PreservedRel], seen: &mut HashSet<String>) -> Result<(), String> {
+        self.keep_through(cx, p, roots, seen, &[])
+    }
+
+    /// [`Self::keep`] for roots whose graph may reach the rewritten kinds in `through`.
+    fn keep_through(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        p: &mut Preserved,
+        roots: &[PreservedRel],
+        seen: &mut HashSet<String>,
+        through: &[&str],
+    ) -> Result<(), String> {
         let mut new_parts: Vec<PreservedPart> = vec![];
         let mut scratch = seen.clone();
         for r in roots {
-            let parts = self.closure(cx, r, &scratch)?;
+            let parts = self.closure(cx, r, &scratch, through)?;
             scratch.extend(parts.iter().map(|q| normalize(&q.name)));
             new_parts.extend(parts);
         }
@@ -317,8 +358,12 @@ impl KeptReader {
     }
 
     /// Package-root and workbook-level content.
-    pub fn workbook(&mut self, cx: &mut Ctx<'_>, wb_part: &str, wb_xml: &xml::El) -> Option<Arc<Preserved>> {
+    pub fn workbook(&mut self, cx: &mut Ctx<'_>, wb_part: &str, wb_xml: &xml::El, file_to_model: &[Option<usize>]) -> Option<Arc<Preserved>> {
         if !self.on {
+            let wb_rels = raw_rels(cx, wb_part).unwrap_or_default();
+            for (_, se) in chart_sheet_entries(wb_xml, &wb_rels, file_to_model) {
+                cx.warn(format!("chart sheet \"{}\" was skipped and is not kept on save", se.attr("name").unwrap_or("")));
+            }
             if self.strict {
                 cx.warn("unmodelled content of a Strict Open XML workbook (custom XML, links, controls…) is not kept on save");
             }
@@ -345,6 +390,25 @@ impl KeptReader {
                 cx.warn(format!("{} part {} was dropped: {why}", kind(&r.rel_type), r.target));
             }
         }
+        // Chart sheets: the sheet entry (name, state, position) plus the chart sheet part and the
+        // drawing, chart, style and colour parts behind it.
+        for (worksheets, se) in chart_sheet_entries(wb_xml, &wb_rels, file_to_model) {
+            let name = se.attr("name").unwrap_or("").to_string();
+            let Some(r) = se.attr("id").and_then(|id| wb_rels.iter().find(|r| r.id == id)) else { continue };
+            match self.keep_through(cx, &mut p, std::slice::from_ref(r), &mut seen, CHART_SHEET_GRAPH) {
+                Ok(()) => p.sheets.push(PreservedSheet {
+                    name,
+                    visibility: match se.attr("state") {
+                        Some("hidden") => Visibility::Hidden,
+                        Some("veryHidden") => Visibility::VeryHidden,
+                        _ => Visibility::Visible,
+                    },
+                    rel_id: r.id.clone(),
+                    before: worksheets,
+                }),
+                Err(why) => cx.warn(format!("chart sheet \"{name}\" was dropped: {why}")),
+            }
+        }
         // Links to external workbooks: `[1]` in formulas is the position in <externalReferences>,
         // so they are kept all together or not at all.
         let ids: Vec<&str> =
@@ -368,6 +432,30 @@ impl KeptReader {
                 }
                 Err(why) => cx.warn(format!("links to external workbooks were dropped: {why}")),
             }
+        }
+        // Excel trusts the saved cell values only when both are present; without them it
+        // recalculates everything on open, and links into closed workbooks come back as errors.
+        if let Some(v) = wb_xml.child("fileVersion") {
+            let mut x = String::from("<fileVersion");
+            for k in FILE_VERSION_ATTRS {
+                if let Some(a) = v.attr(k) {
+                    let _ = write!(x, " {k}=\"{}\"", esc_attr(a));
+                }
+            }
+            x.push_str("/>");
+            p.elements.push(PreservedXml { slot: "fileVersion".into(), xml: x });
+        }
+        let calc_features = wb_xml
+            .child("extLst")
+            .and_then(|l| l.kids("ext").find(|e| e.attr("uri").is_some_and(|u| u.eq_ignore_ascii_case(CALC_FEATURES_URI))))
+            .and_then(|e| e.child("calcFeatures"));
+        if let Some(c) = calc_features {
+            let mut x = format!("<ext uri=\"{CALC_FEATURES_URI}\" xmlns:xcalcf=\"{NS_CALC_FEATURES}\"><xcalcf:calcFeatures>");
+            for name in c.kids("feature").filter_map(|f| f.attr("name")) {
+                let _ = write!(x, "<xcalcf:feature name=\"{}\"/>", esc_attr(name));
+            }
+            x.push_str("</xcalcf:calcFeatures></ext>");
+            p.elements.push(PreservedXml { slot: "ext".into(), xml: x });
         }
         (!p.is_empty()).then(|| Arc::new(p))
     }
@@ -839,18 +927,171 @@ fn remap(x: &str, ids: &HashMap<String, String>) -> Option<String> {
     map_rel_ids(x, &mut |id| ids.get(id).cloned())
 }
 
-/// Writes the workbook's kept parts and relationships; returns the workbook XML elements that
-/// go right after `<sheets>` (`<externalReferences>`).
-pub fn write_workbook(wb: &Workbook, wb_rels: &mut Rels, out: &mut Out) -> String {
-    let Some(p) = wb.preserved.as_deref() else { return String::new() };
-    let names = write_parts(out, &p.parts);
-    let ids = attach(wb_rels, &p.rels, &names);
+/// A kept chart sheet being written: its `<sheet>` entry's fields and its new relationship id.
+pub struct KeptSheet {
+    before: usize,
+    name: String,
+    visibility: Visibility,
+    rid: String,
+}
+
+/// The workbook's kept content as written.
+#[derive(Default)]
+pub struct WorkbookKept {
+    /// Workbook XML elements that go right after `<sheets>` (`<externalReferences>`).
+    pub elements: String,
+    sheets: Vec<KeptSheet>,
+}
+
+impl WorkbookKept {
+    /// Where the model's sheet `i` is in the file's sheet list: chart sheets come between worksheets.
+    pub fn file_index(&self, i: usize) -> usize {
+        i + self.sheets.iter().filter(|s| s.before <= i).count()
+    }
+
+    /// The `<sheet>` entries of the chart sheets that go right before the model's sheet `i`
+    /// (`i` = the number of sheets for those that come last); `id` numbers them from `first_id`.
+    pub fn sheet_entries(&self, i: usize, last: bool, mut id: usize) -> (String, usize) {
+        let mut x = String::new();
+        for s in self.sheets.iter().filter(|s| if last { s.before >= i } else { s.before == i }) {
+            let state = match s.visibility {
+                Visibility::Visible => "",
+                Visibility::Hidden => " state=\"hidden\"",
+                Visibility::VeryHidden => " state=\"veryHidden\"",
+            };
+            let name: String = s.name.chars().take(31).collect();
+            let _ = write!(x, "<sheet name=\"{}\" sheetId=\"{id}\"{state} r:id=\"{}\"/>", esc_attr(&name), esc_attr(&s.rid));
+            id += 1;
+        }
+        (x, id)
+    }
+}
+
+/// The part names reachable from `root` through kept parts' relationships (normalized).
+fn reachable(p: &Preserved, root: &PreservedRel) -> HashSet<String> {
+    let by_name: HashMap<String, &PreservedPart> = p.parts.iter().map(|q| (normalize(&q.name), q)).collect();
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::from([normalize(&root.target)]);
+    while let Some(n) = queue.pop_front() {
+        if !seen.insert(n.clone()) {
+            continue;
+        }
+        if let Some(q) = by_name.get(&n) {
+            queue.extend(q.rels.iter().filter(|r| !r.external).map(|r| normalize(&r.target)));
+        }
+    }
+    seen
+}
+
+/// Every formula (`<c:f>`) of a chart part, depth first.
+fn chart_formulas(el: &xml::El, out: &mut Vec<String>) {
+    if el.name == "f" && !el.text.trim().is_empty() {
+        out.push(el.text.trim().to_string());
+    }
+    for c in &el.children {
+        chart_formulas(c, out);
+    }
+}
+
+/// The sheet names a formula such as `'My Sheet'!$A$1:$A$9,Data!$B$1` refers to. References to
+/// other workbooks (`[1]Sheet!A1`) are not sheets of this one and are left out.
+pub(crate) fn sheet_names_in(formula: &str) -> Vec<String> {
+    let mut names = vec![];
+    let chars: Vec<char> = formula.chars().collect();
+    let at = |i: usize| chars.get(i).copied();
+    let mut i = 0;
+    while let Some(c) = at(i) {
+        let mut name = String::new();
+        let start = i;
+        if c == '\'' {
+            i += 1;
+            while let Some(c) = at(i) {
+                if c == '\'' {
+                    if at(i + 1) == Some('\'') {
+                        name.push('\'');
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                name.push(c);
+                i += 1;
+            }
+            i += 1;
+        } else {
+            while let Some(c) = at(i).filter(|c| !matches!(c, '!' | ',' | '(' | ')' | '\'' | ' ')) {
+                name.push(c);
+                i += 1;
+            }
+        }
+        if at(i) == Some('!') {
+            if !name.is_empty() && !name.starts_with('[') {
+                names.push(name);
+            }
+            i += 1;
+        } else if i == start {
+            i += 1;
+        }
+    }
+    names
+}
+
+/// Whether a kept chart sheet can be written back: its chart's series must still refer to sheets
+/// that exist under the same names (the chart is kept as it was, so a series on a deleted or
+/// renamed sheet would be left pointing at nothing), and no worksheet may have taken its name.
+fn chart_sheet_usable(wb: &Workbook, p: &Preserved, s: &PreservedSheet) -> bool {
+    let same = |a: &str, b: &str| a.chars().take(31).collect::<String>().eq_ignore_ascii_case(&b.chars().take(31).collect::<String>());
+    if wb.sheets.iter().any(|w| same(&w.name, &s.name)) {
+        return false;
+    }
+    let Some(root) = p.rels.iter().find(|r| r.id == s.rel_id) else { return false };
+    let parts = reachable(p, root);
+    let mut formulas = vec![];
+    for q in p.parts.iter().filter(|q| parts.contains(&normalize(&q.name)) && q.content_type.contains("chart")) {
+        if let Ok(x) = xml::parse(&q.data) {
+            chart_formulas(&x, &mut formulas);
+        }
+    }
+    formulas.iter().flat_map(|f| sheet_names_in(f)).all(|n| wb.sheets.iter().any(|w| same(&w.name, &n)))
+}
+
+/// Writes the workbook's kept parts and relationships. Chart sheets that can't be written back
+/// (see [`chart_sheet_usable`]) are left out with the parts only they reach.
+pub fn write_workbook(wb: &Workbook, wb_rels: &mut Rels, out: &mut Out) -> WorkbookKept {
+    let Some(p) = wb.preserved.as_deref() else { return WorkbookKept::default() };
+    let (live, dropped): (Vec<&PreservedSheet>, Vec<&PreservedSheet>) = p.sheets.iter().partition(|s| chart_sheet_usable(wb, p, s));
+    let root_of = |s: &PreservedSheet| p.rels.iter().find(|r| r.id == s.rel_id);
+    let dropped_ids: HashSet<&str> = dropped.iter().map(|s| s.rel_id.as_str()).collect();
+    // Parts reached only by dropped chart sheets go with them.
+    let mut gone: HashSet<String> = dropped.iter().filter_map(|s| root_of(s)).flat_map(|r| reachable(p, r)).collect();
+    if !gone.is_empty() {
+        let others = p.rels.iter().filter(|r| !dropped_ids.contains(r.id.as_str())).flat_map(|r| reachable(p, r));
+        for n in others {
+            gone.remove(&n);
+        }
+    }
+    let parts: Vec<PreservedPart> = p.parts.iter().filter(|q| !gone.contains(&normalize(&q.name))).cloned().collect();
+    let rels: Vec<PreservedRel> = p.rels.iter().filter(|r| !dropped_ids.contains(r.id.as_str())).cloned().collect();
+    let names = write_parts(out, &parts);
+    let ids = attach(wb_rels, &rels, &names);
     for r in &p.package_rels {
         if let Some(target) = rel_target(r, &names) {
             out.kept.root.push((r.rel_type.clone(), target, r.external));
         }
     }
-    p.elements.iter().filter(|e| e.slot == "externalReferences").filter_map(|e| remap(&e.xml, &ids)).collect()
+    WorkbookKept {
+        elements: p.elements.iter().filter(|e| e.slot == "externalReferences").filter_map(|e| remap(&e.xml, &ids)).collect(),
+        sheets: live
+            .iter()
+            .filter_map(|s| Some(KeptSheet { before: s.before, name: s.name.clone(), visibility: s.visibility, rid: ids.get(&s.rel_id)?.clone() }))
+            .collect(),
+    }
+}
+
+/// The workbook's kept elements of `slot` that refer to no part (`fileVersion`, `ext`).
+pub fn workbook_elements(wb: &Workbook, slot: &str) -> String {
+    let Some(p) = wb.preserved.as_deref() else { return String::new() };
+    p.elements.iter().filter(|e| e.slot == slot).map(|e| e.xml.as_str()).collect()
 }
 
 /// Adds the kept package-root relationships (custom properties…) to `_rels/.rels`.
@@ -921,4 +1162,137 @@ impl<'a> SheetKept<'a> {
         }
         s
     }
+}
+
+// ---------------------------------------------------------------- linked workbooks
+
+/// `wb` as it is saved into the folder `to` (absolute): the relative paths of its linked
+/// workbooks, relative to the folder it was read from, are rewritten relative to `to`, as Excel
+/// does on Save As, or made absolute when no relative path exists (another drive). `None` when
+/// nothing changes.
+pub fn rebase_links(wb: &Workbook, to: &Path) -> Option<Workbook> {
+    let p = wb.preserved.as_deref()?;
+    let from = Folder::of(wb.source_dir.as_deref()?)?;
+    let to = Folder::of(to)?;
+    if from == to {
+        return None;
+    }
+    let mut parts = p.parts.clone();
+    let mut changed = false;
+    for r in parts.iter_mut().flat_map(|part| part.rels.iter_mut()) {
+        if r.external
+            && is_kind(r, &["externalLinkPath"])
+            && let Some(target) = rebase(&r.target, &from, &to)
+        {
+            r.target = target;
+            changed = true;
+        }
+    }
+    if !changed {
+        return None;
+    }
+    let mut out = wb.clone();
+    out.preserved = Some(Arc::new(Preserved { parts, ..p.clone() }));
+    Some(out)
+}
+
+/// An absolute folder, lexically normalized.
+#[derive(PartialEq)]
+struct Folder {
+    /// Drive or share and root separator (`/`, `C:\`, `\\server\share\`).
+    root: String,
+    names: Vec<String>,
+}
+
+impl Folder {
+    fn of(dir: &Path) -> Option<Folder> {
+        if !dir.is_absolute() {
+            return None;
+        }
+        let mut f = Folder { root: String::new(), names: vec![] };
+        for c in dir.components() {
+            match c {
+                Component::Prefix(_) | Component::RootDir => f.root.push_str(&c.as_os_str().to_string_lossy()),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    f.names.pop();
+                }
+                Component::Normal(n) => f.names.push(n.to_string_lossy().into_owned()),
+            }
+        }
+        Some(f)
+    }
+}
+
+/// A relative link target read from `from`, rewritten for `to`. `None` keeps it as it is: an
+/// absolute path or URL, or a path that climbs above the root.
+fn rebase(target: &str, from: &Folder, to: &Folder) -> Option<String> {
+    if !is_relative_path(target) {
+        return None;
+    }
+    // Each name as the file system knows it, and as it is written in a target. Names taken from
+    // the original target keep their spelling.
+    let mut path: Vec<(String, String)> = from.names.iter().map(|n| (n.clone(), encode_name(n))).collect();
+    for seg in target.split(['/', '\\']) {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                path.pop()?;
+            }
+            _ => path.push((decode_name(seg), seg.to_string())),
+        }
+    }
+    let folders = path.len().checked_sub(1)?;
+    if !from.root.eq_ignore_ascii_case(&to.root) {
+        let sep = if from.root.contains('\\') { "\\" } else { "/" };
+        let names: Vec<&str> = path.iter().map(|(name, _)| name.as_str()).collect();
+        return Some(format!("file:///{}{}", from.root, names.join(sep)));
+    }
+    let common = to.names.iter().zip(&path).take(folders).take_while(|(a, (b, _))| *a == b).count();
+    let up = "../".repeat(to.names.len().saturating_sub(common));
+    let down: Vec<&str> = path.iter().skip(common).map(|(_, written)| written.as_str()).collect();
+    Some(format!("{up}{}", down.join("/")))
+}
+
+/// Not empty, no root, no scheme or drive (`file:`, `http:`, `C:`).
+fn is_relative_path(target: &str) -> bool {
+    let scheme = target.split_once(':').is_some_and(|(s, _)| {
+        s.starts_with(|c: char| c.is_ascii_alphabetic()) && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    });
+    !target.is_empty() && !target.starts_with(['/', '\\']) && !scheme
+}
+
+/// A folder name as a segment of a relationship target (a URI): ASCII characters a URI path
+/// can't hold are percent-encoded, other characters are written as they are.
+fn encode_name(name: &str) -> String {
+    let mut s = String::with_capacity(name.len());
+    for c in name.chars() {
+        if !c.is_ascii() || c.is_ascii_alphanumeric() || "-._~!$&'()+,;=@".contains(c) {
+            s.push(c);
+        } else {
+            let _ = write!(s, "%{:02X}", c as u32);
+        }
+    }
+    s
+}
+
+/// A target segment with its percent-escapes decoded; as written when they don't decode to UTF-8.
+fn decode_name(seg: &str) -> String {
+    let b = seg.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while let Some(&c) = b.get(i) {
+        let hex = b.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok());
+        match hex {
+            Some(byte) if c == b'%' => {
+                out.push(byte);
+                i += 3;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| seg.to_string())
 }

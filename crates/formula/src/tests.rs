@@ -6,6 +6,29 @@ fn rt(src: &str) -> String {
 }
 
 #[test]
+fn quoted_sheet_qualified_name_keeps_quotes() {
+    assert_eq!(rt("'My Sheet'!Total"), "'My Sheet'!Total");
+    assert_eq!(rt("'Data'!Total"), "Data!Total");
+    assert_eq!(rt("'It''s'!Total+1"), "'It''s'!Total+1");
+}
+
+#[test]
+fn intersection_with_deleted_operand_reparses() {
+    // Deleting the columns of an intersection operand prints `A1:B2 #REF!`; that text must parse back.
+    assert_eq!(rt("A1:B2 #REF!"), "A1:B2 #REF!");
+    assert_eq!(rt("#REF! A1:B2"), "#REF! A1:B2");
+    assert_eq!(parse("A1:B2 #REF!"), parse("A1:B2 (#REF!)").map(|e| strip_paren(&e)));
+}
+
+fn strip_paren(e: &Expr) -> Expr {
+    match e {
+        Expr::Binary(op, a, b) => Expr::Binary(*op, Box::new(strip_paren(a)), Box::new(strip_paren(b))),
+        Expr::Paren(x) => strip_paren(x),
+        other => other.clone(),
+    }
+}
+
+#[test]
 fn roundtrips() {
     for f in [
         "1+2*3",
@@ -48,6 +71,8 @@ fn normalises() {
     assert_eq!(rt("=sum(a1:b2)"), "SUM(A1:B2)");
     assert_eq!(rt("= 1 + 2"), "1+2");
     assert_eq!(rt("_xlfn.XLOOKUP(1,A:A,B:B)"), "XLOOKUP(1,A:A,B:B)");
+    assert_eq!(rt("_xlfn.GROUPBY(A1:A3,B1:B3,_xleta.SUM)"), "GROUPBY(A1:A3,B1:B3,SUM)");
+    assert_eq!(rt("_XLUDF.concat(\"a\",\"b\")"), "_xludf.CONCAT(\"a\",\"b\")");
     assert_eq!(rt("true"), "TRUE");
     assert_eq!(rt("'Sheet1'!A1"), "Sheet1!A1");
 }
@@ -183,6 +208,10 @@ fn rename_sheet_updates_qualified_names() {
     assert_eq!(print(&rename_sheet(e, "data", "Numbers")), "Numbers!MyName+MyName+Other!MyName");
     let e = parse("Data!MyName").unwrap();
     assert_eq!(print(&rename_sheet(e, "Data", "New Name")), "'New Name'!MyName");
+    // Stored bare, like a parsed name, so the evaluator finds the sheet and a second rename still matches.
+    let e = rename_sheet(parse("Data!MyName").unwrap(), "Data", "It's");
+    assert_eq!(e, Expr::Name("It's!MyName".into()));
+    assert_eq!(print(&rename_sheet(e, "It's", "Totals")), "Totals!MyName");
 }
 
 #[test]
@@ -249,6 +278,20 @@ fn unbracketed_this_row_column() {
 }
 
 #[test]
+fn struct_column_keeps_edge_spaces() {
+    // The spaces are part of the column name: `Table1[Qty ]` names `Qty `, never `Qty`.
+    let Expr::Struct(s) = parse("Table1[Qty ]").unwrap() else { panic!() };
+    assert_eq!(s.col_start.as_deref(), Some("Qty "));
+    let Expr::Struct(s) = parse("Table1[ Qty]").unwrap() else { panic!() };
+    assert_eq!(s.col_start.as_deref(), Some(" Qty"));
+    // Excel writes such a column in the double-bracket form.
+    assert_eq!(rt("Table1[Qty ]"), "Table1[[Qty ]]");
+    for f in ["Table1[[Qty ]]", "Table1[[ Sum for Q2 ]]", "Table1[[#Totals],[Qty ]]", "Table1[@[Qty ]]", "Table1[Unit Price]"] {
+        assert_eq!(rt(f), f);
+    }
+}
+
+#[test]
 fn trim_references() {
     for f in [
         "SUM(A1:.E10)",
@@ -300,4 +343,26 @@ fn trim_references_adjust() {
     assert_eq!(print(&shift_relative(parse("SUM(A1.:.B2)").unwrap(), 1, 1)), "SUM(B2.:.C3)");
     let refs: Vec<String> = parse("SUM(Sheet2!A1:.B5)").unwrap().references().iter().map(|r| printer::reference_a1(r)).collect();
     assert_eq!(refs, ["Sheet2!A1:B5"]);
+}
+
+#[test]
+fn prints_long_flat_chain_without_deep_recursion() {
+    // Small stack: a recursive printer overflows long before 20000 levels.
+    let handle = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let mut e = Expr::Number(1.0);
+            for _ in 0..20000 {
+                e = Expr::Binary(BinOp::Add, Box::new(e), Box::new(Expr::Number(1.0)));
+            }
+            let text = print(&e);
+            let r1c1 = print_r1c1(&e, gridcraft_core::CellRef { row: 0, col: 0 });
+            // Dropping the deep tree recurses; leak it so only the printer is under test.
+            std::mem::forget(e);
+            (text, r1c1)
+        })
+        .expect("spawn");
+    let (text, r1c1) = handle.join().expect("printer must not overflow the stack");
+    assert_eq!(text, vec!["1"; 20001].join("+"));
+    assert_eq!(r1c1, text);
 }

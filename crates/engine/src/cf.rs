@@ -184,7 +184,7 @@ impl CfCache {
                 },
                 CfRule::TimePeriod { period, style } => match v.as_f64() {
                     Some(n) => {
-                        let today = gridcraft_calc::now_serial().floor();
+                        let today = gridcraft_core::date::serial_in_system(wb.date_system, gridcraft_calc::now_serial()).floor();
                         let d = n.floor();
                         let wd = gridcraft_core::date::datetime_from_serial(wb.date_system, today).map(|x| x.weekday as f64).unwrap_or(0.0);
                         let week_start = today - wd;

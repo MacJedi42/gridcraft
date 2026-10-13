@@ -251,9 +251,10 @@ pub fn column_completion(sheet: &gridcraft_engine::model::Sheet, at: CellRef, ty
         match sheet.value(CellRef::new(row, at.col)) {
             gridcraft_engine::core::Value::Empty => false,
             gridcraft_engine::core::Value::Text(t) => {
-                if t.to_lowercase().starts_with(&lower) && t.len() > typed.len() {
+                let folded = t.to_lowercase();
+                if folded.starts_with(&lower) && folded.len() > lower.len() {
                     match &found {
-                        Some(f) if !f.eq_ignore_ascii_case(&t) => ambiguous = true,
+                        Some(f) if f.to_lowercase() != folded => ambiguous = true,
                         None => found = Some(t.to_string()),
                         _ => {}
                     }
@@ -279,6 +280,13 @@ pub fn column_completion(sheet: &gridcraft_engine::model::Sheet, at: CellRef, ty
         n += 1;
     }
     if ambiguous { None } else { found }
+}
+
+/// The part of `full` after the `typed` prefix, counted in characters: case folding can change
+/// a character's byte length ("ß" is two bytes, "ẞ" three).
+pub fn completion_rest<'a>(full: &'a str, typed: &str) -> Option<&'a str> {
+    let start = full.char_indices().nth(typed.chars().count())?.0;
+    full.get(start..)
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@ use gridcraft_core::{CellRef, DateSystem, Value};
 use gridcraft_model::{Sheet, Workbook};
 
 use crate::csv::{decode_text, sniff_delimiter};
-use crate::{CsvOptions, Format, read_csv, sniff, write_csv};
+use crate::{CsvOptions, Format, IoError, read_csv, sniff, write_csv, write_csv_limited};
 
 fn v(wb: &Workbook, r: u32, c: u32) -> Value {
     wb.sheet(0).unwrap().value(CellRef::new(r, c))
@@ -109,11 +109,11 @@ fn writing() {
         Value::Error(e) => e.as_str().into(),
         Value::Array(_) => String::new(),
     };
-    let out = String::from_utf8(write_csv(sh, b',', raw)).unwrap();
+    let out = String::from_utf8(write_csv(sh, b',', raw).unwrap()).unwrap();
     assert_eq!(out, "\"a,b\",\"q\"\"t\",\r\n0.1,FALSE,\r\n#DIV/0!,,\"x\ny\"\r\n");
-    let semi = String::from_utf8(write_csv(sh, b';', raw)).unwrap();
+    let semi = String::from_utf8(write_csv(sh, b';', raw).unwrap()).unwrap();
     assert!(semi.starts_with("a,b;"));
-    assert!(write_csv(&Sheet::new("E"), b',', raw).is_empty());
+    assert!(write_csv(&Sheet::new("E"), b',', raw).unwrap().is_empty());
     // Round trip.
     let back = read_csv(out.as_bytes(), &CsvOptions::default()).unwrap();
     assert_eq!(v(&back, 0, 0), Value::text("a,b"));
@@ -141,4 +141,52 @@ fn hostile_csv() {
     let wide = ",".repeat(20_000);
     let wb = read_csv(format!("{wide}x").as_bytes(), &CsvOptions::default()).unwrap();
     assert!(wb.sheet(0).unwrap().cells.is_empty(), "fields past column XFD are dropped");
+}
+
+/// A sheet with `a` in A1 and `b` in `corner`.
+fn two_cells(corner: (u32, u32)) -> Sheet {
+    let mut s = Sheet::new("S");
+    s.set_value(CellRef::new(0, 0), Value::text("a"));
+    s.set_value(CellRef::new(corner.0, corner.1), Value::text("b"));
+    s
+}
+
+fn text_of(sh: &Sheet) -> impl FnMut(CellRef) -> String + '_ {
+    |c| match sh.value(c) {
+        Value::Text(t) => t.to_string(),
+        _ => String::new(),
+    }
+}
+
+#[test]
+fn two_far_apart_cells_are_refused_before_anything_is_allocated() {
+    // A1 and XFD1048576 span the whole grid: 16 GiB of commas. Refused at once, with the numbers.
+    let s = two_cells((gridcraft_core::MAX_ROWS - 1, gridcraft_core::MAX_COLS - 1));
+    let err = write_csv(&s, b',', text_of(&s)).unwrap_err();
+    assert!(matches!(err, IoError::TooLarge(_)), "{err}");
+    let msg = err.to_string();
+    assert!(msg.contains("1048576 rows by 16384 columns") && msg.contains("512 MiB"), "{msg}");
+    // A single row or column across the grid is refused too when it is over the cap.
+    let wide = two_cells((gridcraft_core::MAX_ROWS - 1, 0));
+    assert!(write_csv_limited(&wide, b',', 1 << 20, text_of(&wide)).is_err());
+}
+
+#[test]
+fn the_cap_counts_the_bytes_the_cells_hold_and_accepted_exports_keep_every_position() {
+    // 3 rows x 3 columns, 14 bytes: accepted at the cap, refused one byte under.
+    let s = two_cells((2, 2));
+    let ok = write_csv_limited(&s, b',', 14, text_of(&s)).unwrap();
+    assert_eq!(String::from_utf8(ok).unwrap(), "a,,\r\n,,\r\n,,b\r\n");
+    assert!(write_csv_limited(&s, b',', 13, text_of(&s)).is_err());
+    // Rows that pass the lower bound but hold long text stop as soon as the cap is passed.
+    let mut long = Sheet::new("L");
+    for r in 0..50u32 {
+        long.set_value(CellRef::new(r, 0), Value::text("x".repeat(100)));
+    }
+    let err = write_csv_limited(&long, b',', 1000, text_of(&long)).unwrap_err();
+    assert!(err.to_string().contains("stopped at row"), "{err}");
+    assert!(write_csv_limited(&long, b',', 50 * 102, text_of(&long)).is_ok());
+    // A tab is one byte, like a comma.
+    let tabs = write_csv_limited(&s, b'\t', 14, text_of(&s)).unwrap();
+    assert_eq!(tabs.len(), 14);
 }

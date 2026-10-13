@@ -224,13 +224,17 @@ impl Value {
     /// Coercion to a number as arithmetic does it: empty = 0, TRUE = 1, numeric text parses
     /// (including dates, times, percentages and currency), other text = `#VALUE!`.
     pub fn to_number(&self) -> Result<f64, CellError> {
+        self.to_number_in(crate::DateSystem::D1900)
+    }
+    /// [`Value::to_number`] with date text read in the given workbook date system.
+    pub fn to_number_in(&self, sys: crate::DateSystem) -> Result<f64, CellError> {
         match self {
             Value::Empty => Ok(0.0),
             Value::Number(n) => Ok(*n),
             Value::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
-            Value::Text(t) => crate::parse::parse_number_text(t).ok_or(CellError::Value),
+            Value::Text(t) => crate::parse::parse_number_text_in(t, sys).ok_or(CellError::Value),
             Value::Error(e) => Err(*e),
-            Value::Array(a) => a.data.first().map(|v| v.to_number()).unwrap_or(Ok(0.0)),
+            Value::Array(a) => a.data.first().map(|v| v.to_number_in(sys)).unwrap_or(Ok(0.0)),
         }
     }
     /// Coercion to text as `&` does it.

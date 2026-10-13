@@ -153,9 +153,18 @@ pub fn specs() -> Vec<CommandSpec> {
             "Link",
             ["Insert", "Links"],
             Some("Cmd+K"),
-            "{cell?, target: \"https://…\" | \"Sheet2!A1\" | \"mailto:…\", text?, tooltip?, remove?: bool}",
+            "{cell?, target: \"https://…\" | \"Book.xlsx\" | \"Sheet2!A1\" | \"mailto:…\", text?, tooltip?, remove?: bool}",
             has_doc,
             insert_link
+        ),
+        cmd!(
+            "link.open",
+            "Open Hyperlink",
+            [],
+            None,
+            "{url?: \"https://…\" | \"mailto:…\" | \"Sheet2!A1\", cell?} (default: the cell's link); only http, https and mailto are opened, any other scheme is an error; the UI asks before opening",
+            has_doc,
+            open_link
         ),
         cmd!("review.newNote", "New Note", ["Review", "Notes"], Some("Shift+F2"), "{cell?, text, author?}", has_doc, |s, p| comment(s, p, false)),
         cmd!("review.newComment", "New Comment", ["Review", "Comments"], Some("Cmd+Shift+F2"), "{cell?, text, author?}", has_doc, |s, p| comment(
@@ -240,7 +249,7 @@ fn insert_table(s: &mut Session, p: &Json) -> Result<Json> {
     let name = str_param(p, "name")
         .map(str::to_string)
         .unwrap_or_else(|| (1..).map(|n| format!("Table{n}")).find(|n| d.wb.table(n).is_none()).unwrap_or_else(|| "Table".into()));
-    if name.is_empty() || name.contains(' ') || name.chars().next().is_some_and(|c| c.is_ascii_digit()) || CellRef::parse(&name).is_some() {
+    if !valid_table_name(&name) {
         return Err(EngineError::Other("The name that you entered is not valid.".into()));
     }
     if d.wb.table(&name).is_some() || d.wb.names.iter().any(|n| n.name.eq_ignore_ascii_case(&name)) {
@@ -310,7 +319,10 @@ fn insert_table(s: &mut Session, p: &Json) -> Result<Json> {
             range: r,
             header_row: true,
             totals_row: false,
-            columns: names.into_iter().map(|n| TableColumn { name: n, totals: TotalsFn::None, totals_label: None, formula: None }).collect(),
+            columns: names
+                .into_iter()
+                .map(|n| TableColumn { name: n, totals: TotalsFn::None, totals_label: None, formula: None, unique_name: None, xml: None })
+                .collect(),
             style,
             banded_rows: true,
             banded_cols: false,
@@ -318,6 +330,8 @@ fn insert_table(s: &mut Session, p: &Json) -> Result<Json> {
             last_col: false,
             filter_button: true,
             filter: vec![],
+            table_type: None,
+            connection_id: None,
         });
         cx.structural = true;
         Ok(json!({"table": name, "range": r.a1()}))
@@ -349,6 +363,9 @@ fn table_flag(s: &mut Session, p: &Json, which: &str) -> Result<Json> {
             "totals" => {
                 let v = on.unwrap_or(!t.totals_row);
                 if v != t.totals_row {
+                    if v && t.range.end.row.saturating_add(1) >= MAX_ROWS {
+                        return Err(EngineError::Other("There's no room below the table for the total row.".into()));
+                    }
                     t.totals_row = v;
                     if v {
                         t.range.end.row += 1;
@@ -448,14 +465,19 @@ fn table_style(s: &mut Session, p: &Json) -> Result<Json> {
     })
 }
 
+/// Table names follow the Microsoft name rules, as the xlsx writer does: letters, digits, `_` and `.`,
+/// starting with a letter, `_` or `\`. Anything else (a hyphen, say) would read as an operator inside a
+/// structured reference, and the writer would rename the table on save.
+fn valid_table_name(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_alphabetic() || c == '_' || c == '\\')
+        && CellRef::parse(name).is_none()
+        && name.chars().enumerate().all(|(i, c)| c.is_alphanumeric() || c == '_' || c == '.' || (i == 0 && c == '\\'))
+}
+
 fn table_rename(s: &mut Session, p: &Json) -> Result<Json> {
     let (si, ti) = find_table(s, p)?;
     let name = str_param(p, "name").ok_or_else(|| bad("table.rename", "missing `name`"))?.to_string();
-    if name.is_empty()
-        || name.contains(' ')
-        || name.chars().next().is_some_and(|c| c.is_ascii_digit())
-        || gridcraft_core::CellRef::parse(&name).is_some()
-    {
+    if !valid_table_name(&name) {
         return Err(EngineError::Other("The name that you entered is not valid.".into()));
     }
     if s.doc()?.wb.table(&name).is_some_and(|x| x != (si, ti)) {
@@ -470,6 +492,8 @@ fn table_rename(s: &mut Session, p: &Json) -> Result<Json> {
         for i in 0..cx.wb.sheets.len() {
             let keys: Vec<(CellRef, std::sync::Arc<Formula>)> =
                 cx.wb.sheets.get(i).map(|s| s.cells.iter().filter_map(|(c, x)| x.formula.clone().map(|f| (c, f))).collect()).unwrap_or_default();
+            // A bare name that is also a defined name resolves to the defined name, so it is not the table.
+            let shadowed = cx.wb.name(&old, i).is_some();
             let Some(sh) = cx.wb.sheet_mut(i) else { continue };
             for (c, f) in keys {
                 let Some(e) = f.expr() else { continue };
@@ -478,7 +502,7 @@ fn table_rename(s: &mut Session, p: &Json) -> Result<Json> {
                         st.table = name.clone();
                         gridcraft_formula::Expr::Struct(st)
                     }
-                    gridcraft_formula::Expr::Name(n) if n.eq_ignore_ascii_case(&old) => gridcraft_formula::Expr::Name(name.clone()),
+                    gridcraft_formula::Expr::Name(n) if !shadowed && n.eq_ignore_ascii_case(&old) => gridcraft_formula::Expr::Name(name.clone()),
                     o => o,
                 });
                 if let Some(cell) = sh.cells.get_mut(c) {
@@ -1156,6 +1180,7 @@ fn insert_link(s: &mut Session, p: &Json) -> Result<Json> {
     };
     let text = str_param(p, "text").map(str::to_string);
     let tooltip = str_param(p, "tooltip").map(str::to_string);
+    let external = links_outside(&s.doc()?.wb, sheet, &target);
     edit(s, |cx| {
         let link_style = cx.wb.styles.derive(cx.wb.sheet(sheet).map(|sh| sh.style_id(at)).unwrap_or_default(), |st| {
             st.font.color = Color::Theme(10, 0);
@@ -1167,10 +1192,53 @@ fn insert_link(s: &mut Session, p: &Json) -> Result<Json> {
         } else {
             sh.set_style(at, link_style);
         }
-        sh.hyperlinks.insert(at, Hyperlink { target: target.clone(), tooltip: tooltip.clone() });
+        sh.hyperlinks.insert(at, Hyperlink { target: target.clone(), tooltip: tooltip.clone(), external });
         cx.touch(sheet, at);
         Ok(Json::Null)
     })
+}
+
+/// Follows a link: a reference selects it, an `http`/`https`/`mailto` address is handed to the
+/// host (`UiRequest::OpenUrl`); anything else is refused ([`crate::links::classify`]). Opens no
+/// dialog; the interactive click asks for confirmation first, in the UI.
+fn open_link(s: &mut Session, p: &Json) -> Result<Json> {
+    let target = match str_param(p, "url").or_else(|| str_param(p, "target")) {
+        Some(t) => t.to_string(),
+        None => {
+            let sheet = target_sheet(s, p)?;
+            let at = cell_param_on(s, p, "cell", sheet)?.unwrap_or(s.doc()?.selection.active);
+            let Some(h) = s.doc()?.wb.sheet(sheet).and_then(|sh| sh.hyperlinks.get(&at)) else {
+                return Err(EngineError::Other("There's no hyperlink in this cell.".into()));
+            };
+            h.target.clone()
+        }
+    };
+    match crate::links::classify(&target) {
+        crate::links::LinkKind::Internal(r) => super::edit::go_to(s, &json!({"reference": r.trim_start_matches('#')})),
+        crate::links::LinkKind::External(u) => {
+            s.ui_requests.push(crate::UiRequest::OpenUrl(u.clone()));
+            Ok(json!({"opened": u}))
+        }
+        crate::links::LinkKind::Refused(why) => Err(EngineError::Other(why)),
+    }
+}
+
+/// Sorts a link target as the two pages of Excel's Insert Hyperlink dialog do: "Place in This
+/// Document" is a sheet reference, a defined name or `#…`; anything else ("Existing File or Web
+/// Page") is outside the workbook and saved as a relationship.
+fn links_outside(wb: &Workbook, sheet: usize, target: &str) -> bool {
+    let t = target.trim();
+    if t.starts_with('#') || wb.name(t, sheet).is_some() || wb.table(t).is_some() {
+        return false;
+    }
+    let (on, body) = split_sheet(t);
+    // Sheet names can't hold `: \ / ? * [ ]`, so `https://…!A1` or `C:\…!A1` is no sheet reference,
+    // and `Book.xlsx#Sheet1!A1` is a place in another file unless a sheet has that name.
+    let on_sheet = on.is_none_or(|name| {
+        wb.sheets.iter().any(|s| s.name.eq_ignore_ascii_case(&name))
+            || (!name.is_empty() && !name.contains([':', '\\', '/', '?', '*', '[', ']', '#']))
+    });
+    !(on_sheet && RangeRef::parse(body).is_some())
 }
 
 fn comment(s: &mut Session, p: &Json, threaded: bool) -> Result<Json> {
@@ -1420,20 +1488,20 @@ fn manage_cf(s: &mut Session, p: &Json) -> Result<Json> {
     }
     edit(s, |cx| {
         let sh = cx.sheet_mut(sheet)?;
-        let n = sh.cond_formats.len();
+        // The count is taken again after each step: a delete shortens the list.
         if let Some(i) = u32_param(p, "delete").map(|v| v as usize)
-            && i < n
+            && i < sh.cond_formats.len()
         {
             sh.cond_formats.remove(i);
         }
         if let Some(i) = u32_param(p, "moveUp").map(|v| v as usize)
             && i > 0
-            && i < n
+            && i < sh.cond_formats.len()
         {
             sh.cond_formats.swap(i, i - 1);
         }
         if let Some(i) = u32_param(p, "moveDown").map(|v| v as usize)
-            && i + 1 < n
+            && i + 1 < sh.cond_formats.len()
         {
             sh.cond_formats.swap(i, i + 1);
         }
@@ -1465,4 +1533,24 @@ fn insert_icon(s: &mut Session, p: &Json) -> Result<Json> {
         cx.sheet_mut(sheet)?.shapes.push(shape);
         Ok(json!({"shape": id}))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manage_rules_delete_then_move() {
+        let mut s = Session::new();
+        s.new_workbook();
+        for v in ["1", "2"] {
+            let rule = json!({"type": "cellIs", "operator": "greaterThan", "value": v, "preset": "lightRedFill"});
+            s.execute("home.conditionalFormat", json!({"range": "A1:A3", "rule": rule})).unwrap();
+        }
+        // Deleting first left two rules' worth of indices for the move: it panicked.
+        s.execute("home.manageRules", json!({"delete": 0, "moveUp": 1})).unwrap();
+        s.execute("home.manageRules", json!({"delete": 0, "moveDown": 0})).unwrap();
+        let rules = s.execute("home.manageRules", json!({})).unwrap();
+        assert_eq!(rules["rules"].as_array().map(Vec::len), Some(0));
+    }
 }

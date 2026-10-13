@@ -81,7 +81,7 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
     let tables: Vec<(&Table, Vec<String>)> = sheet
         .tables
         .iter()
-        .filter(|t| t.range.height() > t.header_row as u32 + t.totals_row as u32 || (t.header_row && !t.totals_row && t.range.height() >= 1))
+        .filter(|t| t.range.height() > t.header_row as u32 + t.totals_row as u32 || (t.header_row && t.range.height() > t.totals_row as u32))
         .map(|t| (t, table_columns(t)))
         .collect();
     for (t, cols) in &tables {
@@ -388,7 +388,10 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
             if t.is_empty() {
                 continue;
             }
-            let external = t.contains("://")
+            // `external` is what the file said, or what Insert › Link chose; the scheme test covers
+            // links made before the flag existed.
+            let external = h.external
+                || t.contains("://")
                 || t.to_ascii_lowercase().starts_with("mailto:")
                 || t.starts_with("\\\\")
                 || t.to_ascii_lowercase().starts_with("file:");
@@ -573,9 +576,33 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
         }
         let _ = write!(s, "<tableParts count=\"{}\">{parts}</tableParts>", tables.len());
     }
-    // Sparklines (Excel 2010 extension).
+    // Excel 2010 extensions: solid data bars, then sparklines.
+    let solid_bars: Vec<(&CondFormat, u32)> = sheet
+        .cond_formats
+        .iter()
+        .enumerate()
+        .filter(|(_, cf)| !cf.ranges.is_empty() && matches!(cf.rule, CfRule::DataBar { gradient: false, .. }))
+        .map(|(i, cf)| (cf, prio.get(i).copied().unwrap_or(1)))
+        .collect();
+    if !solid_bars.is_empty() || !sheet.sparklines.is_empty() {
+        s.push_str("<extLst>");
+    }
+    if !solid_bars.is_empty() {
+        let _ = write!(
+            s,
+            "<ext uri=\"{{78C0D931-6437-407d-A8A1-0F90B4350D7D}}\" xmlns:x14=\"{X14_NS}\" xmlns:xm=\"{XM_NS}\"><x14:conditionalFormattings>"
+        );
+        for (cf, p) in &solid_bars {
+            if let CfRule::DataBar { min, max, .. } = &cf.rule {
+                let (id, lo, hi) = (solid_bar_id(*p), x14_cfvo(min), x14_cfvo(max));
+                let _ = write!(s, "<x14:conditionalFormatting><x14:cfRule type=\"dataBar\" id=\"{id}\"><x14:dataBar gradient=\"0\">{lo}{hi}");
+                let _ = write!(s, "</x14:dataBar></x14:cfRule><xm:sqref>{}</xm:sqref></x14:conditionalFormatting>", sqref(&cf.ranges));
+            }
+        }
+        s.push_str("</x14:conditionalFormattings></ext>");
+    }
     if !sheet.sparklines.is_empty() {
-        s.push_str("<extLst><ext uri=\"{05C60535-1F16-4fd2-B633-F4F36F0B64E0}\" xmlns:x14=\"http://schemas.microsoft.com/office/spreadsheetml/2009/9/main\"><x14:sparklineGroups xmlns:xm=\"http://schemas.microsoft.com/office/excel/2006/main\">");
+        let _ = write!(s, "<ext uri=\"{{05C60535-1F16-4fd2-B633-F4F36F0B64E0}}\" xmlns:x14=\"{X14_NS}\"><x14:sparklineGroups xmlns:xm=\"{XM_NS}\">");
         for sp in &sheet.sparklines {
             let ty = match sp.kind {
                 SparklineKind::Line => "",
@@ -593,7 +620,10 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
                 sp.cell.a1()
             );
         }
-        s.push_str("</x14:sparklineGroups></ext></extLst>");
+        s.push_str("</x14:sparklineGroups></ext>");
+    }
+    if !solid_bars.is_empty() || !sheet.sparklines.is_empty() {
+        s.push_str("</extLst>");
     }
     s.push_str("</worksheet>");
     (s, rels)
@@ -714,6 +744,33 @@ fn quote(t: &str) -> String {
     format!("\"{}\"", t.replace('"', "\"\""))
 }
 
+const X14_NS: &str = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main";
+const XM_NS: &str = "http://schemas.microsoft.com/office/excel/2006/main";
+
+/// The id linking a solid data bar's `cfRule` to its x14 extension; unique per sheet because priorities are.
+fn solid_bar_id(priority: u32) -> String {
+    format!("{{00000000-0000-0000-0000-{priority:012}}}")
+}
+
+/// The `cfRule` extension that points a solid data bar at its x14 rule.
+fn solid_bar_ext(priority: u32) -> String {
+    let id = solid_bar_id(priority);
+    format!("<extLst><ext uri=\"{{B025F937-C7B1-47D3-B67F-A62EFF666E3E}}\" xmlns:x14=\"{X14_NS}\"><x14:id>{id}</x14:id></ext></extLst>")
+}
+
+/// An x14 `cfvo`: unlike the 2006 one it has no `val` attribute, the value is an `xm:f` child.
+fn x14_cfvo(v: &CfValueKind) -> String {
+    let (ty, val) = match v {
+        CfValueKind::Min => return "<x14:cfvo type=\"min\"/>".into(),
+        CfValueKind::Max => return "<x14:cfvo type=\"max\"/>".into(),
+        CfValueKind::Number(n) => ("num", num(*n)),
+        CfValueKind::Percent(n) => ("percent", num(*n)),
+        CfValueKind::Percentile(n) => ("percentile", num(*n)),
+        CfValueKind::Formula(f) => ("formula", text_to_file(f)),
+    };
+    format!("<x14:cfvo type=\"{ty}\"><xm:f>{}</xm:f></x14:cfvo>", esc(&val))
+}
+
 fn cf_rule_xml(cf: &CondFormat, priority: u32, out: &mut Out) -> String {
     let tl = cf.ranges.first().map(|r| r.start.a1()).unwrap_or_else(|| "A1".into());
     let stop = if cf.stop_if_true { " stopIfTrue=\"1\"" } else { "" };
@@ -809,12 +866,13 @@ fn cf_rule_xml(cf: &CondFormat, priority: u32, out: &mut Out) -> String {
             b.push_str("</colorScale>");
             format!("<cfRule type=\"colorScale\" priority=\"{priority}\"{stop}>{b}</cfRule>")
         }
-        CfRule::DataBar { min, max, color, show_value, .. } => format!(
-            "<cfRule type=\"dataBar\" priority=\"{priority}\"{stop}><dataBar{}>{}{}<color {}/></dataBar></cfRule>",
+        CfRule::DataBar { min, max, color, show_value, gradient } => format!(
+            "<cfRule type=\"dataBar\" priority=\"{priority}\"{stop}><dataBar{}>{}{}<color {}/></dataBar>{}</cfRule>",
             if *show_value { "" } else { " showValue=\"0\"" },
             cfvo_xml(min),
             cfvo_xml(max),
-            if *color == Color::Auto { "rgb=\"FF638EC6\"".to_string() } else { color_attrs(color) }
+            if *color == Color::Auto { "rgb=\"FF638EC6\"".to_string() } else { color_attrs(color) },
+            if *gradient { String::new() } else { solid_bar_ext(priority) }
         ),
         CfRule::IconSet { set, thresholds, reverse, show_value } => {
             let mut b = format!("<iconSet iconSet=\"{}\"", esc_attr(set));
@@ -974,6 +1032,12 @@ fn table_xml(t: &Table, cols: &[String], name: &str, id: u32, out: &mut Out) -> 
     } else {
         s.push_str(" totalsRowShown=\"0\"");
     }
+    if let Some(ty) = &t.table_type {
+        let _ = write!(s, " tableType=\"{}\"", esc_attr(ty));
+    }
+    if let Some(c) = t.connection_id {
+        let _ = write!(s, " connectionId=\"{c}\"");
+    }
     s.push('>');
     if t.header_row && t.filter_button {
         let end_row = if t.totals_row { t.range.end.row.saturating_sub(1).max(t.range.start.row) } else { t.range.end.row };
@@ -983,7 +1047,11 @@ fn table_xml(t: &Table, cols: &[String], name: &str, id: u32, out: &mut Out) -> 
     let _ = write!(s, "<tableColumns count=\"{}\">", cols.len());
     for (i, name) in cols.iter().enumerate() {
         let col = t.columns.get(i);
-        let _ = write!(s, "<tableColumn id=\"{}\" name=\"{}\"", i + 1, esc_attr(&encode_xstring(name)));
+        let _ = write!(s, "<tableColumn id=\"{}\"", i + 1);
+        if let Some(u) = col.and_then(|c| c.unique_name.as_ref()) {
+            let _ = write!(s, " uniqueName=\"{}\"", esc_attr(u));
+        }
+        let _ = write!(s, " name=\"{}\"", esc_attr(&encode_xstring(name)));
         let totals = col.map(|c| c.totals).unwrap_or_default();
         if t.totals_row {
             let f = match totals {
@@ -1006,7 +1074,8 @@ fn table_xml(t: &Table, cols: &[String], name: &str, id: u32, out: &mut Out) -> 
         }
         let calc = col.and_then(|c| c.formula.as_ref()).filter(|f| !f.is_empty());
         let custom = if t.totals_row && totals == TotalsFn::Custom { col.and_then(|c| c.totals_label.as_ref()) } else { None };
-        if calc.is_none() && custom.is_none() {
+        let xml = col.and_then(|c| c.xml.as_ref());
+        if calc.is_none() && custom.is_none() && xml.is_none() {
             s.push_str("/>");
             continue;
         }
@@ -1016,6 +1085,13 @@ fn table_xml(t: &Table, cols: &[String], name: &str, id: u32, out: &mut Out) -> 
         }
         if let Some(f) = custom {
             let _ = write!(s, "<totalsRowFormula>{}</totalsRowFormula>", esc(&text_to_file(f)));
+        }
+        if let Some(x) = xml {
+            let _ = write!(s, "<xmlColumnPr mapId=\"{}\" xpath=\"{}\"", x.map_id, esc_attr(&x.xpath));
+            if x.denormalized {
+                s.push_str(" denormalized=\"1\"");
+            }
+            let _ = write!(s, " xmlDataType=\"{}\"/>", esc_attr(&x.data_type));
         }
         s.push_str("</tableColumn>");
     }

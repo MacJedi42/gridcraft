@@ -237,10 +237,12 @@ pub(crate) fn apply_style(s: &mut Session, p: &Json, f: impl Fn(&mut Style)) -> 
                 // Existing cells in those lines.
                 let cells: Vec<(CellRef, StyleId)> =
                     cx.wb.sheet(sheet).map(|sh| sh.cells.iter_range(*r).map(|(c, x)| (c, x.style)).collect()).unwrap_or_default();
-                for (c, st) in cells {
-                    let new = *cache.entry(st).or_insert_with(|| cx.wb.styles.derive(st, &f));
-                    cx.sheet_mut(sheet)?.set_style(c, new);
+                for (c, st) in &cells {
+                    let new = *cache.entry(*st).or_insert_with(|| cx.wb.styles.derive(*st, &f));
+                    cx.sheet_mut(sheet)?.set_style(*c, new);
                 }
+                // Formatting touched these cells: re-fit their rows (Excel auto-fits).
+                cx.fit_rows.extend(cells.iter().map(|(c, _)| (sheet, c.row)));
                 continue;
             }
             if r.count() > 4_000_000 {
@@ -574,6 +576,16 @@ fn merge(s: &mut Session, p: &Json, how: &str) -> Result<Json> {
                         let m = RangeRef::new(CellRef::new(row, r.start.col), CellRef::new(row, r.end.col));
                         if !m.is_single() {
                             sh.merges.push(m);
+                            // As below: only the first value of each row survives.
+                            let others: Vec<CellRef> = sh.cells.iter_range(m).map(|(c, _)| c).filter(|c| *c != m.start).collect();
+                            for c in others {
+                                if let Some(mut cell) = sh.cells.get(c).cloned() {
+                                    cell.value = gridcraft_core::Value::Empty;
+                                    cell.formula = None;
+                                    sh.set_cell(c, cell);
+                                }
+                                touched.push((sheet, c));
+                            }
                         }
                     }
                 }
@@ -953,6 +965,7 @@ fn row_height(s: &mut Session, p: &Json) -> Result<Json> {
                 e.custom = true;
             }
         }
+        cx.structural = true; // setting a height shows or hides rows: SUBTOTAL(10x) depends on it
         Ok(Json::Null)
     })
 }
@@ -992,9 +1005,7 @@ pub fn chars_to_points(c: f64) -> f64 {
     }
 }
 
-pub fn points_to_chars(px: f64) -> f64 {
-    if px <= 12.0 { (px / 12.0 * 100.0).round() / 100.0 } else { ((px - 5.0) / 7.0 * 100.0 + 0.5).trunc() / 100.0 }
-}
+pub use gridcraft_model::points_to_chars;
 
 /// Approximate text width in points for autofit (no font metrics in the engine: average glyph
 /// widths for the default font; the UI refines with real measurement when it autofits).
@@ -1069,6 +1080,7 @@ fn autofit_rows(s: &mut Session, p: &Json) -> Result<Json> {
             }
             cx.fit_rows.extend((a..=b).map(|r| (si, r)));
         }
+        cx.structural = true; // autofit reveals hidden rows: SUBTOTAL(10x) depends on it
         Ok(Json::Null)
     })
 }
@@ -1111,6 +1123,19 @@ fn hide(s: &mut Session, p: &Json, rows: bool, on: bool) -> Result<Json> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_across_keeps_the_first_value_of_each_row() {
+        let mut s = crate::Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [[1, 2], [3, 4]]})).unwrap();
+        s.execute("cell.set", json!({"cell": "D1", "input": "=SUM(A1:B2)"})).unwrap();
+        s.execute("home.mergeAcross", json!({"range": "A1:B2"})).unwrap();
+        let v = |s: &mut crate::Session, a: &str| s.execute("cell.get", json!({"cell": a})).unwrap()["value"].clone();
+        assert_eq!(v(&mut s, "B1"), Json::Null);
+        assert_eq!(v(&mut s, "B2"), Json::Null);
+        assert_eq!(v(&mut s, "D1"), json!(4.0));
+    }
 
     #[test]
     fn decimal_steps() {

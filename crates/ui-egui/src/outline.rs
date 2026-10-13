@@ -142,6 +142,13 @@ impl Dir<'_> {
         let (a0, a1) = (a.max(top), (a + size).min(self.hi));
         (size > 0.0 && a1 > a0).then_some((a0, a1))
     }
+    /// The first on-screen line in `start..=end`: the frozen ones first, then the scrolling ones from the line
+    /// at the pane's edge, so a long group is not scanned from its far-off start.
+    fn first_visible(&self, start: u32, end: u32) -> Option<(u32, (f32, f32))> {
+        let at = if self.rows { self.geo.row_at(self.sh, self.split) } else { self.geo.col_at(self.sh, self.split) };
+        let scrolled = start.max(self.frozen).max(at);
+        (start..self.frozen.min(end.saturating_add(1))).chain(scrolled..=end).find_map(|l| self.visible(l).map(|v| (l, v)))
+    }
     fn point(&self, along: f32, across: f32) -> Pos2 {
         if self.rows { pos2(across, along) } else { pos2(along, across) }
     }
@@ -198,7 +205,7 @@ pub fn layout(geo: &Geo, sh: &Sheet) -> Layout {
                 continue;
             }
             // The bracket, over the part of the detail that is on screen.
-            let first = (grp.start..=grp.end).take(4096).find_map(|l| dir.visible(l).map(|v| (l, v)));
+            let first = dir.first_visible(grp.start, grp.end);
             let Some((first_line, (a0, _))) = first else { continue };
             let a1 = match button {
                 Some(mid) => mid - side / 2.0,
@@ -296,6 +303,28 @@ mod tests {
         assert_eq!((g.band_w, g.band_h), (0.0, 0.0));
         assert_eq!(layout(&g, &sh), Layout::default());
         assert_eq!(g.head_left(), g.rect.left());
+    }
+
+    #[test]
+    fn long_groups_keep_their_bracket_past_4096_lines() {
+        for rows in [true, false] {
+            let mut sh = Sheet::new("S");
+            let map = if rows { &mut sh.rows } else { &mut sh.cols };
+            for i in 0..5000u32 {
+                map.entry(i).or_default().outline = 1;
+            }
+            for line in [0u32, 4095, 4096, 4200, 4970] {
+                let scroll = if rows { vec2(0.0, sh.row_top(line) as f32) } else { vec2(sh.col_left(line) as f32, 0.0) };
+                let g = Geo::new(&sh, Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0)), scroll);
+                let l = layout(&g, &sh);
+                assert_eq!(l.brackets.len(), 1, "rows={rows} line={line}");
+                assert_eq!(l.brackets[0].tick.is_some(), line == 0, "rows={rows} line={line}");
+            }
+            // Past the group's summary line nothing is left to bracket.
+            let scroll = if rows { vec2(0.0, sh.row_top(5100) as f32) } else { vec2(sh.col_left(5100) as f32, 0.0) };
+            let g = Geo::new(&sh, Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0)), scroll);
+            assert!(layout(&g, &sh).brackets.is_empty(), "rows={rows}");
+        }
     }
 
     #[test]

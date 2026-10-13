@@ -16,6 +16,8 @@ pub(crate) const MAX_TRENDLINES: usize = 16;
 
 /// Tints used for series beyond the six theme accents: lighter, darker, lighter still…
 const CYCLE_TINTS: [f64; 6] = [0.0, 0.4, -0.25, 0.6, -0.5, 0.2];
+/// `series_color` repeats after this many colours (six accents × the tints).
+pub(crate) const PALETTE_CYCLE: usize = 6 * CYCLE_TINTS.len();
 
 /// Colour of the `i`-th series: theme accents 1–6, then tinted variations of them.
 pub fn series_color(theme: &Theme, i: usize) -> Rgba {
@@ -145,7 +147,7 @@ fn category_texts(wb: &Workbook, sheet: usize, formula: &str) -> Vec<String> {
                 if let Some(c) = at {
                     let code = &wb.styles.get(s.style_id(c)).num_fmt.0;
                     if !code.eq_ignore_ascii_case("general") {
-                        return format_value(v, &NumberFormat::parse(code), wb.date_system).text;
+                        return format_value(v, &NumberFormat::parse_cached(code), wb.date_system).text;
                     }
                 }
             }
@@ -239,5 +241,6 @@ pub fn resolve(wb: &Workbook, sheet: usize, chart: &Chart) -> ChartData {
     }
     let n = series.iter().map(|s| s.values.len()).max().unwrap_or(0);
     let categories = categories.unwrap_or_else(|| (1..=n).map(|i| i.to_string()).collect());
-    ChartData { categories, series }
+    let palette = default_palette(&wb.theme, n.min(PALETTE_CYCLE));
+    ChartData { categories, series, palette }
 }

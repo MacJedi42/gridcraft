@@ -1,11 +1,12 @@
 //! Text functions.
 
-use gridcraft_core::parse::parse_number_text;
+use gridcraft_core::parse::parse_number_text_in;
 use gridcraft_core::{CellError, Value, number_to_text};
 
 use crate::criteria::wildcard_find;
 use crate::util::{
-    A, MAX_TEXT, R, S, arg, array_val, as_array, boolean, has, num, num_val, opt_bool, opt_int, opt_num, round_half_away, scalar, text, text_val,
+    A, MAX_CELLS, MAX_TEXT, R, S, arg, array_val, as_array, boolean, has, num, num_val, opt_bool, opt_int, opt_num, round_half_away, scalar, text,
+    text_val,
 };
 use crate::{Arg, Ctx, FnSpec, VAR};
 
@@ -214,7 +215,7 @@ fn find_impl(a: &[Arg], wild: bool) -> R<Value> {
     let hay = text(a, 1)?;
     let start = opt_num(a, 2, 1.0)?;
     let hc = chars(&hay);
-    if (start.is_nan() || start < 1.0) || start > hc.len() as f64 + 1.0 {
+    if (start.is_nan() || start < 1.0) || start > hc.len().max(1) as f64 {
         return Err(CellError::Value);
     }
     let start = start as usize - 1;
@@ -294,17 +295,17 @@ fn unicode(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
 
 /// VALUE: a blank cell reads as 0, but empty or blank text is not a number (observed:
 /// `VALUE("")` is `#VALUE!`).
-fn value(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
+fn value(a: &[Arg], c: &mut dyn Ctx) -> R<Value> {
     match scalar(arg(a, 0)?) {
         Value::Number(n) => num_val(n),
         Value::Empty => num_val(0.0),
         Value::Error(e) => Err(e),
-        Value::Text(t) => parse_number_text(&t).ok_or(CellError::Value).and_then(num_val),
+        Value::Text(t) => parse_number_text_in(&t, c.date_system()).ok_or(CellError::Value).and_then(num_val),
         _ => Err(CellError::Value),
     }
 }
 
-fn numbervalue(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
+fn numbervalue(a: &[Arg], c: &mut dyn Ctx) -> R<Value> {
     let s = text(a, 0)?;
     let dec = if a.len() > 1 { text(a, 1)?.chars().next().ok_or(CellError::Value)? } else { '.' };
     let grp = if a.len() > 2 { text(a, 2)?.chars().next().ok_or(CellError::Value)? } else { ',' };
@@ -337,7 +338,7 @@ fn numbervalue(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
             out.push(c);
         }
     }
-    let mut n = parse_number_text(&out).ok_or(CellError::Value)?;
+    let mut n = parse_number_text_in(&out, c.date_system()).ok_or(CellError::Value)?;
     for _ in 0..pct {
         n /= 100.0;
     }
@@ -610,6 +611,9 @@ fn textsplit(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     }
     let ncols = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
     let nrows = rows.len();
+    if nrows.saturating_mul(ncols) > MAX_CELLS {
+        return Err(CellError::Num);
+    }
     let mut data = Vec::with_capacity(nrows * ncols);
     for r in rows {
         let n = r.len();
@@ -841,6 +845,7 @@ pub(crate) fn specs() -> Vec<FnSpec> {
             fixed
         ),
         f!("DOLLAR", 1, 2, Text, S, "DOLLAR(number, [decimals])", "Formats a number as currency text.", dollar),
+        f!("USDOLLAR", 1, 2, Compatibility, S, "USDOLLAR(number, [decimals])", "Formats a number as currency text, like DOLLAR.", dollar),
         f!("BAHTTEXT", 1, 1, Text, S, "BAHTTEXT(number)", "Spells out a number in Thai words with Baht.", bahttext),
         f!("T", 1, 1, Text, S, "T(value)", "Returns the value if it is text, otherwise empty text.", t_fn),
         f!(
@@ -1032,6 +1037,15 @@ mod tests {
         close(ev("SEARCH", vec![t("~*"), t("a*b")]), 2.0);
         is_err(ev("SEARCH", vec![t("z"), t("abc")]), CellError::Value);
         is_err(ev("SEARCH", vec![t("a"), t("abc"), n(5.0)]), CellError::Value);
+        close(ev("SEARCH", vec![t("b"), t("\u{130}b")]), 2.0);
+        close(ev("SEARCH", vec![t("B"), t("\u{130}b")]), 2.0);
+        close(ev("SEARCH", vec![t("b?"), t("a\u{130}bc")]), 3.0);
+        close(ev("SEARCH", vec![t("i"), t("a\u{130}bc")]), 2.0);
+        is_err(ev("SEARCH", vec![t("b"), t("a\u{130}bc"), n(4.0)]), CellError::Value);
+        for f in ["FIND", "SEARCH"] {
+            close(ev(f, vec![t(""), t("abc"), n(3.0)]), 3.0);
+            is_err(ev(f, vec![t(""), t("abc"), n(4.0)]), CellError::Value);
+        }
         assert_eq!(ev("EXACT", vec![t("a"), t("A")]), Value::Bool(false));
         assert_eq!(ev("EXACT", vec![t("a"), t("a")]), Value::Bool(true));
     }
@@ -1091,6 +1105,8 @@ mod tests {
         is_text(ev("DOLLAR", vec![n(1234.567)]), "$1,234.57");
         is_text(ev("DOLLAR", vec![n(-1234.567), n(1.0)]), "($1,234.6)");
         is_text(ev("DOLLAR", vec![n(0.5), n(0.0)]), "$1");
+        is_text(ev("USDOLLAR", vec![n(1.0)]), "$1.00");
+        is_text(ev("USDOLLAR", vec![n(-1234.567), n(1.0)]), "($1,234.6)");
         is_text(ev("T", vec![t("x")]), "x");
         is_text(ev("T", vec![n(1.0)]), "");
     }
@@ -1131,6 +1147,13 @@ mod tests {
         assert_eq!(rows_of(&v), vec![vec![tv("a"), tv("b"), tv("c")]]);
         let v = ev("TEXTSPLIT", vec![t("a,b;c"), t(","), t(";"), b(false), n(0.0), t("-")]);
         assert_eq!(rows_of(&v)[1], vec![tv("c"), tv("-")]);
+    }
+
+    #[test]
+    fn split_rejects_oversized_padded_grid() {
+        // One row of 8000 columns followed by 8000 one-cell rows: the text is under the cell-text limit, the padded grid is not.
+        let text = format!("{}{}", "a,".repeat(8000), "b;".repeat(8000));
+        is_err(ev("TEXTSPLIT", vec![t(&text), t(","), t(";")]), CellError::Num);
     }
 
     #[test]

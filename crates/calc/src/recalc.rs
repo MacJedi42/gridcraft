@@ -898,11 +898,11 @@ impl Calc {
         // Spill areas of changed anchors also change.
         for &k in changed {
             if let Some(r) = wb.sheet(k.0).and_then(|s| s.spill_ranges.get(&k.1)) {
-                seeds.extend(r.iter().take(65536).map(|c| (k.0, c)));
+                seeds.extend(r.iter().map(|c| (k.0, c)));
             }
         }
         for (si, r) in &cleared {
-            seeds.extend(r.iter().take(65536).map(|c| (*si, c)));
+            seeds.extend(r.iter().map(|c| (*si, c)));
         }
         let t0 = prof_now();
         let dirty = self.dirty_closure(wb, &seeds);

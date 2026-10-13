@@ -61,3 +61,7 @@ sync_github_name = true
 real_name = "James Symes"
 sync_github_name = true
 
+
+[people.Silvertree2010]
+display_name = "Netter"
+sync_github_name = false

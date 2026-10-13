@@ -180,7 +180,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "Enter one cell exactly as if typed: a number, text, or a formula starting with = (\"=AVERAGE(B2:B9)\"). \
              Dependent cells recalculate. Returns the command result; use get_cell to read the computed value.",
             obj(
-                json!({"cell": string("Cell, e.g. \"B7\" or \"Sheet2!C3\""), "input": string("Typed input: number, text or =formula")}),
+                json!({"cell": string("Cell, e.g. \"B7\" or \"Sheet2!C3\""), "input": {"type": ["string", "number", "boolean"], "description": "Typed input: number, text or =formula"}}),
                 &["cell", "input"],
             ),
             false,
@@ -391,8 +391,41 @@ fn type_matches(t: &str, v: &Value) -> bool {
     }
 }
 
-/// Validates `args` against the tool's schema: unknown tool, missing required properties and
-/// top-level type mismatches are JSON-RPC "invalid params" errors.
+/// Checks a value against a (sub)schema: `type`, `enum`, `oneOf`, array `items`, and for objects the required and known properties.
+fn schema_matches(schema: &Value, v: &Value) -> bool {
+    if let Some(t) = schema["type"].as_str()
+        && !type_matches(t, v)
+    {
+        return false;
+    }
+    if let Some(allowed) = schema["enum"].as_array()
+        && !allowed.contains(v)
+    {
+        return false;
+    }
+    if let Some(alts) = schema["oneOf"].as_array()
+        && !alts.iter().any(|alt| schema_matches(alt, v))
+    {
+        return false;
+    }
+    if let Some(xs) = v.as_array()
+        && !xs.iter().all(|x| schema_matches(&schema["items"], x))
+    {
+        return false;
+    }
+    if let Some(o) = v.as_object() {
+        if schema["required"].as_array().into_iter().flatten().filter_map(Value::as_str).any(|r| o.get(r).is_none_or(Value::is_null)) {
+            return false;
+        }
+        if let Some(props) = schema["properties"].as_object() {
+            return o.iter().all(|(k, x)| props.get(k).is_some_and(|ps| x.is_null() || schema_matches(ps, x)));
+        }
+    }
+    true
+}
+
+/// Validates `args` against the tool's schema: unknown tool, missing required properties,
+/// top-level type mismatches and values matching none of a `oneOf` are JSON-RPC "invalid params" errors.
 pub(crate) fn check_arguments(name: &str, args: &Value) -> Result<(), String> {
     let defs = tool_definitions();
     let def = defs.iter().find(|d| d["name"] == name).ok_or_else(|| format!("unknown tool `{name}`"))?;
@@ -420,6 +453,9 @@ pub(crate) fn check_arguments(name: &str, args: &Value) -> Result<(), String> {
             && !allowed.contains(v)
         {
             return Err(format!("{name}: `{k}` must be one of {}", Value::Array(allowed.clone())));
+        }
+        if (p["oneOf"].is_array() || p["items"]["oneOf"].is_array()) && !schema_matches(p, v) {
+            return Err(format!("{name}: argument `{k}` does not match the schema: {}", p["description"]));
         }
     }
     Ok(())

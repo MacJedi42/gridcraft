@@ -138,7 +138,8 @@ fn circle(cx: f32, cy: f32, r: f32) -> Vec<[f32; 2]> {
 }
 
 fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Vec<[f32; 2]> {
-    let r = r.clamp(0.0, w.min(h) / 2.0);
+    // A negative or NaN extent gives an upper bound of 0 (clamp panics if max < min or NaN).
+    let r = r.clamp(0.0, (w.min(h) / 2.0).max(0.0));
     if r < 0.5 {
         return vec![[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
     }

@@ -10,11 +10,13 @@ use gridcraft_numfmt::{Formatted, NumberFormat, format_value};
 /// Parsed number formats are cached by code.
 fn parsed(code: &str) -> NumberFormat {
     static CACHE: std::sync::LazyLock<Mutex<HashMap<String, NumberFormat>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-    let mut m = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(f) = m.get(code) {
+    let lock = || CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(f) = lock().get(code) {
         return f.clone();
     }
+    // Parse outside the lock, so a slow code never blocks the other threads' lookups.
     let f = NumberFormat::parse(code);
+    let mut m = lock();
     if m.len() > 4096 {
         m.clear();
     }

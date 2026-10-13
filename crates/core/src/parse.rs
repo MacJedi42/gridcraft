@@ -41,7 +41,12 @@ pub fn parse_input(s: &str, sys: DateSystem) -> Parsed {
 
 /// Numeric text as arithmetic coerces it ("1,000", "50%", "$3", "1/2/2020", "10:00").
 pub fn parse_number_text(s: &str) -> Option<f64> {
-    parse_numeric(s.trim(), DateSystem::D1900).map(|(n, _)| n)
+    parse_number_text_in(s, DateSystem::D1900)
+}
+
+/// Like [`parse_number_text`], with date text read in the given workbook date system.
+pub fn parse_number_text_in(s: &str, sys: DateSystem) -> Option<f64> {
+    parse_numeric(s.trim(), sys).map(|(n, _)| n)
 }
 
 fn parse_numeric(t: &str, sys: DateSystem) -> Option<(f64, Option<&'static str>)> {
@@ -252,10 +257,14 @@ fn parse_date(t: &str, sys: DateSystem) -> Option<(f64, &'static str)> {
     // "Mar 4, 2026" / "March 4 2026" / "4 March 2026"
     let words: Vec<&str> = t.split([' ', ',']).filter(|w| !w.is_empty()).collect();
     if words.len() == 3 {
+        // Two-digit years follow the same 2029 rule as the dashed forms above.
+        let expand = |w: &str, y: i64| if w.len() <= 2 { if y < 30 { 2000 + y } else { 1900 + y } } else { y };
         if let (Some(m), Some(d), Some(y)) = (month_from_name(words[0]), num(words[1]), num(words[2])) {
+            let y = expand(words[2], y);
             return valid_ymd(sys, y, m as i64, d).map(|s| (s, "d-mmm-yy"));
         }
         if let (Some(d), Some(m), Some(y)) = (num(words[0]), month_from_name(words[1]), num(words[2])) {
+            let y = expand(words[2], y);
             return valid_ymd(sys, y, m as i64, d).map(|s| (s, "d-mmm-yy"));
         }
     }
@@ -315,6 +324,16 @@ mod tests {
 
     fn p(s: &str) -> Parsed {
         parse_input(s, DateSystem::D1900)
+    }
+
+    #[test]
+    fn month_name_short_year() {
+        for s in ["Mar 4, 26", "Mar 4 26", "March 4 26", "4 March 26", "Mar 4, 2026"] {
+            assert_eq!(p(s).value, Value::Number(46085.0), "{s}");
+        }
+        assert_eq!(p("Mar 4, 99").value, p("Mar 4, 1999").value);
+        assert_eq!(p("Mar 4, 1776").value, Value::text("Mar 4, 1776"));
+        assert_eq!(p("Feb 30, 26").value, Value::text("Feb 30, 26"));
     }
 
     #[test]

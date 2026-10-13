@@ -91,6 +91,16 @@ fn range_r1c1(r: &Reference, at: CellRef, sep: &str) -> String {
 }
 
 pub fn struct_ref(s: &StructRef) -> String {
+    write_struct_ref(s, true)
+}
+
+/// Structured reference as files spell it: `[@Col]` is only Excel's display shorthand, files
+/// hold `[[#This Row],[Col]]` (and `[#This Row]` for `[@]`).
+pub fn struct_ref_file(s: &StructRef) -> String {
+    write_struct_ref(s, false)
+}
+
+fn write_struct_ref(s: &StructRef, at_shorthand: bool) -> String {
     let esc = |c: &str| c.replace('\'', "''").replace('[', "'[").replace(']', "']").replace('#', "'#");
     let item = |i: &StructItem| match i {
         StructItem::All => "#All",
@@ -99,7 +109,7 @@ pub fn struct_ref(s: &StructRef) -> String {
         StructItem::Totals => "#Totals",
         StructItem::ThisRow => "#This Row",
     };
-    let this_row = s.specifiers == [StructItem::ThisRow];
+    let this_row = at_shorthand && s.specifiers == [StructItem::ThisRow];
     let mut out = s.table.clone();
     let simple_col = |c: &str| !c.chars().any(|ch| matches!(ch, ' ' | '[' | ']' | '#' | '\'' | ',' | ':'));
     match (&s.col_start, &s.col_end) {
@@ -109,7 +119,12 @@ pub fn struct_ref(s: &StructRef) -> String {
             let _ = write!(out, "[{}]", s.specifiers.first().map(item).unwrap_or(""));
         }
         (Some(c), None) if s.specifiers.is_empty() => {
-            let _ = write!(out, "[{}]", esc(c));
+            // Excel writes a name with spaces at its edges in the double-bracket form.
+            if c.trim() == c {
+                let _ = write!(out, "[{}]", esc(c));
+            } else {
+                let _ = write!(out, "[[{}]]", esc(c));
+            }
         }
         (Some(c), None) if this_row => {
             if simple_col(c) {
@@ -178,7 +193,15 @@ fn write_expr(s: &mut String, e: &Expr, r1c1: Option<CellRef>) {
             Some(at) => s.push_str(&reference_r1c1(r, at)),
             None => s.push_str(&reference_a1(r)),
         },
-        Expr::Name(n) => s.push_str(n),
+        Expr::Name(n) => match n.rsplit_once('!') {
+            // A sheet-qualified name is stored with the bare sheet name (`My Sheet!Total`): quote it so it parses back.
+            Some((sheet, name)) => {
+                s.push_str(&quote_sheet(sheet));
+                s.push('!');
+                s.push_str(name);
+            }
+            _ => s.push_str(n),
+        },
         Expr::Struct(st) => s.push_str(&struct_ref(st)),
         Expr::Unary(op, x) => match op {
             UnOp::Neg => {
@@ -224,10 +247,20 @@ fn write_expr(s: &mut String, e: &Expr, r1c1: Option<CellRef>) {
                 }
             },
         },
-        Expr::Binary(op, a, b) => {
-            write_expr(s, a, r1c1);
-            s.push_str(op.symbol());
-            write_expr(s, b, r1c1);
+        Expr::Binary(..) => {
+            // Walk the left spine iteratively: a flat chain such as `1+1+1+...` parses into a
+            // tree one level deeper per operator, and recursing on it could exhaust the stack.
+            let mut rest: Vec<(&BinOp, &Expr)> = Vec::new();
+            let mut first = e;
+            while let Expr::Binary(op, a, b) = first {
+                rest.push((op, b));
+                first = a;
+            }
+            write_expr(s, first, r1c1);
+            for (op, right) in rest.into_iter().rev() {
+                s.push_str(op.symbol());
+                write_expr(s, right, r1c1);
+            }
         }
         Expr::Call(name, args) => {
             s.push_str(name);

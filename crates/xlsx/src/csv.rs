@@ -8,6 +8,9 @@ use gridcraft_model::{Cell, NumFmt, Sheet, StyleId, Workbook};
 
 use crate::{CsvOptions, IoError};
 
+/// The largest CSV or tab-separated file written (bytes).
+pub const MAX_CSV_BYTES: usize = 512 << 20;
+
 /// Windows-1252 code points for bytes 0x80–0x9F (others map to Latin-1).
 const CP1252: [u32; 32] = [
     0x20AC, 0x81, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x8D, 0x017D, 0x8F, 0x90, 0x2018, 0x2019,
@@ -187,10 +190,31 @@ pub fn read_csv(bytes: &[u8], opts: &CsvOptions) -> Result<Workbook, IoError> {
 /// Writes the sheet's used range as CSV (CRLF line ends, UTF-8 without BOM). `cell_text` gives
 /// each cell's field text: the caller decides how values look (Save As CSV writes them as
 /// displayed, number formats applied); quoting is done here.
-pub fn write_csv(sheet: &Sheet, delimiter: u8, mut cell_text: impl FnMut(CellRef) -> String) -> Vec<u8> {
+///
+/// The output is capped at [`MAX_CSV_BYTES`]: two cells far apart make the used range, and so the
+/// file, as big as the whole rectangle between them (`A1` and `XFD1048576` are 16 GiB of commas).
+/// An export that would pass the cap is refused before anything is allocated, or as soon as the
+/// text written so far passes it, with [`IoError::TooLarge`]; accepted exports keep every field in
+/// its place.
+pub fn write_csv(sheet: &Sheet, delimiter: u8, cell_text: impl FnMut(CellRef) -> String) -> Result<Vec<u8>, IoError> {
+    write_csv_limited(sheet, delimiter, MAX_CSV_BYTES, cell_text)
+}
+
+/// [`write_csv`] with the output cap `limit` (bytes) given.
+pub fn write_csv_limited(sheet: &Sheet, delimiter: u8, limit: usize, mut cell_text: impl FnMut(CellRef) -> String) -> Result<Vec<u8>, IoError> {
     let delim = if delimiter == 0 { ',' } else { delimiter as char };
     let mut out = String::new();
-    let Some(r) = sheet.used_range() else { return Vec::new() };
+    let Some(r) = sheet.used_range() else { return Ok(Vec::new()) };
+    let too_large =
+        |what: String| IoError::TooLarge(format!("the CSV would be {what}, over the limit of {} MiB; export a smaller range", limit >> 20));
+    // Every row has a delimiter between its fields and a CRLF, whatever the cells hold: a lower
+    // bound on the output that needs no cell text.
+    let (rows, cols) = (u64::from(r.end.row - r.start.row) + 1, u64::from(r.end.col - r.start.col) + 1);
+    let per_row = (cols - 1).saturating_mul(delim.len_utf8() as u64).saturating_add(2);
+    let least = rows.saturating_mul(per_row);
+    if least > limit as u64 {
+        return Err(too_large(format!("at least {} MiB ({rows} rows by {cols} columns)", least >> 20)));
+    }
     for row in r.start.row..=r.end.row {
         for col in r.start.col..=r.end.col {
             if col > r.start.col {
@@ -206,6 +230,9 @@ pub fn write_csv(sheet: &Sheet, delimiter: u8, mut cell_text: impl FnMut(CellRef
             }
         }
         out.push_str("\r\n");
+        if out.len() > limit {
+            return Err(too_large(format!("more than {} MiB (stopped at row {})", limit >> 20, row + 1)));
+        }
     }
-    out.into_bytes()
+    Ok(out.into_bytes())
 }

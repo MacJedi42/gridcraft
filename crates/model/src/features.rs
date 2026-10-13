@@ -48,6 +48,23 @@ pub struct TableColumn {
     pub totals_label: Option<String>,
     /// Calculated column formula.
     pub formula: Option<String>,
+    /// `uniqueName`: the name XML maps know the column by.
+    #[serde(default)]
+    pub unique_name: Option<String>,
+    /// Binding to an element of an XML map. It moves with the column and goes when the column is
+    /// deleted; inserted columns are unmapped.
+    #[serde(default)]
+    pub xml: Option<XmlColumnPr>,
+}
+
+/// A table column's binding to an XML map (`<xmlColumnPr>`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct XmlColumnPr {
+    pub map_id: u32,
+    pub xpath: String,
+    /// `xmlDataType` as written in the file (`string`, `boolean`, `integer`…).
+    pub data_type: String,
+    pub denormalized: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -70,6 +87,12 @@ pub struct Table {
     /// SUBTOTAL distinguishes.
     #[serde(default)]
     pub filter: Vec<(u32, FilterCriterion)>,
+    /// `tableType` when it isn't a plain worksheet table: `xml` for a table bound to an XML map.
+    #[serde(default)]
+    pub table_type: Option<String>,
+    /// The connection (`xl/connections.xml`) an XML table is bound through.
+    #[serde(default)]
+    pub connection_id: Option<u32>,
 }
 
 impl Table {
@@ -304,9 +327,14 @@ pub struct Comment {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Hyperlink {
-    /// URL, `mailto:`, or an in-workbook location like `Sheet2!A1`.
+    /// URL, `mailto:`, a file path (`Book.xlsx`, `Book.xlsx#Sheet1!A2`), or an in-workbook location
+    /// like `Sheet2!A1`.
     pub target: String,
     pub tooltip: Option<String>,
+    /// The target is outside this workbook (Excel's "Existing File or Web Page"): a relationship in
+    /// the file, not a `location`. A bare file name can't be told from a defined name by its text.
+    #[serde(default)]
+    pub external: bool,
 }
 
 // ---------------------------------------------------------------- drawing objects
@@ -975,6 +1003,12 @@ pub struct PivotTable {
     pub last_range: Option<RangeRef>,
     /// Calculated fields, usable in the Values area by name.
     pub calculated_fields: Vec<PivotCalcField>,
+    /// The Σ Values pseudo-field (it exists with two or more value fields) sits in Rows rather
+    /// than Columns (Excel's "values on rows").
+    pub values_on_rows: bool,
+    /// Position of Σ Values among the row fields (`None` = after the last). Only used with
+    /// `values_on_rows`: in Columns Σ Values always comes after the last column field.
+    pub values_position: Option<usize>,
 }
 
 /// A calculated field: a formula over other fields (`=Sales*0.1`, `='Unit Price'*Units`). As in
@@ -1007,6 +1041,8 @@ impl Default for PivotTable {
             show_headers: true,
             last_range: None,
             calculated_fields: vec![],
+            values_on_rows: false,
+            values_position: None,
         }
     }
 }

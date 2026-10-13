@@ -106,7 +106,7 @@ fn read_series(s: &El) -> Series {
         color,
         secondary: false,
         kind: None,
-        smooth: s.child("smooth").and_then(|e| e.attr("val")).and_then(|v| v.parse::<u8>().ok()).is_some_and(|v| v != 0),
+        smooth: bool_val(s, "smooth"),
         trendlines: s.kids("trendline").filter_map(read_trendline).collect(),
     }
 }
@@ -201,7 +201,7 @@ pub fn read_chart(root: &El) -> Option<Chart> {
         }
     }
     let kind = if groups.len() > 1 { ChartKind::Combo } else { first_kind };
-    let show_val = |e: &El| e.child("dLbls").and_then(|d| d.child_val("showVal")).is_some_and(|v| v == "1" || v == "true");
+    let show_val = |e: &El| e.child("dLbls").is_some_and(|d| bool_val(d, "showVal"));
     let data_labels = groups.iter().any(|(g, _)| show_val(g) || g.kids("ser").any(show_val));
     let val_axes: Vec<&El> = plot.kids("valAx").collect();
     let cat_ax = plot.child("catAx").or_else(|| plot.child("dateAx"));
@@ -336,10 +336,46 @@ fn num_data(tag: &str, f: Option<&str>, wb: &Workbook, si: usize) -> String {
     s
 }
 
+/// Splits the inside of an array constant on `,` and `;` outside double quotes; inside quotes `""` is a literal quote.
+/// Unquoted items are trimmed; quoted ones keep the text between the quotes and drop the spaces around them.
+fn split_array_items(inner: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut in_quote = false;
+    let mut chars = inner.chars().peekable();
+    let finish = |cur: &mut String, quoted: &mut bool| {
+        let text = std::mem::take(cur);
+        let item = if *quoted { text } else { text.trim().to_string() };
+        *quoted = false;
+        item
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if in_quote && chars.peek() == Some(&'"') => {
+                cur.push('"');
+                chars.next();
+            }
+            '"' => {
+                if !quoted && cur.trim().is_empty() {
+                    cur.clear();
+                }
+                in_quote = !in_quote;
+                quoted = true;
+            }
+            ',' | ';' if !in_quote => items.push(finish(&mut cur, &mut quoted)),
+            c if quoted && !in_quote && c.is_whitespace() => {}
+            _ => cur.push(c),
+        }
+    }
+    items.push(finish(&mut cur, &mut quoted));
+    items
+}
+
 fn str_data(tag: &str, f: &str, wb: &Workbook, si: usize) -> String {
     let f = f.trim();
     if f.starts_with('{') {
-        let vals: Vec<String> = f.trim_matches(|c| c == '{' || c == '}').split([',', ';']).map(|v| v.trim().trim_matches('"').to_string()).collect();
+        let vals = split_array_items(f.trim_matches(|c| c == '{' || c == '}'));
         let mut s = format!("<c:{tag}><c:strLit><c:ptCount val=\"{}\"/>", vals.len());
         for (i, v) in vals.iter().enumerate() {
             let _ = write!(s, "<c:pt idx=\"{i}\"><c:v>{}</c:v></c:pt>", esc(v));

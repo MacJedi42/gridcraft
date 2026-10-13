@@ -249,10 +249,14 @@ fn cancel_copy_mode(s: &mut Session) {
 
 fn insert_lines(s: &mut Session, p: &Json, axis: Axis) -> Result<Json> {
     let (at, count) = lines(s, p, axis)?;
+    let limit = if axis == Axis::Rows { MAX_ROWS } else { MAX_COLS };
+    if at.checked_add(count).is_none_or(|end| end > limit) {
+        let cmd = if axis == Axis::Rows { "home.insertRows" } else { "home.insertColumns" };
+        return Err(bad(cmd, "the inserted lines would extend past the end of the worksheet"));
+    }
     check_lines_protection(s, p, axis, at, count, true)?;
     let sheet = target_sheet(s, p)?;
     // Refuse to push data off the sheet.
-    let limit = if axis == Axis::Rows { MAX_ROWS } else { MAX_COLS };
     if let Some(u) = s.doc()?.wb.sheet(sheet).and_then(|sh| sh.used_range()) {
         let last = if axis == Axis::Rows { u.end.row } else { u.end.col };
         if last >= at && last as u64 + count as u64 >= limit as u64 {
@@ -288,27 +292,65 @@ fn insert_lines(s: &mut Session, p: &Json, axis: Axis) -> Result<Json> {
     Ok(out)
 }
 
+/// The areas a line delete/insert targets as `(first line, count)`, merged and sorted from the
+/// last line to the first so deleting one never shifts the next. A comma-separated list
+/// (`"3:3,7:8"`) or a multi-area selection yields several; `count` forces the single-area form.
+fn delete_areas(s: &Session, p: &Json, axis: Axis) -> Result<Vec<(u32, u32)>> {
+    let key = if axis == Axis::Rows { "rows" } else { "cols" };
+    let spans: Vec<(u32, u32)> = if u32_param(p, "count").is_some() {
+        let (at, count) = lines(s, p, axis)?;
+        let limit = if axis == Axis::Rows { MAX_ROWS } else { MAX_COLS };
+        // Deleting past the last line only removes up to the end of the worksheet.
+        let count = count.min(limit.saturating_sub(at)).max(1);
+        vec![(at, at.saturating_add(count - 1))]
+    } else if let Some(t) = str_param(p, key).or_else(|| str_param(p, "range")) {
+        t.split(',')
+            .map(|part| {
+                let r = RangeRef::parse(part).ok_or_else(|| bad(key, format!("not a range: {part}")))?;
+                Ok(if axis == Axis::Rows { (r.start.row, r.end.row) } else { (r.start.col, r.end.col) })
+            })
+            .collect::<Result<_>>()?
+    } else {
+        s.doc()?.selection.ranges.iter().map(|r| if axis == Axis::Rows { (r.start.row, r.end.row) } else { (r.start.col, r.end.col) }).collect()
+    };
+    let mut spans: Vec<(u32, u32)> = spans.into_iter().map(|(a, b)| (a.min(b), a.max(b))).collect();
+    spans.sort_unstable();
+    let mut merged: Vec<(u32, u32)> = Vec::new();
+    for (a, b) in spans {
+        match merged.last_mut() {
+            Some(last) if a <= last.1.saturating_add(1) => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    Ok(merged.into_iter().rev().map(|(a, b)| (a, b - a + 1)).collect())
+}
+
 fn delete_lines(s: &mut Session, p: &Json, axis: Axis) -> Result<Json> {
-    let (at, count) = lines(s, p, axis)?;
-    check_lines_protection(s, p, axis, at, count, false)?;
+    let areas = delete_areas(s, p, axis)?;
+    for &(at, count) in &areas {
+        check_lines_protection(s, p, axis, at, count, false)?;
+    }
     let sheet = target_sheet(s, p)?;
     let out = edit(s, |cx| {
         let name = cx.wb.sheet(sheet).map(|s| s.name.clone()).unwrap_or_default();
         cx.protection_checked = true;
-        {
-            let sh = cx.sheet_mut(sheet)?;
-            let block = match axis {
-                Axis::Rows => RangeRef::rows(at, (at + count - 1).min(MAX_ROWS - 1)),
-                Axis::Cols => RangeRef::cols(at, (at + count - 1).min(MAX_COLS - 1)),
-            };
-            sh.take_cells(block);
-            match axis {
-                Axis::Rows => sh.cells.shift_rows(at + count, -(count as i64)),
-                Axis::Cols => sh.cells.shift_cols(at + count, -(count as i64)),
+        // Last area first, so the earlier ones keep their positions.
+        for (at, count) in areas {
+            {
+                let sh = cx.sheet_mut(sheet)?;
+                let block = match axis {
+                    Axis::Rows => RangeRef::rows(at, (at + count - 1).min(MAX_ROWS - 1)),
+                    Axis::Cols => RangeRef::cols(at, (at + count - 1).min(MAX_COLS - 1)),
+                };
+                sh.take_cells(block);
+                match axis {
+                    Axis::Rows => sh.cells.shift_rows(at + count, -(count as i64)),
+                    Axis::Cols => sh.cells.shift_cols(at + count, -(count as i64)),
+                }
+                shift_sheet_features(sh, axis, at, count, false);
             }
-            shift_sheet_features(sh, axis, at, count, false);
+            rewrite(&mut cx.wb, &name, &Edit::Delete { axis, at, count });
         }
-        rewrite(&mut cx.wb, &name, &Edit::Delete { axis, at, count });
         cx.structural = true;
         Ok(Json::Null)
     })?;
@@ -982,7 +1024,14 @@ fn shift_table_columns(t: &mut gridcraft_model::Table, at: u32, count: u32, inse
                         break name;
                     }
                 };
-                let col = gridcraft_model::TableColumn { name, totals: Default::default(), totals_label: None, formula: None };
+                let col = gridcraft_model::TableColumn {
+                    name,
+                    totals: Default::default(),
+                    totals_label: None,
+                    formula: None,
+                    unique_name: None,
+                    xml: None,
+                };
                 t.columns.insert((idx + k).min(t.columns.len()), col);
             }
         }

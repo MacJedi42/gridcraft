@@ -277,7 +277,7 @@ fn convert(args: &[String]) -> Result<(), String> {
     let mut s = open(input)?;
     activate_sheet(&mut s, a.opt("sheet"))?;
     let d = s.doc().map_err(|e| e.to_string())?;
-    let bytes = gridcraft_engine::io::save_bytes(&d.wb, out).map_err(|e| e.to_string())?;
+    let bytes = gridcraft_engine::io::save_file_bytes(&d.wb, out).map_err(|e| e.to_string())?;
     gridcraft_engine::io::write_file(out, &bytes).map_err(|e| e.to_string())?;
     eprintln!("wrote {out} ({} bytes)", bytes.len());
     Ok(())

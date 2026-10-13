@@ -4,9 +4,10 @@
 //!
 //! Read: worksheets, shared strings, cell values, formulas (text and cached results, including
 //! shared and array formulas), number formats, the 1904 date system, merged cells, column
-//! widths, row heights, defined names, print areas and print titles. Everything else (fonts,
-//! fills, borders, charts, pictures, comments, conditional formats, validation, macros) is
-//! skipped with a warning. Encrypted workbooks and pre-BIFF8 versions are refused.
+//! widths, row heights, defined names, print areas, print titles and the calculation settings
+//! (mode, iteration, precision as displayed). Everything else (fonts, fills, borders, charts,
+//! pictures, comments, conditional formats, validation, macros) is skipped with a warning.
+//! Encrypted workbooks and pre-BIFF8 versions are refused.
 
 mod formula;
 mod ftab;
@@ -16,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gridcraft_core::{CellRef, DateSystem, MAX_COLS, MAX_ROWS, RangeRef, Value};
-use gridcraft_model::{Cell, DefinedName, Formula, LineInfo, NumFmt, Sheet, Style, StyleId, Visibility, Workbook};
+use gridcraft_model::{CalcMode, CalcSettings, Cell, DefinedName, Formula, LineInfo, NumFmt, Sheet, Style, StyleId, Visibility, Workbook};
 
 use crate::cfb::Compound;
 use crate::tables::{builtin_format, col_width_to_px, pt_to_px};
@@ -123,6 +124,7 @@ struct Globals {
     sst: Vec<Arc<str>>,
     links: Links,
     names: Vec<Lbl>,
+    precision_as_displayed: bool,
 }
 
 /// Reads an Excel 97-2003 workbook. Inspect the report's warnings for what was skipped.
@@ -143,7 +145,7 @@ pub(crate) fn read_xls_with(bytes: &[u8], mut budget: Budget) -> Result<(Workboo
         }
     };
     let mut report = ReadReport::default();
-    let g = globals(&stream, &mut budget)?;
+    let g = globals(&stream, &mut budget, &mut report)?;
 
     let mut wb = Workbook::new();
     wb.sheets.clear();
@@ -175,18 +177,23 @@ pub(crate) fn read_xls_with(bytes: &[u8], mut budget: Budget) -> Result<(Workboo
             continue;
         }
         wb.check_sheet_name(&bs.name, None).map_err(invalid)?;
-        let Some(mut sheet) = worksheet(&stream, bs, &g, &styles, &mut budget, &mut report)? else {
+        let Some((mut sheet, calc)) = worksheet(&stream, bs, &g, &styles, &mut budget, &mut report)? else {
             report.warn("Dialog sheets and unreadable sheets were skipped.");
             model_index.push(None);
             continue;
         };
         sheet.visibility = bs.visibility;
+        // Every worksheet repeats the workbook's calculation settings; Excel applies the first.
+        if wb.sheets.is_empty() {
+            wb.calc = calc;
+        }
         model_index.push(Some(wb.sheets.len()));
         wb.sheets.push(Arc::new(sheet));
     }
     if wb.sheets.is_empty() {
         return Err(invalid("the workbook has no worksheets GridCraft can read"));
     }
+    wb.calc.precision_as_displayed = g.precision_as_displayed;
     defined_names(&g, &model_index, &mut wb, &mut report);
     wb.active_sheet = wb.sheets.iter().position(|s| s.visibility == Visibility::Visible).unwrap_or(0);
     // The overview comes first.
@@ -205,7 +212,7 @@ fn bof(rec: &Record<'_>) -> Result<(u16, u16), IoError> {
     Ok((c.u16()?, c.u16()?))
 }
 
-fn globals(stream: &[u8], budget: &mut Budget) -> Result<Globals, IoError> {
+fn globals(stream: &[u8], budget: &mut Budget, report: &mut ReadReport) -> Result<Globals, IoError> {
     let mut recs = Records::new(stream, 0);
     let first = recs.next_record()?.ok_or_else(|| invalid("empty Workbook stream"))?;
     let (vers, dt) = bof(&first)?;
@@ -247,9 +254,18 @@ fn globals(stream: &[u8], budget: &mut Budget) -> Result<Globals, IoError> {
                 g.sheets.push(BoundSheet { pos, name, visibility, kind });
             }
             0x0022 => g.date1904 = c.u16()? == 1,
+            0x000E => g.precision_as_displayed = c.u16()? == 0,
             0x041E => {
                 let ifmt = c.u16()?;
-                let code = c.string()?;
+                let cch = usize::from(c.u16()?);
+                let high = c.u8()? & 1 != 0;
+                // Some writers count one character more than the record holds; Excel opens
+                // those files, so keep the characters that are there.
+                let fit = c.remaining() / if high { 2 } else { 1 };
+                if cch > fit {
+                    report.warn("Some number formats were shorter than their declared length; the characters present were kept.");
+                }
+                let code = c.chars(cch.min(fit), high)?;
                 budget.text(code.len())?;
                 g.formats.insert(ifmt, code);
             }
@@ -297,6 +313,9 @@ fn globals(stream: &[u8], budget: &mut Budget) -> Result<Globals, IoError> {
             _ => {}
         }
     }
+    // The same test `defined_names` applies, before any cell formula is decoded.
+    let skipped = g.names.iter().map(|l| !l.rgce.is_empty() && decode(&l.rgce, &l.rgcb, CellRef::new(0, 0), Mode::Name, &g.links).is_err()).collect();
+    g.links.skipped = skipped;
     Ok(g)
 }
 
@@ -390,9 +409,12 @@ struct SheetState<'g> {
     shared: HashMap<CellRef, Parsed>,
     arrays: HashMap<CellRef, (RangeRef, Parsed)>,
     last_formula: Option<CellRef>,
-    pending_string: Option<CellRef>,
+    /// The cell waiting for its String record, with its style: a blank cell isn't stored, so a
+    /// formula kept as its value may have no cell to receive the text.
+    pending_string: Option<(CellRef, StyleId)>,
     dropped: usize,
     unsupported: Vec<&'static str>,
+    calc: CalcSettings,
 }
 
 impl SheetState<'_> {
@@ -462,7 +484,7 @@ fn worksheet(
     styles: &[StyleId],
     budget: &mut Budget,
     report: &mut ReadReport,
-) -> Result<Option<Sheet>, IoError> {
+) -> Result<Option<(Sheet, CalcSettings)>, IoError> {
     if bs.pos >= stream.len() {
         return Err(invalid(format!("sheet '{}' points outside the Workbook stream", bs.name)));
     }
@@ -483,6 +505,7 @@ fn worksheet(
         pending_string: None,
         dropped: 0,
         unsupported: vec![],
+        calc: CalcSettings::default(),
     };
     let mut depth = 1usize;
     while let Some(rec) = recs.next_record()? {
@@ -507,9 +530,9 @@ fn worksheet(
     }
     // Shared and array formulas: their definitions follow the first cell that uses them.
     let (arrays, shared) = (std::mem::take(&mut st.arrays), std::mem::take(&mut st.shared));
-    for p in std::mem::take(&mut st.pending) {
+    let pending = std::mem::take(&mut st.pending);
+    for p in &pending {
         if let Some((range, f)) = arrays.get(&p.anchor) {
-            // The other cells of an array formula keep only their values.
             if p.pos == p.anchor {
                 st.attach(p.pos, f, Mode::Cell, Some(*range));
             }
@@ -519,13 +542,23 @@ fn worksheet(
             st.unsupported("a shared formula that is missing from the file");
         }
     }
+    // The other cells of a legacy array formula hold only cached results: dropped, as when an
+    // .xlsx is read, so that the formula fills its range on recalculation. If the formula itself
+    // couldn't be imported, they keep their values.
+    for p in &pending {
+        let filled = st.sheet.cell(p.anchor).and_then(|c| c.formula.as_ref()).and_then(|f| f.array).is_some_and(|r| r.contains(p.pos));
+        if p.pos != p.anchor && filled {
+            let style = st.sheet.style_id(p.pos);
+            st.sheet.cells.set(p.pos, Cell { value: Value::Empty, formula: None, style });
+        }
+    }
     if st.dropped > 0 {
         report.warn(format!("{} cells outside the grid were skipped.", st.dropped));
     }
     for why in &st.unsupported {
         report.warn(format!("Some formulas use {why}; their saved results were kept as values."));
     }
-    Ok(Some(st.sheet))
+    Ok(Some((st.sheet, st.calc)))
 }
 
 fn sheet_record(rec: &Record<'_>, st: &mut SheetState<'_>, budget: &mut Budget, report: &mut ReadReport) -> Result<(), IoError> {
@@ -594,11 +627,13 @@ fn sheet_record(rec: &Record<'_>, st: &mut SheetState<'_>, budget: &mut Budget, 
         }
         0x0006 => formula_cell(&mut c, st, budget)?,
         0x0207 => {
-            if let Some(pos) = st.pending_string.take() {
+            if let Some((pos, style)) = st.pending_string.take() {
                 let s = c.string()?;
                 budget.text(s.len())?;
                 if let Some(cell) = st.sheet.cells.get_mut(pos) {
                     cell.value = Value::from(s);
+                } else {
+                    st.sheet.cells.set(pos, Cell { value: Value::from(s), formula: None, style });
                 }
             }
         }
@@ -620,6 +655,16 @@ fn sheet_record(rec: &Record<'_>, st: &mut SheetState<'_>, budget: &mut Budget, 
                 st.arrays.insert(at, (range, f));
             }
         }
+        0x000D => {
+            st.calc.mode = match c.u16()? as i16 {
+                0 => CalcMode::Manual,
+                -1 => CalcMode::AutomaticExceptTables,
+                _ => CalcMode::Automatic,
+            }
+        }
+        0x000C => st.calc.set_max_iterations(u32::from(c.u16()?)),
+        0x0011 => st.calc.iterative = c.u16()? == 1,
+        0x0010 => st.calc.set_max_change(c.f64()?),
         0x0236 => report.warn("What-if data tables are not supported; their values were kept."),
         0x00E5 => {
             let n = usize::from(c.u16()?);
@@ -736,7 +781,7 @@ fn formula_cell(c: &mut Cursor<'_, '_>, st: &mut SheetState<'_>, budget: &mut Bu
     st.sheet.cells.set(pos, Cell { value, formula: None, style });
     st.last_formula = Some(pos);
     if string_result {
-        st.pending_string = Some(pos);
+        st.pending_string = Some((pos, style));
     }
     // PtgExp: part of a shared or array formula anchored at another cell.
     if f.rgce.len() == 5 && f.rgce.first() == Some(&0x01) {

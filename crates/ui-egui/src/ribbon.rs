@@ -131,6 +131,9 @@ pub fn title_bar(app: &mut SheetApp, ui: &mut Ui) {
                 }
                 let share = small_button(ui, Icon::Share, "Share", "Share: export or save a copy", true);
                 egui::Popup::menu(&share).show(|ui| {
+                    if ui.button("Export as PDF…").clicked() {
+                        app.run_or_alert("file.exportPdf", json!({}));
+                    }
                     for (label, fmt) in
                         [("Save a Copy as Excel Workbook (.xlsx)…", "xlsx"), ("Export as CSV…", "csv"), ("Export as Web Page (.html)…", "html")]
                     {
@@ -343,6 +346,12 @@ fn anchor_keytip(app: &SheetApp, ui: &Ui, response: &egui::Response, targets: &[
     }
 }
 
+/// The `on` value for a ribbon checkbox command. A click has already flipped the checkbox bool, so
+/// it is sent as is; a key tip leaves the bool untouched, so the command gets the opposite.
+fn checkbox_on(clicked: bool, shown: bool) -> bool {
+    shown == clicked
+}
+
 /// Consume a one-shot keytip request for control `id` (set by `Action::Control`).
 fn invoke(app: &mut SheetApp, id: &str) -> bool {
     if app.ui.keytip_invoke == Some(id) {
@@ -367,7 +376,7 @@ struct ComboState {
 }
 
 /// What the user did with an [`editable_combo`].
-enum ComboResult {
+pub(crate) enum ComboResult {
     None,
     /// A row was applied: clicked or Enter on the highlighted row.
     Picked(String),
@@ -378,7 +387,7 @@ enum ComboResult {
 /// Excel-style dropdown: a filter field (type to narrow the list) plus arrow/Enter selection.
 /// `items` are `(value, display)`; the value is what comes back. When `forced` (keytip invoke)
 /// or clicked, the popup opens, focuses the filter field, and selects its text.
-fn editable_combo(
+pub(crate) fn editable_combo(
     ui: &mut Ui,
     anchor: &egui::Response,
     salt: &'static str,
@@ -483,6 +492,8 @@ fn menu_items(app: &mut SheetApp, ui: &mut Ui, items: &[(&str, &str, serde_json:
         if response.clicked() {
             if let Some(d) = id.strip_prefix("dialog:") {
                 app.open_dialog(d, p.clone());
+            } else if *id == "edit.paste" {
+                app.paste_from_clipboard();
             } else {
                 act(app, id, p.clone());
             }
@@ -495,17 +506,14 @@ fn home(app: &mut SheetApp, ui: &mut Ui) {
     let st = active_style(app);
     // Clipboard
     let paste = big_button(ui, Icon::Paste, "Paste", "Paste (⌘V)", true);
+    paste.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Paste"));
     for sequence in
         keytip_table::group_extension(app.keytips.prefix().unwrap_or_default(), &["edit.paste", "edit.pasteSpecial", "dialog:pasteSpecial"])
     {
         keytip(app, ui, sequence, paste.rect.center_bottom());
     }
     if paste.clicked() {
-        if let Some(text) = app.grid.system_clipboard.take() {
-            app.paste_external(text);
-        } else {
-            act(app, "edit.paste", json!({}));
-        }
+        app.paste_from_clipboard();
     }
     let paste_keys = matches!(app.keytips.prefix(), Some("HV" | "E"));
     // Keep a keyboard-opened menu anchored to the button when a pointer click
@@ -1426,7 +1434,13 @@ fn insert(app: &mut SheetApp, ui: &mut Ui) {
     let __k = big_button(ui, Icon::Chart, "Recommended\nCharts", "Recommended Charts", false);
     control_keytip(app, ui, &__k, "insert.recommendedCharts");
     if __k.clicked() {
-        act(app, "insert.recommendedCharts", json!({}));
+        match app.run("insert.recommendedCharts", json!({})) {
+            // The new chart is selected, as after inserting any other object (see insert.chart
+            // in dialogs.rs) — otherwise the prior cell/range selection is left in place, and
+            // Del right after inserting deletes the source data instead of the chart.
+            Ok(r) => app.selected_chart = r.get("chart").and_then(serde_json::Value::as_u64).and_then(|id| u32::try_from(id).ok()),
+            Err(e) => app.message = Some(("GridCraft".into(), crate::clean_error(&e))),
+        }
     }
     ui.vertical(|ui| {
         ui.horizontal(|ui| {
@@ -1698,13 +1712,13 @@ fn page_layout(app: &mut SheetApp, ui: &mut Ui) {
         let resp = ui.checkbox(&mut v, screen);
         control_keytip(app, ui, &resp, "view.gridlines");
         if resp.changed() || invoke(app, "view.gridlines") {
-            act(app, "view.gridlines", json!({"on": !v}));
+            act(app, "view.gridlines", json!({"on": checkbox_on(resp.changed(), v)}));
         }
         let mut p = sh.2;
         let resp = ui.checkbox(&mut p, print);
         control_keytip(app, ui, &resp, "pageLayout.printGridlines");
         if resp.changed() || invoke(app, "pageLayout.printGridlines") {
-            act(app, "pageLayout.printGridlines", json!({"on": !p}));
+            act(app, "pageLayout.printGridlines", json!({"on": checkbox_on(resp.changed(), p)}));
         }
     });
     ui.vertical(|ui| {
@@ -1713,13 +1727,13 @@ fn page_layout(app: &mut SheetApp, ui: &mut Ui) {
         let resp = ui.checkbox(&mut v, screen);
         control_keytip(app, ui, &resp, "view.headings");
         if resp.changed() || invoke(app, "view.headings") {
-            act(app, "view.headings", json!({"on": !v}));
+            act(app, "view.headings", json!({"on": checkbox_on(resp.changed(), v)}));
         }
         let mut p = sh.3;
         let resp = ui.checkbox(&mut p, print);
         control_keytip(app, ui, &resp, "pageLayout.printHeadings");
         if resp.changed() || invoke(app, "pageLayout.printHeadings") {
-            act(app, "pageLayout.printHeadings", json!({"on": !p}));
+            act(app, "pageLayout.printHeadings", json!({"on": checkbox_on(resp.changed(), p)}));
         }
     });
     let rtl = app.session.active().and_then(|d| d.wb.active()).is_some_and(|s| s.right_to_left);
@@ -2022,9 +2036,6 @@ fn review(app: &mut SheetApp, ui: &mut Ui) {
     if __k.clicked() {
         app.open_dialog("comment", json!({"threaded": true}));
     }
-    if big_button(ui, Icon::Comment, "Show\nComments", "Comments pane", false).clicked() {
-        app.grid.pane = Some("comments".into());
-    }
     let __k = big_button(ui, Icon::Delete, "Delete", "Delete Comment", false);
     control_keytip(app, ui, &__k, "review.deleteComment");
     if __k.clicked() {
@@ -2106,6 +2117,7 @@ fn view(app: &mut SheetApp, ui: &mut Ui) {
     let lang = app.ui.language;
     let page_layout =
         app.session.active().and_then(|d| d.wb.active().map(|s| s.view == gridcraft_engine::model::SheetViewMode::PageLayout)).unwrap_or(false);
+    // Two columns of two, as in Excel's Show group: four stacked rows overflow the ribbon body.
     ui.vertical(|ui| {
         // Rulers exist only in Page Layout view.
         let mut ruler = !app.session.hide_ruler;
@@ -2114,17 +2126,20 @@ fn view(app: &mut SheetApp, ui: &mut Ui) {
         if ruler_resp.changed() {
             act(app, "view.ruler", json!({"on": ruler}));
         }
-        let mut fb = app.session.prefs.formula_bar;
-        let resp = ui.checkbox(&mut fb, lang.tr("Formula Bar"));
-        control_keytip(app, ui, &resp, "view.formulaBar");
-        if resp.changed() || invoke(app, "view.formulaBar") {
-            act(app, "view.formulaBar", json!({"on": !fb}));
-        }
         let mut g = s.0;
         let resp = ui.checkbox(&mut g, lang.tr("Gridlines"));
         control_keytip(app, ui, &resp, "view.gridlines");
         if resp.changed() {
             act(app, "view.gridlines", json!({"on": g}));
+        }
+    });
+    ui.add_space(6.0);
+    ui.vertical(|ui| {
+        let mut fb = app.session.prefs.formula_bar;
+        let resp = ui.checkbox(&mut fb, lang.tr("Formula Bar"));
+        control_keytip(app, ui, &resp, "view.formulaBar");
+        if resp.changed() || invoke(app, "view.formulaBar") {
+            act(app, "view.formulaBar", json!({"on": checkbox_on(resp.changed(), fb)}));
         }
         let mut h = s.1;
         let resp = ui.checkbox(&mut h, lang.tr("Headings"));
@@ -2447,11 +2462,13 @@ pub fn shortcut(app: &mut SheetApp, key: Key, m: Modifiers) {
         }
         Key::Semicolon => {
             // Insert today's date.
-            let today = gridcraft_engine::calc::now_serial().floor();
             let text = app
                 .session
                 .active()
-                .map(|d| gridcraft_engine::display::format(&gridcraft_engine::core::Value::Number(today), "m/d/yyyy", &d.wb).text)
+                .map(|d| {
+                    let today = gridcraft_engine::core::date::serial_in_system(d.wb.date_system, gridcraft_engine::calc::now_serial()).floor();
+                    gridcraft_engine::display::format(&gridcraft_engine::core::Value::Number(today), "m/d/yyyy", &d.wb).text
+                })
                 .unwrap_or_default();
             app.begin_edit(Some(text), false);
             None
@@ -2480,5 +2497,20 @@ mod title_bar_tests {
         let margin = (MAC_TITLE_BAR - MAC_LIGHT) / 2.0;
         let lights_end = MAC_LIGHTS_LEFT + 2.0 * MAC_LIGHT_PITCH + MAC_LIGHT;
         assert_eq!(MAC_CONTENT_LEFT - lights_end, margin);
+    }
+}
+
+#[cfg(test)]
+mod checkbox_on_tests {
+    use super::*;
+
+    #[test]
+    fn click_sends_the_new_checkbox_value_and_key_tip_the_opposite() {
+        // Click: the checkbox bool already holds the new choice.
+        assert!(!checkbox_on(true, false));
+        assert!(checkbox_on(true, true));
+        // Key tip: the bool still holds the current setting, so toggle it.
+        assert!(checkbox_on(false, false));
+        assert!(!checkbox_on(false, true));
     }
 }

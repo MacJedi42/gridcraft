@@ -958,7 +958,7 @@
   {
    "seq": "HVP",
    "kind": "command",
-   "target": "edit.pasteSpecial",
+   "target": "edit.paste",
    "excel": "Paste",
    "note": ""
   },

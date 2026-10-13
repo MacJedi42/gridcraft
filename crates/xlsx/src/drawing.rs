@@ -11,6 +11,8 @@ use crate::read::Ctx;
 use crate::tables::EMU_PER_PX;
 use crate::xml::{El, esc, esc_attr};
 
+mod ink;
+
 // ---------------------------------------------------------------- reading
 
 fn emu_px(v: Option<i64>) -> f32 {
@@ -195,6 +197,9 @@ pub fn read_drawing(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet) -> Result<(
 
 fn read_shape(obj: &El, anchor: Anchor) -> Option<Shape> {
     let sp = obj.child("spPr")?;
+    if let Some(shape) = ink::read(obj, anchor) {
+        return Some(shape);
+    }
     let prst = sp.child("prstGeom").and_then(|g| g.attr("prst")).unwrap_or("rect");
     let tx_box = obj.path(&["nvSpPr", "cNvSpPr"]).is_some_and(|c| c.flag("txBox", false));
     let ln = sp.child("ln");
@@ -358,6 +363,12 @@ pub fn write_drawing(sheet: &Sheet, theme: &Theme, objs: &[Obj<'_>]) -> String {
                 let (open, close) = anchor_open(sheet, &sh.anchor);
                 close_tag = close;
                 s.push_str(&open);
+                if let Some(xml) = ink::write(sh, theme, id) {
+                    s.push_str(&xml);
+                    s.push_str("<xdr:clientData/>");
+                    s.push_str(close_tag);
+                    continue;
+                }
                 let (prst, tx) = match sh.kind {
                     ShapeKind::Rectangle => ("rect", false),
                     ShapeKind::RoundedRectangle => ("roundRect", false),

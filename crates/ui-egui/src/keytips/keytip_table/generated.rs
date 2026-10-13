@@ -147,7 +147,7 @@ pub const SEQUENCES: &[(&str, Entry)] = &[
     ("HUI", Entry::Finish(Action::Command("formulas.autoSum"))), // Excel: Auto Min; AutoSum: Min (variant TBD)
     ("HUM", Entry::Finish(Action::Command("formulas.autoSum"))), // Excel: Auto Max; AutoSum: Max (variant TBD)
     ("HV", Entry::Continue),  // Excel: Paste; group level:
-    ("HVP", Entry::Finish(Action::Command("edit.pasteSpecial"))), // Excel: Paste
+    ("HVP", Entry::Finish(Action::Command("edit.paste"))), // Excel: Paste
     ("HW", Entry::Continue),  // Excel: Wrap Text Menu; group level: containment(Wrap Text)
     ("HWW", Entry::Finish(Action::Command("home.wrapText"))), // Excel: Wrap Text
     ("HX", Entry::Finish(Action::Command("edit.cut"))), // Excel: Cut

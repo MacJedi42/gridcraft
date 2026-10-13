@@ -181,6 +181,7 @@ pub fn handle(app: &mut SheetApp, ctx: &egui::Context, method: &str, p: &Json) -
                 ("view.darkMode", "Dark Mode", ""),
                 ("view.theme", "Display Theme", ""),
                 ("view.animations", "Animations", "{on?: bool} (toggles without it) → {on}"),
+                ("options.autoComplete", "Enable AutoComplete for cell values", "{on?: bool} (toggles without it) → {on}"),
                 ("view.interfaceScale", "Interface Size", "{percent: 75–200 | \"auto\"} (100 = auto; clamped)"),
                 ("ui.dialog", "Open Dialog", ""),
                 ("ui.backstage", "File (Backstage view)", "{page?: home|new|open|info|saveAs|print|export|options|close}"),
@@ -242,7 +243,7 @@ pub fn handle(app: &mut SheetApp, ctx: &egui::Context, method: &str, p: &Json) -
                 } else if field == "search" {
                     d.search = s("value").unwrap_or("").to_string();
                 } else {
-                    d.values.insert(field.to_string(), p.get("value").cloned().unwrap_or(Json::Null));
+                    d.set_value(field, p.get("value").cloned().unwrap_or(Json::Null));
                 }
                 ok(json!(d.values))
             }

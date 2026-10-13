@@ -20,6 +20,42 @@ pub const COL_HEADER_H: f32 = 21.0;
 /// which matches desktop spreadsheet density (a default 20 px row is 16 pt tall).
 pub const DISPLAY_SCALE: f32 = 0.8;
 
+/// The zoom percentages a Ctrl+wheel notch steps between: four per doubling (about 20% apart),
+/// so 25, 50, 100, 200 and 400 are on it. Excel steps 15 points a notch instead; the status bar's
+/// Zoom In / Zoom Out buttons keep their 10% steps.
+pub const WHEEL_ZOOM_LADDER: [u16; 22] = [10, 12, 15, 18, 21, 25, 30, 35, 42, 50, 60, 70, 85, 100, 120, 140, 170, 200, 240, 280, 340, 400];
+
+/// Seconds without Ctrl+wheel input after which part of a notch turned so far is forgotten.
+const WHEEL_ZOOM_IDLE: f64 = 0.75;
+
+/// The zoom one Ctrl+wheel notch goes to from `zoom`: the next step on [`WHEEL_ZOOM_LADDER`] in
+/// that direction, skipping a step less than 5% away (121% out goes to 100%, not 120%), but never
+/// 100% or the 10% / 400% limits (99% or 101% towards 100% goes to 100%).
+pub fn wheel_zoom_step(zoom: u16, zoom_in: bool) -> u16 {
+    let zoom = zoom.clamp(10, 400);
+    let z = u32::from(zoom);
+    let far = |l: u32| if zoom_in { l * 100 >= z * 105 } else { l * 105 <= z * 100 };
+    let mut ahead = WHEEL_ZOOM_LADDER.iter().copied().filter(|&l| if zoom_in { l > zoom } else { l < zoom }).collect::<Vec<_>>();
+    if !zoom_in {
+        ahead.reverse();
+    }
+    let limit = ahead.last().copied().unwrap_or(zoom);
+    ahead.into_iter().find(|&l| l == 100 || far(u32::from(l))).unwrap_or(limit)
+}
+
+/// One frame of the zoom gliding from `from` to `to` percent: the share `t` (0–1) of the way,
+/// measured as a ratio so zooming in and out feel alike, and at least one percent, so it arrives.
+pub fn zoom_glide_step(from: u16, to: u16, t: f32) -> u16 {
+    let (f, g) = (f32::from(from.max(1)), f32::from(to.max(1)));
+    let next = (f * (g / f).powf(t.clamp(0.0, 1.0))).round();
+    let next = if next.is_finite() { next.clamp(f32::from(from.min(to)), f32::from(from.max(to))) as u16 } else { to };
+    match (next == from, from.cmp(&to)) {
+        (true, std::cmp::Ordering::Less) => from + 1,
+        (true, std::cmp::Ordering::Greater) => from - 1,
+        _ => next,
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum Drag {
     #[default]
@@ -68,11 +104,15 @@ pub enum Drag {
 pub struct GridState {
     pub drag: Drag,
     pub ensure_visible: bool,
+    /// With `ensure_visible`: scroll to the moving end of the selection instead of the active cell
+    /// (Shift/Ctrl+Shift+arrows keep the active cell on the anchor while the far corner moves).
+    pub reveal_moving_end: bool,
     pub last_title: Option<String>,
     pub drag_select: bool,
     pub rect: Option<Rect>,
     pub cells_rect: Option<Rect>,
-    pub filter_menu: Option<(u32, Pos2)>,
+    /// Column and row of the clicked header cell, and where to open the menu.
+    pub filter_menu: Option<(u32, u32, Pos2)>,
     pub context_menu: Option<Pos2>,
     pub marching_phase: f32,
     /// The selection outline on its way to a new selection.
@@ -84,7 +124,6 @@ pub struct GridState {
     pub last_border: String,
     pub last_fill: String,
     pub last_font_color: String,
-    pub system_clipboard: Option<String>,
     pub trace: Option<serde_json::Value>,
     pub renaming_tab: Option<usize>,
     pub rename_text: String,
@@ -100,10 +139,42 @@ pub struct GridState {
     pub paper: Option<crate::paper_view::PaperCache>,
     /// Header or footer being edited in place (Page Layout view).
     pub hf_edit: Option<crate::paper_view::HfEdit>,
+    /// A page margin being dragged on a ruler (Page Layout view); committed on release.
+    pub ruler_drag: Option<crate::paper_view::RulerDrag>,
     /// Insert › Header & Footer: start editing the first page's header once Page Layout view is up.
     pub hf_start: bool,
     /// The grid geometry of the last frame (hit-testing for agents and tests).
     pub geo: Option<Geo>,
+    /// The horizontal scrollbar's track in the sheet tab bar (hit-testing for tests).
+    pub hscroll: Option<Rect>,
+    /// Ctrl+wheel zoom in progress (see [`WheelZoom`]).
+    pub wheel_zoom: Option<WheelZoom>,
+}
+
+/// Ctrl+wheel zoom for one (doc uid, sheet). egui eases a notch in over several frames and
+/// fine-grained wheels send parts of one, so the turning is counted in notches, and each whole
+/// notch steps [`WHEEL_ZOOM_LADDER`]. With animations on the zoom then glides to that step.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WheelZoom {
+    pub place: (u64, usize),
+    /// Turned so far towards the next step, in notches (+ in, − out).
+    pub notches: f32,
+    /// When `notches` last changed.
+    pub time: f64,
+    /// The step the zoom is gliding to, and the percentage set last on the way.
+    pub glide: Option<(u16, u16)>,
+}
+
+impl WheelZoom {
+    /// The state for `place` showing `zoom` percent: fresh for another document or sheet, and
+    /// without its glide if the zoom was changed some other way since the glide set it.
+    fn at(app: &SheetApp, place: (u64, usize), zoom: u16, now: f64) -> WheelZoom {
+        let mut w = app.grid.wheel_zoom.filter(|w| w.place == place).unwrap_or(WheelZoom { place, notches: 0.0, time: now, glide: None });
+        if w.glide.is_some_and(|(_, shown)| shown != zoom) {
+            w.glide = None;
+        }
+        w
+    }
 }
 
 impl GridState {
@@ -228,6 +299,13 @@ impl Geo {
         match &self.paper {
             Some(pg) => pg.row_y(row) as f32,
             None => (sh.row_top(row) - sh.row_top(self.fr)) as f32,
+        }
+    }
+    /// Scroll offset (in `scroll` units) at which `col` reaches the left of the scrolled area.
+    pub fn scroll_left_of(&self, sh: &Sheet, col: u32) -> f32 {
+        match &self.paper {
+            Some(pg) => pg.col_x(col) as f32,
+            None => (sh.col_left(col) - sh.col_left(self.fc)) as f32,
         }
     }
     /// Screen x for a logical x (and back): identity unless the sheet is right-to-left.
@@ -368,6 +446,15 @@ fn numfmt_color(c: gridcraft_engine::numfmt::FormatColor) -> Color32 {
     }
 }
 
+/// Last column of a Center Across Selection run starting at `start`: it extends over following columns (up to `limit`) while `continues` holds.
+fn center_across_end(start: u32, limit: u32, continues: impl Fn(u32) -> bool) -> u32 {
+    let mut end = start;
+    while end < limit && end + 1 < MAX_COLS && continues(end + 1) {
+        end += 1;
+    }
+    end
+}
+
 fn look(wb: &Workbook, si: usize, sh: &Sheet, c: CellRef, cf: &mut CfCache) -> (Look, Option<CfLook>) {
     let mut style = wb.styles.get(sh.style_id(c)).clone();
     if let Some(t) = sh.table_at(c) {
@@ -488,11 +575,17 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
     // Page Layout view: pages on a desk, rulers above and left of the headings.
     let paper = sh.view == gridcraft_engine::model::SheetViewMode::PageLayout;
     let ruler = if paper && !app.session.hide_ruler { crate::paper_view::RULER } else { 0.0 };
-    let grid_rect = Rect::from_min_max(pos2((rect.left() + ruler).min(rect.right()), (rect.top() + ruler).min(rect.bottom())), rect.max);
+    // Right-to-left sheets carry the vertical ruler on the right, beside the row headings.
+    let grid_rect = if rtl {
+        Rect::from_min_max(pos2(rect.left(), (rect.top() + ruler).min(rect.bottom())), pos2((rect.right() - ruler).max(rect.left()), rect.bottom()))
+    } else {
+        Rect::from_min_max(pos2((rect.left() + ruler).min(rect.right()), (rect.top() + ruler).min(rect.bottom())), rect.max)
+    };
     let make_geo = |app: &mut SheetApp, scroll: egui::Vec2| -> Geo {
         if paper {
             let probe = Geo::new(sh, grid_rect, scroll);
             if let Some(g) = crate::paper_view::grid_for(app, &wb, si, sh, probe.cells.size(), scroll) {
+                let g = crate::paper_view::with_dragged_margin(app, &wb, si, g);
                 return Geo::paged(sh, grid_rect, scroll, g);
             }
         }
@@ -502,8 +595,34 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
     let (scroll_delta, zoom_delta, modifiers, now) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.modifiers, i.time));
     if (resp.hovered() || resp.contains_pointer()) && !crate::text_box::contains_pointer(app, ui.ctx()) {
         if zoom_delta != 1.0 {
-            let z = (sh.zoom as f32 * zoom_delta).clamp(10.0, 400.0).round();
-            let _ = app.session.run("view.zoom", json!({"percent": z}));
+            // egui's zoom factor is e^(speed × points); one notch is `line_scroll_speed` points.
+            let notch = ui.ctx().options(|o| o.input_options.scroll_zoom_speed * o.input_options.line_scroll_speed);
+            let turned = zoom_delta.ln() / notch;
+            let mut zooming = WheelZoom::at(app, place, sh.zoom, now);
+            if now - zooming.time > WHEEL_ZOOM_IDLE {
+                zooming.notches = 0.0;
+            }
+            if turned.is_finite() {
+                zooming.notches = (zooming.notches + turned).clamp(-32.0, 32.0);
+            }
+            zooming.time = now;
+            // A notch steps once 60% of it has turned, and the rest of it brings `notches` back to
+            // about 0. (Past half, so what's left after a step can't step back.) Steps count from
+            // where a glide is going, not from where it has got to.
+            let from = zooming.glide.map_or(sh.zoom, |(to, _)| to);
+            let mut z = from;
+            while zooming.notches >= 0.6 {
+                z = wheel_zoom_step(z, true);
+                zooming.notches -= 1.0;
+            }
+            while zooming.notches <= -0.6 {
+                z = wheel_zoom_step(z, false);
+                zooming.notches += 1.0;
+            }
+            if z != from {
+                zooming.glide = Some((z, sh.zoom));
+            }
+            app.grid.wheel_zoom = Some(zooming);
         } else if scroll_delta != egui::Vec2::ZERO {
             let z = if paper { make_geo(app, view.scroll).z } else { sh.zoom as f32 / 100.0 * DISPLAY_SCALE };
             let mut d = scroll_delta;
@@ -517,6 +636,22 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
             }
             view.scroll -= d / z;
         }
+    }
+    // The zoom glides to its step like egui eases a wheel notch (90% of the way in 0.1 s), or goes
+    // there at once without animations (as for the selection outline below: View › Animations
+    // off, egui's off in the headless harness, or a screenshot on its way).
+    let mut zooming = WheelZoom::at(app, place, sh.zoom, now);
+    if let Some((to, shown)) = zooming.glide {
+        let glides = app.ui.animations && ui.ctx().global_style().animation_time > 0.0 && !app.shots.in_flight();
+        let share = egui::emath::exponential_smooth_factor(0.9, 0.1, ui.input(|i| i.stable_dt).min(0.1));
+        let z = if glides { zoom_glide_step(shown, to, share) } else { to };
+        let _ = app.session.run("view.zoom", json!({"percent": z}));
+        zooming.glide = (z != to).then_some((to, z));
+        ui.ctx().request_repaint();
+    }
+    // Store a glide's progress, or that it stopped.
+    if app.grid.wheel_zoom.is_some_and(|w| w.glide.is_some()) {
+        app.grid.wheel_zoom = Some(zooming);
     }
     view.scroll = view.scroll.max(egui::Vec2::ZERO);
     let (mut max_x, mut max_y) = (sh.col_left(MAX_COLS - 20) as f32, sh.row_top(MAX_ROWS - 40) as f32);
@@ -533,10 +668,11 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
     view.scroll.x = view.scroll.x.min(max_x);
     view.scroll.y = view.scroll.y.min(max_y);
     let mut geo = make_geo(app, view.scroll);
-    // Keep the active cell visible after keyboard moves.
+    // Keep the active cell (or the moving end of an extension) visible after keyboard moves.
     if app.grid.ensure_visible {
         app.grid.ensure_visible = false;
-        let target = app.editor.as_ref().and_then(|e| e.point_cell).unwrap_or(sel.active);
+        let cell = if std::mem::take(&mut app.grid.reveal_moving_end) { sel.moving_end() } else { sel.active };
+        let target = app.editor.as_ref().and_then(|e| e.point_cell).unwrap_or(cell);
         if paper {
             crate::paper_view::ensure_covers(app, &wb, si, target);
             geo = make_geo(app, view.scroll);
@@ -725,6 +861,63 @@ fn vertical_scrollbar(app: &mut SheetApp, ui: &mut egui::Ui, sh: &Sheet, geo: &G
     if next != scroll {
         if let Some(v) = app.view_mut() {
             v.scroll.y = next;
+        }
+        ui.ctx().request_repaint();
+    }
+}
+
+/// The horizontal counterpart of `vertical_scrollbar`, drawn in the sheet tab bar as in Excel. The tab
+/// bar is laid out before the grid, so this reads the last frame's geometry and leaves clamping the
+/// far end to the grid, which runs later in the same frame.
+pub(crate) fn horizontal_scrollbar(app: &mut SheetApp, ui: &mut egui::Ui, track: Rect, t: &Tokens) {
+    app.grid.hscroll = Some(track);
+    if track.height() <= 0.0 || track.width() <= 0.0 {
+        return;
+    }
+    let Some(geo) = app.grid.geo.clone() else { return };
+    let Some(wb) = app.session.active().map(|d| d.wb.clone()) else { return };
+    let Some(sh) = wb.active() else { return };
+    let visible = ((geo.cells.width() - geo.frozen_w) / geo.z).max(0.0);
+    let scroll = app.view().scroll.x;
+    let last = sh.used_range().map(|r| r.end.col.saturating_add(10)).unwrap_or(26).clamp(26, MAX_COLS - 1);
+    let content = geo.scroll_left_of(sh, last);
+    let extent = (content - visible).max(scroll).max(0.0);
+    let id = ui.id().with("hscroll");
+    let resp = ui.interact(track, id, Sense::click_and_drag());
+    let drag_id = id.with("extent");
+    if resp.drag_started() {
+        ui.ctx().data_mut(|d| d.insert_temp(drag_id, extent));
+    }
+    let extent = if resp.dragged() { ui.ctx().data(|d| d.get_temp::<f32>(drag_id)).unwrap_or(extent) } else { extent };
+    let thumb_w = (track.width() * visible / (extent + visible).max(1.0)).clamp(24.0_f32.min(track.width()), track.width());
+    let travel = track.width() - thumb_w;
+    let offset = if extent > 0.0 { travel * (scroll / extent).clamp(0.0, 1.0) } else { 0.0 };
+    // A right-to-left sheet scrolls towards the left, so its thumb starts at the right end.
+    let dir = if geo.rtl { -1.0 } else { 1.0 };
+    let thumb_left = if geo.rtl { track.right() - thumb_w - offset } else { track.left() + offset };
+    let thumb = Rect::from_min_size(pos2(thumb_left, track.top() + 3.0), vec2(thumb_w, (track.height() - 6.0).max(0.0)));
+    ui.painter().rect_filled(track, 0.0, t.tab_bar);
+    ui.painter().rect_filled(thumb, 4.0, if resp.hovered() || resp.dragged() { t.text_dim } else { t.text_disabled });
+    let mut next = scroll;
+    if resp.dragged() && travel > 0.0 {
+        next += dir * resp.drag_delta().x / travel * extent;
+    } else if resp.clicked()
+        && let Some(p) = resp.interact_pointer_pos()
+    {
+        if p.x < thumb.left() {
+            next -= dir * visible;
+        } else if p.x > thumb.right() {
+            next += dir * visible;
+        }
+    }
+    if resp.hovered() {
+        let d = ui.input(|i| i.smooth_scroll_delta);
+        next -= (if d.x != 0.0 { dir * d.x } else { d.y }) / geo.z;
+    }
+    next = next.max(0.0);
+    if next != scroll {
+        if let Some(v) = app.view_mut() {
+            v.scroll.x = next;
         }
         ui.ctx().request_repaint();
     }
@@ -1035,17 +1228,24 @@ pub(crate) fn paint_quadrant(
             galley = p.layout_no_wrap(s, font.clone(), color);
             w = galley.size().x;
         }
+        // Center Across Selection: the text is centred over this cell and the empty cells to its right that also use it.
+        let across_end = if halign == HAlign::CenterAcross && !rotated && in_merge(c).is_none() {
+            center_across_end(c.col, c1 + 20, |col| {
+                let n = CellRef::new(c.row, col);
+                empty_ok(n) && wb.styles.get(sh.style_id(n)).align.h == HAlign::CenterAcross
+            })
+        } else {
+            c.col
+        };
         // Overflow into empty neighbours for text (not upright text, whose width is its line height).
         let mut clip = *rect;
-        if filter_space == 0.0
-            && !numeric
-            && !matches!(v, Value::Number(_))
-            && st.align.rotation.abs() != 90
-            && w > rect.width() - 2.0 * pad
-            && in_merge(c).is_none()
-        {
+        let overflows = !numeric && !matches!(v, Value::Number(_)) && st.align.rotation.abs() != 90 && w > rect.width() - 2.0 * pad;
+        if filter_space == 0.0 && (overflows || across_end > c.col) && in_merge(c).is_none() {
             let mut right = rect.right();
             let mut left = rect.left();
+            if across_end > c.col {
+                right = geo.x(sh, across_end + 1);
+            }
             if matches!(halign, HAlign::Left | HAlign::Center | HAlign::Justify) {
                 let mut cc = c.col + 1;
                 while right - rect.left() < w + 2.0 * pad && cc < MAX_COLS && empty_ok(CellRef::new(c.row, cc)) && cc <= c1 + 20 {
@@ -1075,7 +1275,8 @@ pub(crate) fn paint_quadrant(
             }
         }
         let x = match halign {
-            HAlign::Center | HAlign::CenterAcross | HAlign::Distributed => rect.center().x - w / 2.0,
+            HAlign::CenterAcross => clip.center().x - w / 2.0,
+            HAlign::Center | HAlign::Distributed => rect.center().x - w / 2.0,
             HAlign::Right => rect.right() - pad - w - indent,
             _ => text_left + pad + indent,
         };
@@ -1373,6 +1574,26 @@ fn range_in_pane(r: RangeRef, rows: (u32, u32), cols: (u32, u32)) -> bool {
     r.start.row <= rows.1 && r.end.row >= rows.0 && r.start.col <= cols.1 && r.end.col >= cols.0
 }
 
+/// The four sides of a `width` wide outline centred on `rect`, cut to `clip` (a little beyond it).
+///
+/// A stroked rectangle that spans a whole column (20 million points tall) loses its precision in
+/// the tessellator and its left and right sides vanish; sides filled from rectangles that stay
+/// near the viewport do not. Sides wholly outside `clip` are left out.
+pub(crate) fn outline_bands(rect: Rect, width: f32, clip: Rect) -> Vec<Rect> {
+    if !rect.is_finite() || !clip.is_finite() {
+        return Vec::new();
+    }
+    let h = width / 2.0;
+    let clip = clip.expand(width * 2.0);
+    let sides = [
+        Rect::from_min_max(pos2(rect.left() - h, rect.top() - h), pos2(rect.left() + h, rect.bottom() + h)),
+        Rect::from_min_max(pos2(rect.right() - h, rect.top() - h), pos2(rect.right() + h, rect.bottom() + h)),
+        Rect::from_min_max(pos2(rect.left() - h, rect.top() - h), pos2(rect.right() + h, rect.top() + h)),
+        Rect::from_min_max(pos2(rect.left() - h, rect.bottom() - h), pos2(rect.right() + h, rect.bottom() + h)),
+    ];
+    sides.into_iter().map(|s| s.intersect(clip)).filter(|s| s.is_finite() && s.width() > 0.0 && s.height() > 0.0).collect()
+}
+
 /// `outline` is where the current area's border is drawn this frame (see `selection_glide`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_selection(
@@ -1415,7 +1636,9 @@ pub(crate) fn paint_selection(
         }
     }
     if cur_here {
-        p.rect_stroke(outline.expand(0.5), 0.0, Stroke::new(2.0, t.sel_border), StrokeKind::Middle);
+        for side in outline_bands(outline.expand(0.5), 2.0, p.clip_rect()) {
+            p.rect_filled(side, 0.0, t.sel_border);
+        }
     }
     if active_here && sel.ranges.len() > 1 {
         p.rect_stroke(active, 0.0, Stroke::new(1.0, t.sel_border), StrokeKind::Inside);
@@ -1743,6 +1966,29 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
         }
     }
 
+    // Double-click the fill handle: a double-click is also a click, so run it before the handle press returns.
+    if resp.double_clicked()
+        && let Some(p) = pos
+        && on_handle(p)
+    {
+        // Fill down as far as the neighbouring column goes.
+        let src = sel.current();
+        let neighbour = if src.start.col > 0 { src.start.col - 1 } else { src.end.col + 1 };
+        let mut last = src.end.row;
+        while last + 1 < MAX_ROWS && sh.value_ref(CellRef::new(last + 1, neighbour)).is_some_and(|v| !v.is_empty()) && last - src.end.row < 1_000_000
+        {
+            last += 1;
+        }
+        if last > src.end.row {
+            let target = RangeRef::new(src.start, CellRef::new(last, src.end.col));
+            let _ = app.run("edit.autoFill", json!({"source": src.a1(), "target": target.a1()}));
+        }
+        app.grid.drag = Drag::None;
+        app.grid.drag_select = false;
+        resp.request_focus();
+        return;
+    }
+
     // Press: decide the drag mode.
     if resp.drag_started() || (primary_clicked && app.grid.drag == Drag::None) {
         // Where the press began (a drag is only recognised after the pointer has moved).
@@ -1770,6 +2016,9 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
                 return;
             }
             let c = geo.col_at(sh, p.x);
+            if point_header(app, wb, sh, RangeRef::cols(c, c)) {
+                return;
+            }
             if resp.drag_started()
                 && !mods.any()
                 && sel.ranges.len() == 1
@@ -1790,6 +2039,9 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
                 return;
             }
             let r = geo.row_at(sh, p.y);
+            if point_header(app, wb, sh, RangeRef::rows(r, r)) {
+                return;
+            }
             let range = if mods.shift { RangeRef::rows(sel.anchor.row.min(r), sel.anchor.row.max(r)) } else { RangeRef::rows(r, r) };
             select_ranges(app, range, mods.command, CellRef::new(r, geo.col_at(sh, geo.cells.left() + 1.0)));
             app.grid.drag = Drag::Rows(if mods.shift { sel.anchor.row } else { r });
@@ -1808,7 +2060,7 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
         }
         // Filter dropdown buttons.
         if is_filter_button(sh, geo, p) {
-            app.grid.filter_menu = Some((c.col, geo.mirror_pos(p)));
+            app.grid.filter_menu = Some((c.col, c.row, geo.mirror_pos(p)));
             return;
         }
         // Point mode while editing a formula: clicking inserts a reference.
@@ -2046,25 +2298,6 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
         app.grid.drag_select = false;
     }
 
-    // Double-click the fill handle.
-    if resp.double_clicked()
-        && let Some(p) = pos
-        && on_handle(p)
-    {
-        // Fill down as far as the neighbouring column goes.
-        let src = sel.current();
-        let neighbour = if src.start.col > 0 { src.start.col - 1 } else { src.end.col + 1 };
-        let mut last = src.end.row;
-        while last + 1 < MAX_ROWS && sh.value_ref(CellRef::new(last + 1, neighbour)).is_some_and(|v| !v.is_empty()) && last - src.end.row < 1_000_000
-        {
-            last += 1;
-        }
-        if last > src.end.row {
-            let target = RangeRef::new(src.start, CellRef::new(last, src.end.col));
-            let _ = app.run("edit.autoFill", json!({"source": src.a1(), "target": target.a1()}));
-        }
-    }
-
     // Right-click: context menu.
     if resp.secondary_clicked()
         && let Some(p) = pos
@@ -2095,6 +2328,16 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
         resp.request_focus();
     }
     keyboard(app, &ctx, resp, geo, sh);
+}
+
+/// Point mode on a header: inserts the whole-column or whole-row reference instead of selecting.
+fn point_header(app: &mut SheetApp, wb: &Workbook, sh: &Sheet, range: RangeRef) -> bool {
+    let Some(ed) = app.editor.as_mut().filter(|ed| ed.can_point()) else { return false };
+    let r = range.a1();
+    let r = if ed.sheet != wb.active_sheet { format!("{}!{r}", gridcraft_engine::formula::quote_sheet(&sh.name)) } else { r };
+    ed.insert_ref(&r);
+    ed.request_focus = true;
+    true
 }
 
 fn select_to_pointer(app: &mut SheetApp, geo: &Geo, sh: &Sheet, wb: &Workbook, p: Pos2) {
@@ -2281,15 +2524,18 @@ fn delete_selected_object(app: &mut SheetApp, sh: &Sheet) -> bool {
     true
 }
 
+/// A click on a hyperlink. References select; web and e-mail addresses ask first (the dialog's
+/// OK runs `link.open`); every other kind is refused with a message. The decision is the
+/// engine's ([`gridcraft_engine::links::classify`]), the same one `link.open` applies.
 pub fn follow_link(app: &mut SheetApp, target: &str) {
-    if target.contains("://") || target.starts_with("mailto:") {
-        if let Some(f) = &app.services.open_url {
-            f(target);
+    use gridcraft_engine::links::{LinkKind, classify};
+    match classify(target) {
+        LinkKind::Internal(r) => {
+            let _ = app.session.run("edit.goTo", json!({"reference": r.trim_start_matches('#')}));
+            app.grid.ensure_visible = true;
         }
-    } else {
-        let t = target.trim_start_matches('#');
-        let _ = app.session.run("edit.goTo", json!({"reference": t}));
-        app.grid.ensure_visible = true;
+        LinkKind::External(url) => app.open_dialog("openLink", json!({"url": url})),
+        LinkKind::Refused(why) => app.message = Some(("Hyperlink".into(), why)),
     }
 }
 
@@ -2371,6 +2617,7 @@ fn keyboard(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Response, geo:
                 let mv = |app: &mut SheetApp, dr: i64, dc: i64| {
                     let _ = app.session.run("selection.move", json!({"dr": dr, "dc": dc, "extend": shift, "jump": cmd}));
                     app.grid.ensure_visible = true;
+                    app.grid.reveal_moving_end = shift;
                 };
                 match key {
                     Key::ArrowUp => mv(app, -1, 0),
@@ -2396,6 +2643,12 @@ fn keyboard(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Response, geo:
                     Key::Home => {
                         let a = app.session.active().map(|d| d.selection.active).unwrap_or_default();
                         let _ = app.session.run("selection.set", json!({"cell": CellRef::new(a.row, 0).a1()}));
+                        app.grid.ensure_visible = true;
+                    }
+                    // Excel: Enter while a copied range is marked pastes it and ends copy mode.
+                    Key::Enter if !m.alt && !m.ctrl && !shift && !cmd && app.session.clipboard.is_some() => {
+                        app.run_or_alert("edit.paste", json!({}));
+                        app.session.clipboard = None;
                         app.grid.ensure_visible = true;
                     }
                     Key::Enter => {
@@ -2480,20 +2733,20 @@ fn popup_dismissed(response: &egui::Response, was_open: bool) -> bool {
     response.ctx.input(|i| !i.focused || i.key_pressed(egui::Key::Escape)) || (was_open && response.clicked_elsewhere())
 }
 
+/// The table whose header cell (`row`, `col`) was clicked, not just the first table in the column.
+fn filter_table_range(sh: &Sheet, col: u32, row: u32) -> Option<RangeRef> {
+    sh.tables.iter().find(|t| t.range.start.row == row && col >= t.range.start.col && col <= t.range.end.col).map(|t| t.range)
+}
+
 fn filter_menu(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, was_open: bool) {
-    let Some((col, at)) = app.grid.filter_menu else { return };
+    let Some((col, row, at)) = app.grid.filter_menu else { return };
     let Some(d) = app.session.active() else { return };
     let wb = d.wb.clone();
     let si = wb.active_sheet;
     let Some(sh) = wb.sheet(si) else { return };
     let _ = geo;
     // Tables get an autofilter on demand.
-    let table_range = sh
-        .tables
-        .iter()
-        .find(|t| t.range.start.row <= at.y as u32 || true)
-        .filter(|t| col >= t.range.start.col && col <= t.range.end.col)
-        .map(|t| t.range);
+    let table_range = filter_table_range(sh, col, row);
     if sh.autofilter.is_none()
         && let Some(r) = table_range
     {
@@ -2547,7 +2800,9 @@ fn filter_menu(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, was_open: bool)
                     c.1 = all_new;
                 }
             }
-            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+            // Full width: shrunk to the longest value, the scroll bar sat mid-menu and the wheel only
+            // worked over the values themselves (#432).
+            egui::ScrollArea::vertical().max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
                 for (v, on) in checks.iter_mut().filter(|(v, _)| matches(v)) {
                     ui.checkbox(on, v.as_str());
                 }
@@ -2651,6 +2906,7 @@ fn context_menu(app: &mut SheetApp, ui: &mut egui::Ui) {
                         "edit.copy" | "edit.cut" => {
                             app.copy_to_clipboard(ui.ctx(), id);
                         }
+                        "edit.paste" => app.paste_from_clipboard(),
                         other => app.run_or_alert(other, json!({})),
                     }
                 }
@@ -2674,7 +2930,17 @@ pub fn point_move(app: &mut SheetApp, ed: &mut EditState, dr: i64, dc: i64, exte
     let from = ed.point_cell.unwrap_or(ed.cell);
     let to = from.offset_clamped(dr, dc);
     let text = if extend {
-        let anchor = ed.point.and_then(|(s, e)| ed.text.get(s..e)).and_then(|t| CellRef::parse(t.split(':').next().unwrap_or(""))).unwrap_or(from);
+        // The anchor is the corner opposite the moving end: the written range is normalized, so
+        // after extending up or left its first cell is the moving end, not the anchor.
+        let pointed = ed.point.and_then(|(s, e)| ed.text.get(s..e)).and_then(RangeRef::parse);
+        let anchor = pointed
+            .map(|r| {
+                CellRef::new(
+                    if from.row == r.start.row { r.end.row } else { r.start.row },
+                    if from.col == r.start.col { r.end.col } else { r.start.col },
+                )
+            })
+            .unwrap_or(from);
         RangeRef::new(anchor, to).a1()
     } else {
         to.a1()
@@ -2715,8 +2981,9 @@ pub(crate) fn paint_overlays(
         p.rect_stroke(r, 2.0, Stroke::new(1.0, Color32::from_gray(160)), StrokeKind::Inside);
         crate::icons::paint(p, r.shrink(3.0), crate::icons::Icon::Chevron, Color32::from_gray(60));
     }
-    // Input message of the active cell's validation.
+    // Input message of the active cell's validation, hidden while its list is open: it would cover the items.
     if app.editor.is_none()
+        && app.grid.list_picker != Some(sel.active)
         && let Some(dv) = sh.validations.iter().find(|d| d.ranges.iter().any(|r| r.contains(sel.active)))
         && dv.show_input
         && !(dv.input_title.is_empty() && dv.input_message.is_empty())
@@ -2893,6 +3160,7 @@ fn header_menu(app: &mut SheetApp, ui: &mut egui::Ui, was_open: bool) {
                         "edit.copy" | "edit.cut" => {
                             app.copy_to_clipboard(ui.ctx(), id);
                         }
+                        "edit.paste" => app.paste_from_clipboard(),
                         other => app.run_or_alert(other, json!({})),
                     }
                 }
@@ -3052,6 +3320,104 @@ mod selection_fill_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel_zoom_steps_along_the_ladder_and_stops_at_100() {
+        for (from, zoom_in, to) in [
+            (100, true, 120),
+            (120, false, 100),
+            (100, false, 85),
+            // Between steps, the next one each way (Excel: 112% goes to 115% or 100%).
+            (112, true, 120),
+            (112, false, 100),
+            // A step less than 5% away is skipped…
+            (121, false, 100),
+            (86, false, 70),
+            (139, true, 170),
+            // …but never 100% or a limit.
+            (99, true, 100),
+            (101, false, 100),
+            (96, true, 100),
+            (385, true, 400),
+            (11, false, 10),
+            (400, true, 400),
+            (10, false, 10),
+            // Out-of-range zooms (from a file) come into range first.
+            (5, true, 12),
+            (1000, false, 340),
+            (0, false, 10),
+            (u16::MAX, true, 400),
+        ] {
+            assert_eq!(wheel_zoom_step(from, zoom_in), to, "{from}% {}", if zoom_in { "in" } else { "out" });
+        }
+        // Every step on the ladder is 15–25% from the next, and a notch in then out returns.
+        // (The glide between steps is `zoom_glide_moves_by_ratio_and_always_arrives`.)
+        for w in WHEEL_ZOOM_LADDER.windows(2) {
+            let ratio = f32::from(w[1]) / f32::from(w[0]);
+            assert!((1.15..=1.25).contains(&ratio), "{w:?}");
+            assert_eq!(wheel_zoom_step(w[0], true), w[1]);
+            assert_eq!(wheel_zoom_step(w[1], false), w[0]);
+        }
+    }
+
+    #[test]
+    fn zoom_glide_moves_by_ratio_and_always_arrives() {
+        // A third of the way per frame, as at 60 frames a second.
+        for (from, to) in [(100, 120), (120, 100), (10, 12), (340, 400), (400, 10), (85, 100)] {
+            let (mut z, mut frames) = (from, 0);
+            while z != to {
+                let next = zoom_glide_step(z, to, 0.32);
+                assert!(next != z && next.abs_diff(to) < z.abs_diff(to), "{from} → {to}: {z} then {next}");
+                z = next;
+                frames += 1;
+                assert!(frames < 40, "{from} → {to} arrives");
+            }
+            assert!(frames >= 2, "{from} → {to} glides over more than one frame ({frames})");
+        }
+        assert_eq!(zoom_glide_step(100, 120, 0.32), 106, "a third of the way by ratio");
+        assert_eq!(zoom_glide_step(120, 100, 0.32), 113);
+        // No progress asked or nonsense: still a percent closer, or straight there.
+        assert_eq!(zoom_glide_step(100, 120, 0.0), 101);
+        assert_eq!(zoom_glide_step(120, 100, f32::NAN), 100);
+        assert_eq!(zoom_glide_step(100, 120, 5.0), 120);
+        assert_eq!(zoom_glide_step(120, 120, 0.5), 120);
+        assert_eq!(zoom_glide_step(0, 10, 0.5), 3);
+    }
+
+    #[test]
+    fn center_across_run_stops_at_first_non_continuing_column() {
+        assert_eq!(center_across_end(0, 20, |c| c <= 2), 2);
+        assert_eq!(center_across_end(0, 20, |_| false), 0);
+        assert_eq!(center_across_end(0, 1, |_| true), 1);
+    }
+
+    #[test]
+    fn filter_menu_uses_the_table_whose_header_was_clicked() {
+        use gridcraft_engine::model::Table;
+        let table = |id: u32, r0: u32, r1: u32| Table {
+            id,
+            name: format!("T{id}"),
+            range: RangeRef::new(CellRef::new(r0, 0), CellRef::new(r1, 0)),
+            header_row: true,
+            totals_row: false,
+            columns: vec![],
+            style: String::new(),
+            banded_rows: true,
+            banded_cols: false,
+            first_col: false,
+            last_col: false,
+            filter_button: true,
+            filter: vec![],
+            table_type: None,
+            connection_id: None,
+        };
+        let mut sh = Sheet::new("S");
+        sh.tables.push(table(1, 0, 2));
+        sh.tables.push(table(2, 4, 7));
+        assert_eq!(filter_table_range(&sh, 0, 4), Some(sh.tables[1].range));
+        assert_eq!(filter_table_range(&sh, 0, 0), Some(sh.tables[0].range));
+        assert_eq!(filter_table_range(&sh, 1, 4), None);
+    }
 
     #[test]
     fn cell_text_y_moves_monotonically_in_standard_and_tall_rows() {
@@ -3236,5 +3602,29 @@ mod pane_tests {
         let handle = geo.range_rect(&sh, rng(5, 3, 6, 4)).right_bottom();
         assert!(handle.x < split.x);
         assert!(!geo.range_panes(rng(6, 4, 6, 4)).iter().any(|r| r.contains(handle)));
+    }
+}
+
+#[cfg(test)]
+mod outline_band_tests {
+    use super::*;
+
+    #[test]
+    fn whole_column_outline_keeps_left_and_right_sides_near_viewport() {
+        let clip = Rect::from_min_max(pos2(0.0, 0.0), pos2(800.0, 600.0));
+        let col = Rect::from_min_max(pos2(100.0, 40.0), pos2(180.0, 20_971_540.0));
+        let sides = outline_bands(col, 2.0, clip);
+        // Left, right and top (in view); the bottom is 20 million points away.
+        assert_eq!(sides.len(), 3);
+        assert!(sides.iter().all(|s| s.bottom() <= clip.bottom() + 4.0 + f32::EPSILON));
+        assert!(sides.iter().any(|s| s.left() < 100.0 && s.right() > 100.0 && s.height() > 500.0));
+        assert!(sides.iter().any(|s| s.left() < 180.0 && s.right() > 180.0 && s.height() > 500.0));
+    }
+
+    #[test]
+    fn outline_outside_the_view_and_non_finite_draw_nothing() {
+        let clip = Rect::from_min_max(pos2(0.0, 0.0), pos2(800.0, 600.0));
+        assert!(outline_bands(Rect::from_min_max(pos2(900.0, 0.0), pos2(950.0, 20.0)), 2.0, clip).is_empty());
+        assert!(outline_bands(Rect::from_min_max(pos2(f32::NAN, 0.0), pos2(1.0, 1.0)), 2.0, clip).is_empty());
     }
 }

@@ -117,6 +117,12 @@ pub struct Sheet {
 pub const DEFAULT_COL_WIDTH: f32 = 64.0;
 pub const DEFAULT_ROW_HEIGHT: f32 = 20.0;
 
+/// Column width (points) → characters of the default font's digit width (7 px), without the
+/// cell padding: the value the Column Width dialog shows.
+pub fn points_to_chars(px: f64) -> f64 {
+    if px <= 12.0 { (px / 12.0 * 100.0).round() / 100.0 } else { ((px - 5.0) / 7.0 * 100.0 + 0.5).trunc() / 100.0 }
+}
+
 impl Sheet {
     pub fn new(name: impl Into<String>) -> Sheet {
         Sheet {

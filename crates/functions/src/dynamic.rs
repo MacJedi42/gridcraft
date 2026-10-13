@@ -30,6 +30,11 @@ fn rows_of(a: &Array) -> Vec<Vec<Value>> {
     (0..a.rows).map(|r| (0..a.cols).map(|c| a.get(r, c).cloned().unwrap_or(Value::Empty)).collect()).collect()
 }
 
+/// `#NUM!` when an `h` x `w` output would exceed the function cell budget.
+fn check_output_size(h: usize, w: usize) -> R<()> {
+    if h.saturating_mul(w) > MAX_CELLS { Err(CellError::Num) } else { Ok(()) }
+}
+
 /// Builds an array from rows (all rows padded to the widest with `pad`). Empty → `#CALC!`.
 fn from_rows(rows: Vec<Vec<Value>>, pad: &Value) -> R<Value> {
     let h = rows.len();
@@ -37,9 +42,7 @@ fn from_rows(rows: Vec<Vec<Value>>, pad: &Value) -> R<Value> {
     if h == 0 || w == 0 {
         return Err(CellError::Calc);
     }
-    if h.saturating_mul(w) > MAX_CELLS {
-        return Err(CellError::Num);
-    }
+    check_output_size(h, w)?;
     let mut data = Vec::with_capacity(h * w);
     for mut r in rows {
         r.resize(w, pad.clone());
@@ -321,16 +324,20 @@ fn vstack(args: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
 fn hstack(args: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     let mut arrays = Vec::new();
     let mut h = 0usize;
+    let mut w = 0usize;
     let mut total = 0usize;
     for i in 0..args.len() {
         let a = arr_arg(args, i)?;
         h = h.max(a.rows);
+        w = w.saturating_add(a.cols);
         total = total.saturating_add(a.data.len());
         if total > MAX_CELLS {
             return Err(CellError::Num);
         }
         arrays.push(a);
     }
+    // The padded rectangle can be far larger than the inputs; refuse it before building any rows.
+    check_output_size(h, w)?;
     let mut rows = vec![Vec::new(); h];
     for a in &arrays {
         for (r, row) in rows.iter_mut().enumerate() {
@@ -785,6 +792,12 @@ fn groupby(args: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     from_rows(out, &Value::Empty)
 }
 
+/// Height and width of a PIVOTBY grid: `header_rows` (one per column field, plus the value-name row) and
+/// `body_rows` (row keys plus the total row), each `lead` row-field cells wide plus `value_cols` cells per column key.
+fn pivot_dims(header_rows: usize, body_rows: usize, col_keys: usize, value_cols: usize, lead: usize) -> (usize, usize) {
+    (header_rows.saturating_add(body_rows), col_keys.saturating_mul(value_cols).saturating_add(lead))
+}
+
 fn pivotby(args: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     let rf = arr_arg(args, 0)?;
     let cf = arr_arg(args, 1)?;
@@ -801,9 +814,6 @@ fn pivotby(args: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     let ckeys: Vec<Vec<Value>> = p.rows.iter().map(|&r| key_row(&cf, r)).collect();
     let rk = distinct_keys(&rkeys, if row_sort.unsigned_abs() as usize <= rf.cols { row_sort } else { 0 });
     let ck = distinct_keys(&ckeys, if col_sort.unsigned_abs() as usize <= cf.cols { col_sort } else { 0 });
-    if rk.len().saturating_add(2).saturating_mul((ck.len() + 1).saturating_mul(vals.cols).saturating_add(rf.cols)) > MAX_CELLS {
-        return Err(CellError::Num);
-    }
     let mut cell: HashMap<(String, String), Vec<usize>> = HashMap::new();
     for ((r, c), &i) in rkeys.iter().zip(ckeys.iter()).zip(p.rows.iter()) {
         cell.entry((row_key(r), row_key(c))).or_default().push(i);
@@ -832,6 +842,14 @@ fn pivotby(args: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
         cols.insert(0, None);
     }
     let lead = rf.cols;
+    let value_row = vals.cols > 1 || p.show_headers;
+    let header_rows = cf.cols.saturating_add(usize::from(value_row));
+    let body_rows = rk.len().saturating_add(usize::from(row_total != 0));
+    // Reject before building any header or body row: every column-field header row is as wide as the whole grid.
+    let (height, width) = pivot_dims(header_rows, body_rows, cols.len(), vals.cols, lead);
+    if height.saturating_mul(width) > MAX_CELLS {
+        return Err(CellError::Num);
+    }
     let mut out: Vec<Vec<Value>> = Vec::new();
     // Column header rows: one per column field, plus value names when several value columns.
     for level in 0..cf.cols {
@@ -847,7 +865,7 @@ fn pivotby(args: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
         }
         out.push(line);
     }
-    if vals.cols > 1 || p.show_headers {
+    if value_row {
         let mut line: Vec<Value> = if p.show_headers { p.field_headers.iter().take(lead).cloned().collect() } else { vec![Value::Empty; lead] };
         line.resize(lead, Value::Empty);
         for _ in &cols {
@@ -1133,6 +1151,17 @@ mod tests {
     }
 
     #[test]
+    fn output_size_checked_before_padding() {
+        assert_eq!(super::check_output_size(1_000_001, 10), Err(CellError::Num));
+        assert_eq!(super::check_output_size(usize::MAX, 2), Err(CellError::Num));
+        assert_eq!(super::check_output_size(1_000_000, 10), Ok(()));
+        // A 1M-row column beside a 9-wide row: ~1M input cells, but the padded result would be 10,000,010.
+        let tall = Value::from(gridcraft_core::Array::column(vec![nv(1.0); 1_000_001]));
+        let wide = row(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+        is_err(ev("HSTACK", vec![av(tall), av(wide)]), CellError::Num);
+    }
+
+    #[test]
     fn wrapping() {
         let r = ev("WRAPROWS", vec![av(row(&[1.0, 2.0, 3.0, 4.0, 5.0])), n(2.0)]);
         assert_eq!(rows_of(&r), vec![vec![nv(1.0), nv(2.0)], vec![nv(3.0), nv(4.0)], vec![nv(5.0), Value::Error(CellError::NA)]]);
@@ -1224,5 +1253,30 @@ mod tests {
                 vec![tv("Total"), nv(31.0), nv(12.0), nv(43.0)],
             ]
         );
+    }
+
+    #[test]
+    fn pivotby_size_check_counts_column_header_rows() {
+        // One row, n column fields and n value columns: n header rows + value-name row + body row + total row,
+        // each 1 + 2n wide. The size checked up front matches the grid PIVOTBY builds.
+        let dims = |k: u32, totals: bool| {
+            let fields: Vec<f64> = (0..k).map(f64::from).collect();
+            let mut args = vec![av(row(&[1.0])), av(row(&fields)), av(row(&fields)), t("SUM")];
+            if !totals {
+                args.extend([empty(), n(0.0), empty(), n(0.0)]);
+            }
+            let r = rows_of(&ev("PIVOTBY", args));
+            (r.len(), r.first().map_or(0, Vec::len))
+        };
+        assert_eq!(dims(2, true), super::pivot_dims(3, 2, 2, 2, 1));
+        assert_eq!(dims(10, true), (13, 21));
+        assert_eq!(dims(10, true), super::pivot_dims(11, 2, 2, 10, 1));
+        assert_eq!(dims(10, false), (12, 11));
+        assert_eq!(dims(10, false), super::pivot_dims(11, 1, 1, 10, 1));
+        // n = 2300: the 2300 header rows alone are 10.58M cells, so the check must count them before any is built.
+        let (h, w) = super::pivot_dims(2301, 2, 2, 2300, 1);
+        assert!(2300 * w > crate::util::MAX_CELLS && h * w > crate::util::MAX_CELLS);
+        let wide: Vec<f64> = (0..2300).map(f64::from).collect();
+        is_err(ev("PIVOTBY", vec![av(row(&[1.0])), av(row(&wide)), av(row(&wide)), t("SUM")]), CellError::Num);
     }
 }

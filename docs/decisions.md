@@ -47,3 +47,27 @@ current or preceding frame are protected from eviction. If the visible set excee
 new images show the existing placeholder until capacity is available; header-based admission
 avoids repeatedly decoding overflow images. More than 128 small visible pictures now keep stable
 texture handles instead of cycling through the cache every frame.
+
+## Ctrl+wheel zoom steps along its own ladder, not Excel's 15-point steps
+
+A Ctrl+wheel notch moves the zoom to the next step on `grid::WHEEL_ZOOM_LADDER`: 10, 12, 15, 18,
+21, 25, 30, 35, 42, 50, 60, 70, 85, 100, 120, 140, 170, 200, 240, 280, 340, 400 (four steps per
+doubling, 17–25% apart). A step less than 5% away is skipped, except 100% and the 10% / 400%
+limits, which are never skipped: 121% out goes to 100%, and 99% or 101% towards 100% goes to 100%.
+The wheel's turning is counted in notches (egui eases each notch in over several frames, and
+fine-grained wheels send parts of one); a notch steps once 60% of it has turned. With animations
+on, the zoom then glides to the step over about a tenth of a second (as egui eases a scroll notch),
+and a notch turned during a glide steps on from the step it's going to. With View › Animations off
+it goes to the step at once. Whether the zoom glide should have a setting of its own is left to the
+maintainers.
+
+Before, each frame multiplied the whole-number zoom by egui's eased factor and rounded, so a notch
+out never undid a notch in (100 → 122 → 101 → 123 → 102). Keeping the zoom unrounded fixed that
+for a wheel with exact notches, but not for one that sends uneven parts of a notch.
+
+Excel (observed: Microsoft 365, Windows) steps 15 points a notch: 100 → 115 → 130, and from 112%
+to 115% or 100%. That's a large relative step at low zoom and a small one near 400%; equal
+relative steps keep each notch feeling the same, and the doublings land on 25, 50, 100, 200 and
+400%. The status bar's Zoom In / Zoom Out buttons and Ctrl+Alt+= / Ctrl+Alt+- keep their 10%
+steps, so the wheel and the buttons now step differently. Whether they should share one ladder
+(this one, Excel's, or another) is left to the maintainers.

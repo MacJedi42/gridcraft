@@ -59,6 +59,14 @@ pub fn serial_from_unix_ms(ms: f64) -> f64 {
     25569.0 + ms / 86_400_000.0
 }
 
+/// Converts a 1900-system serial (as the clock supplies it) to the serial of the same instant in `sys`.
+pub fn serial_in_system(sys: DateSystem, serial_1900: f64) -> f64 {
+    match sys {
+        DateSystem::D1900 => serial_1900,
+        DateSystem::D1904 => serial_1900 - 1462.0,
+    }
+}
+
 pub fn civil_from_days(z: i64) -> (i32, u32, u32) {
     let z = z + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
@@ -95,6 +103,14 @@ pub fn days_in_month_in(sys: DateSystem, y: i32, m: u32) -> u32 {
     if sys == DateSystem::D1900 && y == 1900 && m == 2 { 29 } else { days_in_month(y, m) }
 }
 
+/// Last serial that is a valid date in a date system: 9999-12-31 (2958465 in the 1900 system, 2957003 in the 1904 system).
+pub fn max_serial(sys: DateSystem) -> i64 {
+    match sys {
+        DateSystem::D1900 => 2_958_465,
+        DateSystem::D1904 => 2_958_465 - 1462,
+    }
+}
+
 /// Serial for a date. Month and day overflow roll over like `DATE()` (month 13 = January next
 /// year, day 0 = last day of the previous month), in the date system's own calendar: in the 1900
 /// system February 1900 has 29 days, so `(1900, 2, 29)` and `(1900, 3, 0)` are serial 60.
@@ -117,7 +133,7 @@ pub fn serial_from_ymd(sys: DateSystem, year: i64, month: i64, day: i64) -> Opti
         DateSystem::D1904 => first - UNIX_1904_01_01,
     };
     let serial = first.checked_add(day)?.checked_sub(1)?;
-    if !(0..=2_958_465).contains(&serial) {
+    if !(0..=max_serial(sys)).contains(&serial) {
         return None;
     }
     Some(serial as f64)
@@ -125,7 +141,7 @@ pub fn serial_from_ymd(sys: DateSystem, year: i64, month: i64, day: i64) -> Opti
 
 /// Date/time from a serial. `None` for negative or too-large serials.
 pub fn datetime_from_serial(sys: DateSystem, serial: f64) -> Option<DateTime> {
-    if !serial.is_finite() || !(0.0..2_958_466.0).contains(&serial) {
+    if !serial.is_finite() || !(0.0..max_serial(sys) as f64 + 1.0).contains(&serial) {
         return None;
     }
     let mut day = serial.floor() as i64;
@@ -197,6 +213,10 @@ mod tests {
         assert_eq!(serial_from_ymd(s, 2000, 1, 1), Some(36526.0));
         assert_eq!(serial_from_ymd(s, 2026, 10, 7), Some(46302.0));
         assert_eq!(serial_from_ymd(s, 9999, 12, 31), Some(2958465.0));
+        assert_eq!(serial_from_ymd(DateSystem::D1904, 9999, 12, 31), Some(2957003.0));
+        assert_eq!(serial_from_ymd(DateSystem::D1904, 9999, 12, 32), None);
+        assert!(datetime_from_serial(DateSystem::D1904, 2957003.5).is_some());
+        assert!(datetime_from_serial(DateSystem::D1904, 2957004.0).is_none());
         assert_eq!(serial_from_ymd(s, 2020, 13, 1), serial_from_ymd(s, 2021, 1, 1));
         assert_eq!(serial_from_ymd(s, 2020, 3, 0), serial_from_ymd(s, 2020, 2, 29));
         assert_eq!(serial_from_ymd(s, 120, 1, 1), serial_from_ymd(s, 2020, 1, 1));

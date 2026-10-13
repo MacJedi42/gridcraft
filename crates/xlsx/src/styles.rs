@@ -396,7 +396,8 @@ pub fn color_attrs(c: &Color) -> String {
     }
 }
 
-fn font_xml(f: &Font, dxf: bool) -> String {
+/// `minor`: the font follows the theme's body font (`<scheme val="minor"/>`).
+fn font_xml(f: &Font, dxf: bool, minor: bool) -> String {
     let mut s = String::from("<font>");
     if f.bold {
         s.push_str("<b/>");
@@ -429,6 +430,9 @@ fn font_xml(f: &Font, dxf: bool) -> String {
     }
     if !dxf {
         let _ = write!(s, "<name val=\"{}\"/><family val=\"2\"/>", esc_attr(&f.name));
+        if minor {
+            s.push_str("<scheme val=\"minor\"/>");
+        }
     }
     s.push_str("</font>");
     s
@@ -667,7 +671,7 @@ pub fn write_styles(wb: &Workbook, dxfs: &[Style], extra_fmts: &[String]) -> (St
             || d.font.color != Color::Auto
             || d.font.vert != VertAlign::Baseline
         {
-            dx.push_str(&font_xml(&d.font, true));
+            dx.push_str(&font_xml(&d.font, true, false));
         }
         if d.num_fmt != def.num_fmt {
             let id = nf.id(d.num_fmt.as_str());
@@ -699,8 +703,9 @@ pub fn write_styles(wb: &Workbook, dxfs: &[Style], extra_fmts: &[String]) -> (St
         s.push_str("</numFmts>");
     }
     let _ = write!(s, "<fonts count=\"{}\">", fonts.len());
-    for f in &fonts {
-        s.push_str(&font_xml(f, false));
+    for (i, f) in fonts.iter().enumerate() {
+        // A Normal font in the theme's body face follows the theme, as Excel writes it (#805).
+        s.push_str(&font_xml(f, false, i == 0 && f.name == wb.theme.minor_font));
     }
     let _ = write!(s, "</fonts><fills count=\"{}\">", fills.len());
     for f in &fills {

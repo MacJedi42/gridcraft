@@ -202,6 +202,9 @@ fn basic_tools() {
     assert!(f.as_array().unwrap().iter().any(|x| x["name"] == "VLOOKUP"));
     assert_eq!(ok(&mut s, "evaluate_formula", json!({"formula": "SUM(1,2,3)"}))["result"], json!(6.0));
     ok(&mut s, "set_cell", json!({"cell": "A1", "input": "5"}));
+    // #697: a number for `input` is entered, not rejected or cleared.
+    ok(&mut s, "set_cell", json!({"cell": "B1", "input": 42.5}));
+    assert_eq!(ok(&mut s, "get_cell", json!({"cell": "B1"}))["value"], json!(42.5));
     ok(&mut s, "execute_command", json!({"command": "cell.set", "params": {"cell": "A2", "input": "=A1*2"}}));
     assert_eq!(ok(&mut s, "get_cell", json!({"cell": "A2"}))["value"], json!(10.0));
     assert_eq!(ok(&mut s, "evaluate_formula", json!({"formula": "=A1+A2", "cell": "C1"}))["result"], json!(15.0));
@@ -516,4 +519,30 @@ fn text_to_columns_destination_follows_its_sheet() {
     // An unparsable destination and a prefix that contradicts the command's sheet are errors, not A1.
     cmd_fails(&mut s, "data.textToColumns", json!({"range": "Other!A1", "delimiters": [","], "destination": "D0"}));
     cmd_fails(&mut s, "data.textToColumns", json!({"range": "Other!A1", "delimiters": [","], "destination": "Sheet1!D1"}));
+}
+
+#[test]
+fn invalid_borders_are_invalid_params() {
+    let mut s = server();
+    let bad = |s: &mut Server, id: u64, borders: Value| {
+        let v = rpc(s, id, "tools/call", json!({"name": "format_range", "arguments": {"range": "A1", "borders": borders}}));
+        assert_eq!(err_code(&v), -32602, "{v}");
+    };
+    bad(&mut s, 1, json!(123));
+    bad(&mut s, 2, json!("bogus"));
+    bad(&mut s, 3, json!({"preset": "bogus"}));
+    bad(&mut s, 4, json!({"style": "thick"}));
+    ok(&mut s, "format_range", json!({"range": "A1", "borders": "all"}));
+    ok(&mut s, "format_range", json!({"range": "B1", "borders": {"preset": "all", "style": "thick", "color": "#123456"}}));
+}
+
+#[test]
+fn invalid_sort_keys_are_invalid_params() {
+    let mut s = server();
+    ok(&mut s, "write_range", json!({"range": "A1", "values": [["b"], ["c"], ["a"]]}));
+    for (id, keys) in [(1, json!([123])), (2, json!([{"order": "desc"}])), (3, json!([{"column": "A", "order": "sideways"}]))] {
+        let v = rpc(&mut s, id, "tools/call", json!({"name": "sort_range", "arguments": {"range": "A1:A3", "keys": keys}}));
+        assert_eq!(err_code(&v), -32602, "{v}");
+    }
+    ok(&mut s, "sort_range", json!({"range": "A1:A3", "keys": ["A", {"column": "A", "order": "desc"}]}));
 }

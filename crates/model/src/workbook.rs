@@ -116,6 +116,10 @@ pub struct Workbook {
     /// Unmodelled file content kept for saving (package root and workbook level). Not in JSON.
     #[serde(skip)]
     pub preserved: Option<Arc<crate::preserved::Preserved>>,
+    /// The folder the workbook was read from, which relative paths to linked workbooks in
+    /// `preserved` are relative to. Saving into another folder rewrites them from there. Not in JSON.
+    #[serde(skip)]
+    pub source_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for Workbook {
@@ -143,6 +147,7 @@ impl Workbook {
             vba_project: None,
             csv_delimiter: None,
             preserved: None,
+            source_dir: None,
         }
     }
     pub fn sheet(&self, i: usize) -> Option<&Sheet> {

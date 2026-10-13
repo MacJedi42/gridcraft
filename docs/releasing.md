@@ -15,7 +15,7 @@ This is GridCraft's implementation of the shared [release playbook](release-play
 | Display name `GridCraft`, binaries `gridcraft` + `gridcraft-cli` | every script and workflow |
 | Bundle / app id `ai.storyteller.gridcraft` | `packaging/macos/Info.plist.in`, `packaging/linux/*`, flatpak manifest |
 | WiX UpgradeCode `5511327B-F305-41BE-92D0-EB84944E7C4D` (fixed forever) | `packaging/windows/gridcraft.wxs` |
-| File types `.xlsx` `.xlsm` `.csv` `.tsv` | Info.plist (`CFBundleDocumentTypes`), WiX (ProgIds/OpenWithProgids), `.desktop` `MimeType=`, `ai.storyteller.gridcraft.mime.xml`, metainfo |
+| File types `.xlsx` `.xlsm` `.xlsb` `.ods` `.csv` `.tsv` | Info.plist (`CFBundleDocumentTypes`), WiX (ProgIds/OpenWithProgids), `.desktop` `MimeType=`, `ai.storyteller.gridcraft.mime.xml`, metainfo |
 | Web app dir `apps/gridcraft-web` | `packaging/web/package.sh` |
 | App colour `#1f9d55` (ink `#147a40`), **proposed** | `assets/app-icon/README.md`, metainfo `<branding>` |
 
@@ -94,9 +94,9 @@ and upload their artifacts, the environment refuses macOS and Windows, and no re
 
 - `Info.plist` comes from `Info.plist.in`: bundle id `ai.storyteller.gridcraft`,
   `LSMinimumSystemVersion` 11.0, `NSHighResolutionCapable`, category productivity, and
-  `CFBundleDocumentTypes` for `.xlsx`, `.xlsm`, `.csv` and `.tsv` with rank **Alternate**, so
-  GridCraft is offered in *Open With* without taking over Numbers' (or another app's)
-  defaults. `.xlsm` gets an imported UTI in case macOS doesn't know it.
+  `CFBundleDocumentTypes` for `.xlsx`, `.xlsm`, `.xlsb`, `.ods`, `.csv` and `.tsv` with rank
+  **Alternate**, so GridCraft is offered in *Open With* without taking over Numbers' (or another
+  app's) defaults. `.xlsm` and `.xlsb` get imported UTIs in case macOS doesn't know them.
 - **Signing** goes inside-out with the hardened runtime and a secure timestamp; no `--deep` on
   the final signature; `entitlements.plist` is deliberately empty.
 - **Notarization:** the app is zipped and sent with `xcrun notarytool submit --wait`, then

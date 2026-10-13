@@ -145,7 +145,8 @@ impl Font {
 
 /// Width of `text` in points when set in `font` at `size` points.
 pub fn text_width(font: Font, size: f32, text: &str) -> f32 {
-    let units: u32 = text.chars().map(|c| font.char_width(c) as u32).sum();
+    // u64: a u32 sum overflows for ~8 million characters.
+    let units: u64 = text.chars().map(|c| u64::from(font.char_width(c))).sum();
     units as f32 * size / 1000.0
 }
 
@@ -221,6 +222,32 @@ fn n(v: f32) -> String {
     }
 }
 
+/// True when every value is finite (NaN and infinities are rejected).
+fn finite(v: &[f32]) -> bool {
+    v.iter().all(|x| x.is_finite())
+}
+
+/// A positive, finite extent (a width, height or radius).
+fn extent(v: f32) -> bool {
+    v > 0.0 && v.is_finite()
+}
+
+/// A stroke width: negative, NaN and infinite become 0 (the thinnest line).
+fn stroke_width(w: f32) -> f32 {
+    if w.is_finite() { w.max(0.0) } else { 0.0 }
+}
+
+/// The entries of a dash array (`[on, off, …]`, at most 8). A pattern the PDF specification
+/// forbids (any non-finite entry, or no entry that survives rounding to a positive number) is
+/// replaced by an empty array, i.e. a solid line.
+fn dash_values(dash: &[f32]) -> String {
+    let d: Vec<f32> = dash.iter().take(8).map(|v| if v.is_finite() { v.max(0.0) } else { f32::NAN }).collect();
+    if !finite(&d) || !d.iter().any(|v| (v.min(1.0e7) * 1000.0).round() > 0.0) {
+        return String::new();
+    }
+    d.iter().map(|v| n(*v)).collect::<Vec<_>>().join(" ")
+}
+
 fn rgb_op(c: Rgb, stroke: bool) -> String {
     let f = |v: u8| n(v as f32 / 255.0);
     format!("{} {} {} {}", f(c[0]), f(c[1]), f(c[2]), if stroke { "RG" } else { "rg" })
@@ -288,7 +315,7 @@ impl Page {
     }
 
     pub fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Rgb) {
-        if w <= 0.0 || h <= 0.0 {
+        if !(extent(w) && extent(h) && finite(&[x, y])) {
             return;
         }
         let s = format!("{}\n{} {} {} {} re f", rgb_op(color, false), n(x), n(self.y(y + h)), n(w), n(h));
@@ -296,7 +323,10 @@ impl Page {
     }
 
     pub fn rect_stroke(&mut self, x: f32, y: f32, w: f32, h: f32, width: f32, color: Rgb) {
-        let s = format!("{}\n{} w [] 0 d\n{} {} {} {} re S", rgb_op(color, true), n(width), n(x), n(self.y(y + h)), n(w), n(h));
+        if !finite(&[x, y, w, h]) {
+            return;
+        }
+        let s = format!("{}\n{} w [] 0 d\n{} {} {} {} re S", rgb_op(color, true), n(stroke_width(width)), n(x), n(self.y(y + h)), n(w), n(h));
         self.op(&s);
     }
 
@@ -306,19 +336,28 @@ impl Page {
 
     /// A line with a dash pattern (`[on, off, …]` in points; empty = solid).
     pub fn stroke_line_dashed(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, color: Rgb, dash: &[f32]) {
-        let d: Vec<String> = dash.iter().take(8).map(|v| n(v.max(0.0))).collect();
-        let s =
-            format!("{}\n{} w [{}] 0 d\n{} {} m {} {} l S", rgb_op(color, true), n(width), d.join(" "), n(x0), n(self.y(y0)), n(x1), n(self.y(y1)));
+        if !finite(&[x0, y0, x1, y1]) {
+            return;
+        }
+        let s = format!(
+            "{}\n{} w [{}] 0 d\n{} {} m {} {} l S",
+            rgb_op(color, true),
+            n(stroke_width(width)),
+            dash_values(dash),
+            n(x0),
+            n(self.y(y0)),
+            n(x1),
+            n(self.y(y1))
+        );
         self.op(&s);
     }
 
     /// An open polyline.
     pub fn polyline(&mut self, pts: &[[f32; 2]], width: f32, color: Rgb, dash: &[f32]) {
-        if pts.len() < 2 {
+        if pts.len() < 2 || !pts.iter().all(|p| finite(p)) {
             return;
         }
-        let d: Vec<String> = dash.iter().take(8).map(|v| n(v.max(0.0))).collect();
-        let mut s = format!("{}\n{} w [{}] 0 d 1 j\n", rgb_op(color, true), n(width), d.join(" "));
+        let mut s = format!("{}\n{} w [{}] 0 d 1 j\n", rgb_op(color, true), n(stroke_width(width)), dash_values(dash));
         self.path(&mut s, pts, false);
         s.push_str(" S");
         self.op(&s);
@@ -335,7 +374,7 @@ impl Page {
 
     /// A closed polygon, filled and/or stroked.
     pub fn polygon(&mut self, pts: &[[f32; 2]], fill: Option<Rgb>, stroke: Option<(Rgb, f32)>) {
-        if pts.len() < 2 || (fill.is_none() && stroke.is_none()) {
+        if pts.len() < 2 || (fill.is_none() && stroke.is_none()) || !pts.iter().all(|p| finite(p)) {
             return;
         }
         let mut s = String::new();
@@ -344,7 +383,7 @@ impl Page {
             s.push('\n');
         }
         if let Some((c, w)) = stroke {
-            let _ = writeln!(s, "{}\n{} w [] 0 d 1 j", rgb_op(c, true), n(w));
+            let _ = writeln!(s, "{}\n{} w [] 0 d 1 j", rgb_op(c, true), n(stroke_width(w)));
         }
         self.path(&mut s, pts, true);
         s.push_str(match (fill.is_some(), stroke.is_some()) {
@@ -357,7 +396,7 @@ impl Page {
 
     /// A circle approximated by four cubic Béziers.
     pub fn circle(&mut self, cx: f32, cy: f32, r: f32, fill: Option<Rgb>, stroke: Option<(Rgb, f32)>) {
-        if r <= 0.0 || (fill.is_none() && stroke.is_none()) {
+        if !extent(r) || !finite(&[cx, cy]) || (fill.is_none() && stroke.is_none()) {
             return;
         }
         const K: f32 = 0.552_284_8;
@@ -369,7 +408,7 @@ impl Page {
             s.push('\n');
         }
         if let Some((c, w)) = stroke {
-            let _ = writeln!(s, "{}\n{} w [] 0 d", rgb_op(c, true), n(w));
+            let _ = writeln!(s, "{}\n{} w [] 0 d", rgb_op(c, true), n(stroke_width(w)));
         }
         let _ = write!(
             s,
@@ -417,7 +456,7 @@ impl Page {
     /// Text rotated by `angle` radians (clockwise on the page, like the y-down coordinate
     /// system) about its baseline origin.
     pub fn text_rotated(&mut self, x: f32, y: f32, size: f32, font: Font, color: Rgb, text: &str, angle: f32) {
-        if text.is_empty() || !(size.is_finite() && size > 0.0) {
+        if text.is_empty() || !extent(size) || !finite(&[x, y]) {
             return;
         }
         let fi = font.index();
@@ -446,7 +485,7 @@ impl Page {
     /// `(x, y, w, h)`. Malformed or oversized buffers are ignored.
     pub fn image_rgba(&mut self, x: f32, y: f32, w: f32, h: f32, rgba: &[u8], pw: u32, ph: u32) {
         let px = pw as u64 * ph as u64;
-        if pw == 0 || ph == 0 || px > MAX_IMAGE_PIXELS || (rgba.len() as u64) < px * 4 || w <= 0.0 || h <= 0.0 {
+        if pw == 0 || ph == 0 || px > MAX_IMAGE_PIXELS || (rgba.len() as u64) < px * 4 || !(extent(w) && extent(h) && finite(&[x, y])) {
             return;
         }
         let px = px as usize;
@@ -516,8 +555,23 @@ fn run_length(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn pdf_text_string(s: &str) -> String {
-    pdf_string(s)
+/// Longest Info string written, in characters; longer values are cut on a character boundary.
+const MAX_INFO_CHARS: usize = 1024;
+
+/// A PDF text string (document Info entries) for `text`: a literal `( … )` for printable ASCII,
+/// otherwise UTF-16BE with a byte-order mark as a hex string (ISO 32000-1 7.9.2.2).
+fn pdf_text_string(text: &str) -> String {
+    let text: String = text.chars().take(MAX_INFO_CHARS).collect();
+    if text.chars().all(|c| matches!(c, ' '..='~')) {
+        return pdf_string(&text);
+    }
+    let mut s = String::with_capacity(text.len() * 4 + 6);
+    s.push_str("<FEFF");
+    for unit in text.encode_utf16() {
+        let _ = write!(s, "{unit:04X}");
+    }
+    s.push('>');
+    s
 }
 
 impl PdfDoc {

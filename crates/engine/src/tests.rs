@@ -561,6 +561,28 @@ fn insert_delete_rows_adjust() {
 }
 
 #[test]
+fn deleting_a_multi_area_row_selection_removes_every_area_and_undoes_once() {
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [[1], [2], [3], [4], [5], [6]]})).unwrap();
+    s.execute("cell.set", json!({"cell": "B1", "input": "=A6"})).unwrap();
+    // Ctrl-select rows 2, 4 and 5:6 (A1 refs are 1-based).
+    let sel = &mut s.doc_mut().unwrap().selection;
+    sel.ranges = vec![gridcraft_core::RangeRef::rows(1, 1), gridcraft_core::RangeRef::rows(3, 3), gridcraft_core::RangeRef::rows(4, 5)];
+    sel.active = CellRef::new(4, 0);
+    s.doc_mut().unwrap().undo.clear();
+    s.execute("home.deleteRows", json!({})).unwrap();
+    assert_eq!((v(&s, "A1"), v(&s, "A2"), v(&s, "A3")), (Value::Number(1.0), Value::Number(3.0), Value::Empty));
+    assert_eq!(s.execute("cell.get", json!({"cell": "B1"})).unwrap()["formula"], "=#REF!");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!((1..=6).map(|r| v(&s, &format!("A{r}"))).collect::<Vec<_>>(), (1..=6).map(|n| Value::Number(n as f64)).collect::<Vec<_>>());
+    assert!(s.doc().unwrap().undo.is_empty(), "one undo step restored all rows");
+    // The explicit list form behaves the same, for columns too.
+    s.execute("range.setValues", json!({"range": "A1", "values": [[1, 2, 3, 4]]})).unwrap();
+    s.execute("home.deleteColumns", json!({"cols": "A:A,C:C"})).unwrap();
+    assert_eq!((v(&s, "A1"), v(&s, "B1"), v(&s, "C1")), (Value::Number(2.0), Value::Number(4.0), Value::Empty));
+}
+
+#[test]
 fn move_columns_reorders_without_overwriting_and_undoes_once() {
     let mut s = s();
     s.execute("range.setValues", json!({"range": "A1", "values": [[1, 2, 3, 4, 5, 6, 7, 8]]})).unwrap();
@@ -805,6 +827,46 @@ fn sort_and_filter() {
     assert_eq!(r["hiddenRows"], 1);
 }
 
+/// Top 10 keeps the top or bottom N items or percent, ties at the threshold included.
+#[test]
+fn filter_top10_items_and_percent() {
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [["Score"], [5], [1], [9], [3], [9], [7], ["x"]]})).unwrap();
+    s.execute("selection.set", json!({"cell": "A1"})).unwrap();
+    s.execute("data.filter", json!({})).unwrap();
+    // Top 2 items: 9, 9 (the "x" text row is hidden too).
+    let r = s.execute("data.filterBy", json!({"column": "A", "top": {"count": 2}})).unwrap();
+    assert_eq!(r["hiddenRows"], 5);
+    // Bottom 2 items: 1, 3.
+    let r = s.execute("data.filterBy", json!({"column": "A", "top": {"count": 2, "bottom": true}})).unwrap();
+    assert_eq!(r["hiddenRows"], 5);
+    // Top 50 percent of 6 numbers = 3 items; the threshold 7 keeps 9, 9, 7.
+    let r = s.execute("data.filterBy", json!({"column": "A", "top": {"count": 50, "percent": true}})).unwrap();
+    assert_eq!(r["hiddenRows"], 4);
+}
+
+/// Two Top 10 criteria on one column (possible in a native JSON file) each keep their own
+/// cutoff: Top 3 and Bottom 4 of 1..5 keep 3 and 4.
+#[test]
+fn filter_top10_two_criteria_on_one_column() {
+    use gridcraft_model::FilterCriterion;
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [["N"], [1], [2], [3], [4], [5]]})).unwrap();
+    s.execute("selection.set", json!({"cell": "A1"})).unwrap();
+    s.execute("data.filter", json!({})).unwrap();
+    let sh = std::sync::Arc::make_mut(&mut s.doc_mut().unwrap().wb).sheet_mut(0).unwrap();
+    if let Some(af) = sh.autofilter.as_mut() {
+        af.criteria = vec![
+            (0, FilterCriterion::Top10 { bottom: false, percent: false, count: 3 }),
+            (0, FilterCriterion::Top10 { bottom: true, percent: false, count: 4 }),
+        ];
+    }
+    s.execute("data.reapply", json!({})).unwrap();
+    let hidden: Vec<u32> = s.active().unwrap().wb.sheet(0).unwrap().rows.iter().filter(|(_, r)| r.hidden).map(|(k, _)| *k).collect();
+    // Rows are 0-based: values 1, 2 and 5 sit on rows 1, 2 and 5.
+    assert_eq!(hidden, vec![1, 2, 5]);
+}
+
 /// Turning the filter on with only the header row selected filters the data below it (#201).
 #[test]
 fn filter_on_a_selected_header_row_covers_the_data_below() {
@@ -1007,6 +1069,87 @@ fn spill_references_roundtrip_through_xlsx() {
     assert_eq!((v(&s, "C1"), v(&s, "C2")), (Value::Number(10.0), Value::Number(4.0)));
 }
 
+/// Fixture for the open-time row fit (issue #833): `row_info` = (size, custom, hidden) for
+/// row 5 (index 4), `None` = no row entry at all. Cell A5 = "plain big bold" — whole-cell
+/// font 20pt with `big_font`, plain 11pt without (a tall plain row's fit removes its entry).
+/// 11pt cell in A1 for contrast rows. Built with the model API, never through commands —
+/// commands would auto-fit the rows — and exported with `write_xlsx`, which omits `ht` for
+/// rows without a size: exactly the bug's input.
+fn big_font_workbook(row_info: Option<(f32, bool, bool)>, big_font: bool) -> Vec<u8> {
+    let mut wb = gridcraft_model::Workbook::new();
+    let big = wb.styles.derive(gridcraft_model::StyleId::DEFAULT, |s| s.font.size = 20.0);
+    let sh = wb.sheet_mut(0).unwrap();
+    sh.set_value(CellRef::new(0, 0), Value::text("small"));
+    sh.set_value(CellRef::new(4, 0), Value::text("plain big bold"));
+    if big_font {
+        sh.set_style(CellRef::new(4, 0), big);
+    }
+    if let Some((size, custom, hidden)) = row_info {
+        let e = sh.rows.entry(4).or_default();
+        e.size = Some(size);
+        e.custom = custom;
+        e.hidden = hidden;
+    }
+    gridcraft_xlsx::write_xlsx(&wb).unwrap()
+}
+
+#[test] // A — the issue's repro
+fn open_grows_default_height_rows_to_their_font() {
+    let default_h = gridcraft_model::Workbook::new().active().unwrap().row_height(0);
+    let mut s = Session::new();
+    s.execute("file.open", json!({"name": "bigfont.xlsx", "base64": crate::io::base64_encode(&big_font_workbook(None, true))})).unwrap();
+    let h = s.doc().unwrap().wb.active().unwrap().row_height(4);
+    assert!(h >= 30.0, "20pt cell must grow its default-height row on open, got {h}");
+    assert_eq!(s.doc().unwrap().wb.active().unwrap().row_height(0), default_h, "11pt row stays default");
+}
+
+#[test] // B — Review Focus 1
+fn open_keeps_custom_height_rows() {
+    let mut s = Session::new();
+    s.execute("file.open", json!({"name": "custom.xlsx", "base64": crate::io::base64_encode(&big_font_workbook(Some((25.0, true, false)), true))}))
+        .unwrap();
+    assert_eq!(s.doc().unwrap().wb.active().unwrap().row_height(4), 25.0, "custom-height rows are left alone on open");
+}
+
+#[test] // C — Review Focus 2 (Some→Some: the fit shrinks the row, the clamp keeps the taller height)
+fn open_never_shrinks_taller_auto_rows() {
+    let mut s = Session::new();
+    s.execute("file.open", json!({"name": "tall.xlsx", "base64": crate::io::base64_encode(&big_font_workbook(Some((60.0, false, false)), true))}))
+        .unwrap();
+    assert_eq!(s.doc().unwrap().wb.active().unwrap().row_height(4), 60.0, "open is grow-only: a 60px auto-height row keeps its height");
+}
+
+#[test] // C′ — Review Focus 2 (Some→None: a plain tall row's entry is removed by the fit, the clamp restores it)
+fn open_restores_height_of_plain_rows_the_fit_removed() {
+    let mut s = Session::new();
+    s.execute(
+        "file.open",
+        json!({"name": "tall-plain.xlsx", "base64": crate::io::base64_encode(&big_font_workbook(Some((60.0, false, false)), false))}),
+    )
+    .unwrap();
+    assert_eq!(s.doc().unwrap().wb.active().unwrap().row_height(4), 60.0, "a tall plain row keeps its height after the fit removes its entry");
+}
+
+#[test] // D — Review Focus 5
+fn open_fitting_keeps_hidden_rows_hidden() {
+    let mut s = Session::new();
+    s.execute("file.open", json!({"name": "hidden.xlsx", "base64": crate::io::base64_encode(&big_font_workbook(Some((20.0, false, true)), true))}))
+        .unwrap();
+    let sh = s.doc().unwrap().wb.active().unwrap();
+    let info = sh.rows.get(&4).unwrap();
+    assert!(info.size.is_some_and(|h| h >= 20.0), "hidden row grows or keeps its height, got {:?}", info.size);
+    assert!(info.hidden, "fitting a hidden row must not unhide it");
+}
+
+#[test] // E — Review Focus 4
+fn open_leaves_plain_workbooks_untouched() {
+    let mut s = Session::new();
+    s.execute("file.open", json!({"name": "plain.xlsx", "base64": crate::io::base64_encode(&big_font_workbook(None, false))})).unwrap();
+    let sh = s.doc().unwrap().wb.active().unwrap();
+    assert!(sh.rows.get(&0).is_none_or(|i| i.size.is_none()), "11pt default rows get no height entry");
+    assert!(sh.rows.values().all(|i| i.size.is_none()), "no row gains a height entry");
+}
+
 #[test]
 fn tables_and_structured_refs() {
     let mut s = s();
@@ -1016,6 +1159,51 @@ fn tables_and_structured_refs() {
     assert_eq!(v(&s, "D1"), Value::Number(7.0));
     s.execute("table.totalRow", json!({"on": true, "table": "Table1"})).unwrap();
     assert_eq!(v(&s, "B4"), Value::Number(7.0));
+}
+
+#[test]
+fn structured_refs_to_columns_with_edge_spaces() {
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [["Item", "Qty "], ["a", 2], ["b", 3]]})).unwrap();
+    s.execute("insert.table", json!({"range": "A1:B3", "hasHeaders": true})).unwrap();
+    s.execute("table.totalRow", json!({"on": true, "table": "Table1"})).unwrap();
+    assert_eq!(v(&s, "B4"), Value::Number(5.0));
+    for (cell, input) in [
+        ("F1", "=SUM(Table1[Qty ])"),
+        ("F2", "=Table1[[#Totals],[Qty ]]"),
+        ("F3", "=SUBTOTAL(109,Table1[Qty ])"),
+        ("F4", "=SUM(Table1[[Qty ]])"),
+        ("F5", "=SUM(Table1[Qty])"),
+        ("C2", "=Table1[@[Qty ]]*10"),
+    ] {
+        s.execute("cell.set", json!({"cell": cell, "input": input})).unwrap();
+    }
+    let n = Value::Number;
+    assert_eq!([v(&s, "F1"), v(&s, "F2"), v(&s, "F3"), v(&s, "F4")], [n(5.0), n(5.0), n(5.0), n(5.0)]);
+    assert_eq!(v(&s, "F5"), Value::Error(gridcraft_core::CellError::Ref));
+    assert_eq!(v(&s, "C2"), n(20.0));
+    assert_eq!(s.execute("cell.get", json!({"cell": "F3"})).unwrap()["formula"], "=SUBTOTAL(109,Table1[[Qty ]])");
+
+    let r = s.execute("file.saveBytes", json!({"format": "xlsx"})).unwrap();
+    let b64 = r["base64"].as_str().unwrap().to_string();
+    s.execute("file.open", json!({"name": "x.xlsx", "base64": b64})).unwrap();
+    assert_eq!(s.execute("cell.get", json!({"cell": "F3"})).unwrap()["formula"], "=SUBTOTAL(109,Table1[[Qty ]])");
+    assert_eq!([v(&s, "F1"), v(&s, "F2"), v(&s, "F3")], [n(5.0), n(5.0), n(5.0)]);
+}
+
+#[test]
+fn table_rename_keeps_a_defined_name_with_the_same_name() {
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [["Qty"], [7]]})).unwrap();
+    s.execute("cell.set", json!({"cell": "D1", "input": "100"})).unwrap();
+    s.execute("insert.table", json!({"range": "A1:A2", "header": true, "name": "Data"})).unwrap();
+    s.execute("formulas.defineName", json!({"name": "Data", "refersTo": "=Sheet1!$D$1"})).unwrap();
+    s.execute("cell.set", json!({"cell": "E1", "input": "=Data"})).unwrap();
+    s.execute("cell.set", json!({"cell": "F1", "input": "=SUM(Data[Qty])"})).unwrap();
+    s.execute("table.rename", json!({"table": "Data", "name": "Later"})).unwrap();
+    assert_eq!(s.execute("cell.get", json!({"cell": "E1"})).unwrap()["formula"], "=Data");
+    assert_eq!(s.execute("cell.get", json!({"cell": "F1"})).unwrap()["formula"], "=SUM(Later[Qty])");
+    assert_eq!((v(&s, "E1"), v(&s, "F1")), (Value::Number(100.0), Value::Number(7.0)));
 }
 
 #[test]
@@ -1168,6 +1356,22 @@ fn insert_and_delete_cells_never_shift_part_of_a_table() {
     assert!(e.to_string().contains("not valid"), "a cell reference isn't a table name: {e}");
     let e = s.execute("insert.table", json!({"range": "D5:F6", "header": false})).unwrap_err();
     assert!(e.to_string().contains("shift cells in a table"), "{e}");
+}
+
+#[test]
+fn table_names_with_a_hyphen_are_rejected() {
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [["Qty"], [7]]})).unwrap();
+    let e = s.execute("insert.table", json!({"range": "A1:A2", "header": true, "name": "A-B"})).unwrap_err();
+    assert!(e.to_string().contains("not valid"), "{e}");
+    assert!(s.doc().unwrap().wb.table("A-B").is_none());
+    s.execute("insert.table", json!({"range": "A1:A2", "header": true, "name": "Sales"})).unwrap();
+    let e = s.execute("table.rename", json!({"table": "Sales", "name": "A-B"})).unwrap_err();
+    assert!(e.to_string().contains("not valid"), "{e}");
+    assert!(s.doc().unwrap().wb.table("Sales").is_some());
+    assert!(s.execute("table.rename", json!({"table": "Sales", "name": ".AB"})).is_err());
+    s.execute("table.rename", json!({"table": "Sales", "name": "A_B"})).unwrap();
+    assert!(s.doc().unwrap().wb.table("A_B").is_some());
 }
 
 #[test]
@@ -1519,6 +1723,141 @@ fn saving_an_opened_semicolon_csv_keeps_semicolons() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A workbook whose B1 is `=[1]Sheet1!A1`, linked to `link` (an external relationship target).
+fn linked_workbook(link: &str) -> Vec<u8> {
+    use std::io::{Cursor, Write};
+    const NS_REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    let types = r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/externalLinks/externalLink1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.externalLink+xml"/></Types>"#.to_string();
+    let rels = format!(
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{NS_REL}/officeDocument" Target="xl/workbook.xml"/></Relationships>"#
+    );
+    let book = format!(
+        r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="{NS_REL}"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets><externalReferences><externalReference r:id="rId2"/></externalReferences></workbook>"#
+    );
+    let book_rels = format!(
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{NS_REL}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{NS_REL}/externalLink" Target="externalLinks/externalLink1.xml"/></Relationships>"#
+    );
+    let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="B1"><f>[1]Sheet1!A1</f><v>10</v></c></row></sheetData></worksheet>"#.to_string();
+    let link_part = format!(
+        r#"<externalLink xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="{NS_REL}"><externalBook r:id="rId1"><sheetNames><sheetName val="Sheet1"/></sheetNames><sheetDataSet><sheetData sheetId="0"><row r="1"><cell r="A1"><v>10</v></cell></row></sheetData></sheetDataSet></externalBook></externalLink>"#
+    );
+    let link_rels = format!(
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{NS_REL}/externalLinkPath" Target="{link}" TargetMode="External"/></Relationships>"#
+    );
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for (name, data) in [
+        ("[Content_Types].xml", types),
+        ("_rels/.rels", rels),
+        ("xl/workbook.xml", book),
+        ("xl/_rels/workbook.xml.rels", book_rels),
+        ("xl/worksheets/sheet1.xml", sheet),
+        ("xl/externalLinks/externalLink1.xml", link_part),
+        ("xl/externalLinks/_rels/externalLink1.xml.rels", link_rels),
+    ] {
+        zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(data.as_bytes()).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+/// The target of the linked workbook in a saved file.
+fn link_target(path: &std::path::Path) -> String {
+    use std::io::Read;
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(std::fs::read(path).unwrap())).unwrap();
+    let mut rels = String::new();
+    zip.by_name("xl/externalLinks/_rels/externalLink1.xml.rels").unwrap().read_to_string(&mut rels).unwrap();
+    let (_, after) = rels.split_once("Target=\"").unwrap();
+    after.split_once('"').unwrap().0.to_string()
+}
+
+/// Save As into another folder keeps the link on the same file, as Excel does: the relative path
+/// is rewritten from the new folder (#801).
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn save_as_into_another_folder_keeps_linked_workbooks_on_the_same_file() {
+    #[allow(clippy::disallowed_methods)] // native-only test: a unique temp dir name
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let a = std::env::temp_dir().join(format!("gridcraft-links-{}-{nonce}", std::process::id()));
+    let b = a.join("b");
+    std::fs::create_dir_all(&b).unwrap();
+    let dest = a.join("Dest.xlsx");
+    std::fs::write(&dest, linked_workbook("Source.xlsx")).unwrap();
+    let mut s = s();
+    s.execute("file.open", json!({"path": dest})).unwrap();
+    s.execute("file.saveAs", json!({"path": b.join("Dest.xlsx")})).unwrap();
+    assert_eq!(link_target(&b.join("Dest.xlsx")), "../Source.xlsx");
+    // Saved again into the folder it was read from, the path is the one it was read with.
+    s.execute("file.saveAs", json!({"path": a.join("Copy.xlsx")})).unwrap();
+    assert_eq!(link_target(&a.join("Copy.xlsx")), "Source.xlsx");
+    // Read from a subfolder and saved into its parent, the path goes down into the subfolder.
+    let deep = b.join("Deep.xlsx");
+    std::fs::write(&deep, linked_workbook("Source.xlsx")).unwrap();
+    let mut s = Session::new();
+    s.execute("file.open", json!({"path": deep})).unwrap();
+    s.execute("file.saveAs", json!({"path": a.join("Deep.xlsx")})).unwrap();
+    assert_eq!(link_target(&a.join("Deep.xlsx")), "b/Source.xlsx");
+    std::fs::remove_dir_all(a).unwrap();
+}
+
+/// A typo like `report.cvs` must not quietly write an XLSX under that name and adopt it as the
+/// document's file.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn saving_to_an_unknown_extension_is_refused() {
+    #[allow(clippy::disallowed_methods)] // native-only test: a unique temp dir name
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("gridcraft-unknown-ext-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let mut s = s();
+    s.execute("cell.set", json!({"cell": "A1", "input": "1"})).unwrap();
+    for name in ["report.cvs", "report"] {
+        let path = dir.join(name);
+        let e = s.execute("file.save", json!({"path": path})).unwrap_err().to_string();
+        assert!(e.contains(".xlsx"), "{name}: {e}");
+        assert!(!path.exists(), "{name} was written");
+    }
+    let d = s.doc().unwrap();
+    assert!(d.path.is_none());
+    assert!(d.is_dirty());
+    assert!(s.execute("file.saveBytes", json!({"format": "foo"})).is_err());
+    s.execute("file.save", json!({"path": dir.join("report.csv")})).unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// An XLSX opened by its content under an unknown extension (`budget.dat`) saves back to its own
+/// file as XLSX; a Save As to another unknown extension is still refused.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn an_xlsx_opened_under_an_unknown_extension_saves_back_as_xlsx() {
+    #[allow(clippy::disallowed_methods)] // native-only test: a unique temp dir name
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("gridcraft-dat-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("budget.dat");
+    let mut src = s();
+    src.execute("cell.set", json!({"cell": "A1", "input": "1"})).unwrap();
+    std::fs::write(&path, crate::io::save_bytes(&src.doc().unwrap().wb, "book.xlsx").unwrap()).unwrap();
+    let mut s = s();
+    s.execute("file.open", json!({"path": path})).unwrap();
+    s.execute("cell.set", json!({"cell": "A1", "input": "2"})).unwrap();
+    s.execute("file.save", json!({})).unwrap();
+    assert!(!s.doc().unwrap().is_dirty());
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(gridcraft_xlsx::sniff(&bytes), gridcraft_xlsx::Format::Xlsx);
+    let (wb, _) = crate::io::open_bytes("book.xlsx", &bytes).unwrap();
+    assert_eq!(wb.active().unwrap().value(CellRef::parse("A1").unwrap()), Value::Number(2.0));
+    assert!(s.execute("file.saveAs", json!({"path": dir.join("copy.foo")})).is_err());
+    assert!(!dir.join("copy.foo").exists());
+    // A text file under an unknown extension opens as CSV: Save doesn't turn it into an XLSX.
+    let notes = dir.join("notes.dat");
+    std::fs::write(&notes, "a,b\r\n").unwrap();
+    s.execute("file.open", json!({"path": notes})).unwrap();
+    s.execute("cell.set", json!({"cell": "A1", "input": "c"})).unwrap();
+    assert!(s.execute("file.save", json!({})).is_err());
+    assert_eq!(std::fs::read_to_string(&notes).unwrap(), "a,b\r\n");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn validation_formulas_are_relative_and_see_the_new_value() {
     let mut s = s();
@@ -1618,6 +1957,17 @@ fn replacing_a_spilling_formula_clears_its_spill() {
 }
 
 #[test]
+fn clearing_a_spill_past_65536_cells_updates_a_late_dependent() {
+    let mut s = s();
+    s.execute("cell.set", json!({"cell": "A1", "input": "=SEQUENCE(65537)"})).unwrap();
+    s.execute("cell.set", json!({"cell": "C1", "input": "=A65536"})).unwrap();
+    s.execute("cell.set", json!({"cell": "C2", "input": "=A65537"})).unwrap();
+    assert_eq!(v(&s, "C2"), Value::Number(65537.0));
+    s.execute("cell.set", json!({"cell": "A1", "input": "5"})).unwrap();
+    assert_eq!((v(&s, "C1"), v(&s, "C2")), (Value::Number(0.0), Value::Number(0.0)));
+}
+
+#[test]
 fn range_ending_in_index_recalculates() {
     let mut s = s();
     s.execute("cell.set", json!({"cell": "B6", "input": "=SUM(C3:INDEX(B9:C11,2,2))"})).unwrap();
@@ -1694,6 +2044,23 @@ fn every_command_survives_empty_params() {
         let _ = s.execute(spec.id, json!([1, 2]));
         let _ = s.execute(spec.id, json!({"range": "ZZZ999999999", "cell": "", "sheet": 99}));
     }
+}
+
+#[test]
+fn non_object_params_do_not_panic_in_wrapper_commands() {
+    // Issue #516.
+    for cmd in ["pageLayout.themeColors", "pageLayout.background", "home.drawBorder"] {
+        for params in [json!([]), json!(5), json!("x"), json!(true)] {
+            let mut s = s();
+            let r = s.execute(cmd, params.clone());
+            assert!(!matches!(r, Err(crate::EngineError::Internal(..))), "{cmd} {params}: {r:?}");
+        }
+    }
+    // A saved script step forwards its params unchanged into the same call.
+    let mut s = s();
+    s.execute("automate.newScript", json!({"name": "bad", "commands": [{"command": "home.drawBorder", "params": []}]})).unwrap();
+    let r = s.execute("automate.runScript", json!({"name": "bad"}));
+    assert!(!matches!(r, Err(crate::EngineError::Internal(..))), "script: {r:?}");
 }
 
 fn fmt_of(s: &Session, a: &str) -> String {
@@ -2506,6 +2873,15 @@ fn fill_series_month_clamps_to_month_end() {
 }
 
 #[test]
+fn fill_series_weekday_out_of_range_step_errors() {
+    let mut s = s();
+    s.execute("cell.set", json!({"cell": "A1", "input": "45000"})).unwrap();
+    let r = s.execute("edit.fillSeries", json!({"range": "A1:A2", "direction": "columns", "type": "date", "dateUnit": "weekday", "step": 1e12}));
+    assert!(r.is_err());
+    assert_eq!(v(&s, "A2"), Value::Empty);
+}
+
+#[test]
 fn fill_series_month_leap_year() {
     let s = series_date("2028-01-31", "A1:A3", "month");
     assert_eq!(v(&s, "A2"), ymd(2028, 2, 29));
@@ -2547,6 +2923,56 @@ fn notes_comments_and_links_survive_a_json_save() {
     assert_eq!(after.comments, before.comments);
     assert_eq!(after.hyperlinks, before.hyperlinks);
     assert_eq!(after.cells, before.cells);
+}
+
+/// Insert › Link sorts a target as Excel's dialog does: a sheet reference, a defined name or `#…` is
+/// a place in this document, anything else an existing file or web page. A file saved as a
+/// `location` opens nothing in Excel (#800).
+#[test]
+fn links_to_files_are_saved_as_external_relationships() {
+    use std::io::Read;
+    let mut s = s();
+    s.execute("formulas.defineName", json!({"name": "Price", "refersTo": "=Sheet1!$A$1"})).unwrap();
+    s.execute("insert.table", json!({"range": "F1:G3", "name": "Sales"})).unwrap();
+    s.execute("home.insertSheet", json!({"name": "Q#1"})).unwrap();
+    s.execute("sheet.activate", json!({"sheet": 0})).unwrap();
+    let links = [
+        ("A1", "Source.xlsx", true),
+        ("A2", r"C:\Temp\Book.xlsx", true),
+        ("A3", r"..\Reports\Q1.xlsx", true),
+        ("A4", "Other.xlsx#Sheet1!A2", true),
+        ("A5", "https://example.com/a.xlsx", true),
+        ("A6", "Sheet1!B2", false),
+        ("A7", "#Sheet1!B3", false),
+        ("A8", "Price", false),
+        ("A9", "'Sheet1'!C4:D5", false),
+        ("A10", "Sales", false),
+        ("A11", "'Q#1'!B2", false),
+    ];
+    for (cell, target, _) in links {
+        s.execute("insert.link", json!({"cell": cell, "target": target})).unwrap();
+    }
+    let bytes = gridcraft_xlsx::write_xlsx(&s.doc().unwrap().wb).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.clone())).unwrap();
+    let mut part = |name: &str| {
+        let mut text = String::new();
+        zip.by_name(name).unwrap().read_to_string(&mut text).unwrap();
+        text
+    };
+    let (sheet, rels) = (part("xl/worksheets/sheet1.xml"), part("xl/worksheets/_rels/sheet1.xml.rels"));
+    for (cell, target, external) in links {
+        let file = target.split_once('#').map_or(target, |(f, _)| f);
+        let as_rel = format!("Target=\"{file}\" TargetMode=\"External\"");
+        let as_location = format!("location=\"{}\"", target.trim_start_matches('#'));
+        assert_eq!(rels.contains(&as_rel), external, "{cell} {target}: {rels}");
+        assert_eq!(sheet.contains(&as_location), !external, "{cell} {target}: {sheet}");
+    }
+    assert!(sheet.contains("location=\"Sheet1!A2\""), "{sheet}");
+    let (back, _) = gridcraft_xlsx::read_xlsx(&bytes).unwrap();
+    for (cell, target, external) in links {
+        let h = &back.sheet(0).unwrap().hyperlinks[&CellRef::parse(cell).unwrap()];
+        assert_eq!((h.target.as_str(), h.external), (target.trim_start_matches('#'), external), "{cell}");
+    }
 }
 
 #[test]
@@ -2819,4 +3245,65 @@ fn a_decrypted_workbook_never_overwrites_its_encrypted_original() {
     assert!(s.take_ui_requests().iter().any(|r| matches!(r, crate::UiRequest::Dialog(name, _) if name == "saveAs")));
     assert_eq!(std::fs::read(&path).unwrap(), bytes, "the encrypted original is untouched");
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn link_open_refuses_every_scheme_but_http_https_and_mailto() {
+    let mut s = s();
+    s.execute("insert.link", json!({"cell": "A1", "target": "file:///etc/passwd"})).unwrap();
+    s.take_ui_requests();
+    for url in ["file:///etc/passwd", "smb://h/s", "\\\\h\\s", "JAVASCRIPT:1"] {
+        assert!(s.execute("link.open", json!({"url": url})).is_err(), "{url}");
+    }
+    assert!(s.execute("link.open", json!({"cell": "A1"})).is_err());
+    assert!(s.take_ui_requests().is_empty());
+    s.execute("link.open", json!({"url": "HTTPS://example.org/a"})).unwrap();
+    assert_eq!(s.take_ui_requests(), vec![crate::UiRequest::OpenUrl("HTTPS://example.org/a".into())]);
+    s.execute("link.open", json!({"url": "B2"})).unwrap();
+    assert!(s.take_ui_requests().is_empty());
+}
+
+#[test]
+fn subtotal_109_recalculates_when_row_height_or_autofit_reveals_rows() {
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [[1], [2], [4], [8]]})).unwrap();
+    s.execute("cell.set", json!({"cell": "C1", "input": "=SUBTOTAL(109,A1:A4)"})).unwrap();
+    s.execute("home.hideRows", json!({"rows": "2:3"})).unwrap();
+    assert_eq!(v(&s, "C1"), Value::Number(9.0));
+    // A non-zero height unhides the rows (the fuzz found the stale SUBTOTAL).
+    s.execute("home.rowHeight", json!({"rows": "2:3", "height": 60.0})).unwrap();
+    assert_eq!(v(&s, "C1"), Value::Number(15.0));
+    s.execute("home.hideRows", json!({"rows": "2:3"})).unwrap();
+    assert_eq!(v(&s, "C1"), Value::Number(9.0));
+    s.execute("home.autofitRowHeight", json!({"rows": "2:3"})).unwrap();
+    assert_eq!(v(&s, "C1"), Value::Number(15.0));
+}
+
+#[test]
+fn paste_special_validation_copies_the_rule() {
+    let mut s = s();
+    let ok = |s: &mut Session, cell: &str, input: &str| s.execute("data.validate", json!({"cell": cell, "input": input})).unwrap()["ok"] == true;
+    s.execute("cell.set", json!({"cell": "A1", "input": "5"})).unwrap();
+    s.execute("cell.set", json!({"cell": "C3", "input": "7"})).unwrap();
+    s.execute("data.validation", json!({"range": "A1", "type": "whole", "operator": "greater", "formula1": "0"})).unwrap();
+    s.execute("edit.copy", json!({"range": "A1"})).unwrap();
+    s.execute("edit.pasteSpecial", json!({"what": "formats", "at": "E5"})).unwrap();
+    assert!(ok(&mut s, "E5", "-1"));
+    s.execute("edit.pasteSpecial", json!({"what": "validation", "at": "C3"})).unwrap();
+    assert!(!ok(&mut s, "C3", "-1"));
+    assert!(ok(&mut s, "C3", "1"));
+    assert!(!ok(&mut s, "A1", "-1"));
+    assert_eq!(s.execute("cell.get", json!({"cell": "C3"})).unwrap()["text"], json!("7"));
+}
+
+#[test]
+fn paste_special_validation_moves_relative_references() {
+    let mut s = s();
+    let ok = |s: &mut Session, cell: &str, input: &str| s.execute("data.validate", json!({"cell": cell, "input": input})).unwrap()["ok"] == true;
+    s.execute("cell.set", json!({"cell": "A1", "input": "50"})).unwrap();
+    s.execute("data.validation", json!({"range": "A1", "type": "custom", "formula1": "=A1>10"})).unwrap();
+    s.execute("edit.copy", json!({"range": "A1"})).unwrap();
+    s.execute("edit.pasteSpecial", json!({"what": "validation", "at": "C3"})).unwrap();
+    assert!(!ok(&mut s, "C3", "5"), "the pasted rule checks C3, not A1");
+    assert!(ok(&mut s, "C3", "20"));
 }
