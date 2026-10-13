@@ -65,3 +65,18 @@ the password, and never replaces the encrypted original.
 
 For a headless equivalent (no window), use `gridcraft-cli mcp` or `gridcraft-cli run`;
 see [`mcp.md`](mcp.md) and [`cli.md`](cli.md).
+
+### Native printing
+
+Desktop `engine.commands {"search":"print"}` (and connected MCP `list_commands`)
+lists `ui.printSettings` and `ui.printSubmit` with their parameter and result fields.
+
+`engine.execute` can call `ui.printSettings` with `{}` to inspect the printer list, selected
+printer, copies, duplex, grayscale, discovery/submission status and backend receipt/error.
+`{"refresh":true}` starts background discovery; poll the same command until `discovering` is
+false. Set `printer` to a discovered name, integer `copies` from 1 to 999, `duplex` to
+`printerDefault`, `off`, `longEdge` or `shortEdge`, and boolean `grayscale`. Invalid updates are
+rejected without changing earlier settings. `ui.printSubmit` explicitly submits the current
+print-ready PDF without opening a dialog; inspect `ui.printSettings` until `busy` becomes false
+and check `status`/`detail`. The browser keeps its own print hook. PDF export remains separate.
+GridCraft accepts the existing `file.print` sheet/pagination params on `ui.printSubmit`; the engine `file.print` command returns the PDF without spooling.

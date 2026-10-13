@@ -16,6 +16,7 @@ mod graphics;
 mod logging;
 #[cfg(target_os = "macos")]
 mod native_menu;
+mod print;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -39,6 +40,10 @@ impl eframe::App for App {
             apple_events::poll(&self.2, &mut self.0, ctx);
         }
         self.0.logic(ctx);
+        self.0.poll_printing(ctx);
+        if ctx.input(|input| input.viewport().close_requested()) && self.0.printing.busy() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
     }
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
         self.0.raw_input_hook(raw);
@@ -53,6 +58,7 @@ impl eframe::App for App {
         self.0.ui(ui);
     }
     fn on_exit(&mut self) {
+        print::finish_pending_jobs();
         save_prefs(&self.0);
         // macOS (#117): end the process here, before eframe tears the window down. AccessKit's
         // macOS adapter subclasses the window's content view and restores its class on teardown;
@@ -180,12 +186,8 @@ fn services() -> Services {
             dialog.save_file().and_then(|p| p.to_str().map(str::to_string))
         })),
         open_url: Some(Box::new(|url: &str| open_with_system(url))),
-        // File › Print, Ctrl+P: the print PDF opens in the system's PDF viewer, whose Print
-        // command reaches the printer dialog (GridCraft has no printer driver of its own).
-        print: Some(Box::new(|bytes: &[u8]| match write_print_pdf(&std::env::temp_dir(), bytes) {
-            Ok(path) => open_with_system(&path.to_string_lossy()),
-            Err(e) => log::warn!("print: {e}"),
-        })),
+        printers: Some(print::discover()),
+        print_native: Some(print::submit()),
         ..Default::default()
     }
 }
@@ -202,32 +204,6 @@ fn open_with_system(target: &str) {
     if let Err(e) = std::process::Command::new(cmd).arg(target).spawn() {
         log::warn!("{cmd} {target}: {e}");
     }
-}
-
-/// Writes a print PDF into `dir` under a fresh name (an earlier print may still be open in the
-/// viewer) and returns its path. The temp folder is shared, so the file is created exclusively
-/// (an existing file or a planted symlink is never followed or overwritten) and, on Unix, readable
-/// only by the user.
-fn write_print_pdf(dir: &std::path::Path, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
-    use std::io::Write;
-    static PRINTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    for _ in 0..64 {
-        let n = PRINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed).wrapping_add(1);
-        let path = dir.join(format!("GridCraft print {}-{n}.pdf", std::process::id()));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        match options.open(&path) {
-            Ok(mut file) => {
-                file.write_all(bytes)?;
-                return Ok(path);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free print file name"))
 }
 
 fn icon() -> Option<egui::IconData> {
@@ -392,34 +368,4 @@ fn main() -> eframe::Result<()> {
         return run(options);
     }
     result
-}
-
-#[cfg(test)]
-mod print_tests {
-    #[test]
-    fn print_pdfs_get_fresh_names_in_the_given_folder() {
-        let dir = std::env::temp_dir().join(format!("gridcraft-print-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let a = super::write_print_pdf(&dir, b"%PDF-1.4 a").unwrap();
-        let b = super::write_print_pdf(&dir, b"%PDF-1.4 b").unwrap();
-        assert_ne!(a, b);
-        assert!(a.starts_with(&dir) && a.extension().is_some_and(|e| e == "pdf"));
-        assert_eq!(std::fs::read(&b).unwrap(), b"%PDF-1.4 b");
-        assert!(super::write_print_pdf(&dir.join("missing"), b"x").is_err());
-        // A file (or symlink) already at the next name is skipped, never overwritten.
-        let pid = std::process::id();
-        let taken: Vec<_> = (1..=200).map(|n| dir.join(format!("GridCraft print {pid}-{n}.pdf"))).filter(|p| !p.exists()).take(3).collect();
-        for p in &taken {
-            std::fs::write(p, b"keep").unwrap();
-        }
-        let c = super::write_print_pdf(&dir, b"%PDF-1.4 c").unwrap();
-        assert!(taken.iter().all(|p| std::fs::read(p).unwrap() == b"keep"));
-        assert_eq!(std::fs::read(&c).unwrap(), b"%PDF-1.4 c");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&c).unwrap().permissions().mode() & 0o077, 0, "only the user can read it");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

@@ -26,6 +26,7 @@ pub mod outline;
 pub mod panes;
 pub mod paper_view;
 pub mod pivot_pane;
+pub mod printing;
 pub mod ribbon;
 pub mod selection_glide;
 pub mod tabs;
@@ -159,6 +160,10 @@ pub struct Notice {
 /// Host services the platform shell provides (file pickers, opening URLs).
 #[derive(Default)]
 pub struct Services {
+    /// Desktop: discover configured printers on a worker.
+    pub printers: Option<printing::Discover>,
+    /// Desktop: submit the PDF with the chosen settings on a worker.
+    pub print_native: Option<printing::Submit>,
     pub pick_open: Option<Box<dyn Fn() -> Option<String>>>,
     pub pick_save: Option<Box<dyn Fn(&str) -> Option<String>>>,
     /// Native picture picker (PNG/JPEG), separate from workbook opening.
@@ -210,6 +215,8 @@ pub struct SheetApp {
     /// Dismissible info bar under the ribbon (open-time notices).
     pub notice: Option<Notice>,
     pub services: Services,
+    pub printing: printing::State,
+    print_feedback_seen: Option<printing::Feedback>,
     /// Synthetic input from agents, one batch per frame (drags need several frames).
     pub synthetic: std::collections::VecDeque<Vec<egui::Event>>,
     pub control_rx: Option<std::sync::mpsc::Receiver<ControlRequest>>,
@@ -256,6 +263,8 @@ impl SheetApp {
             toast: None,
             notice: None,
             services,
+            printing: Default::default(),
+            print_feedback_seen: None,
             synthetic: Default::default(),
             control_rx: None,
             grid: grid::GridState {
@@ -404,8 +413,12 @@ impl SheetApp {
     }
 
     pub fn run_or_alert(&mut self, id: &str, params: Json) {
-        // Printing from the UI also hands the PDF to the host's print flow (web).
+        // A menu/shortcut opens the settings first; the Print page's button submits explicitly.
         if id == "file.print" {
+            if self.services.print_native.is_some() {
+                self.open_backstage(backstage::Page::Print);
+                return;
+            }
             return self.print_now(params);
         }
         if let Err(e) = self.run(id, params) {
@@ -422,29 +435,39 @@ impl SheetApp {
         }
     }
 
-    /// Runs `file.print`, builds the PDF and (where the host provides the hook — the web
-    /// build) hands the bytes straight to the browser's print flow; errors show the usual
-    /// alert. Desktop builds have no `services.print`, so this falls back to `run_or_alert`
-    /// (which still produces the PDF — just without a UI to act on the result yet).
+    /// Builds the selected sheets' print-ready PDF and hands it to the desktop worker or the
+    /// browser. Rendering errors use the usual alert; asynchronous spooler errors stay visible
+    /// on the Print page. The engine command still returns PDF bytes without submitting.
     pub fn print_now(&mut self, params: Json) {
-        match self.run("file.print", params) {
-            Ok(r) => {
-                let Some(b64) = r.get("base64").and_then(Json::as_str) else { return };
-                let Some(bytes) = gridcraft_engine::io::base64_decode(b64) else {
-                    self.message = Some(("GridCraft".into(), "Couldn't decode the generated PDF.".into()));
-                    return;
-                };
-                if let Some(print) = &self.services.print {
-                    print(&bytes);
-                }
-            }
-            Err(e) => self.alert(e),
+        if let Err(error) = self.submit_print(params) {
+            self.alert(error);
         }
+    }
+
+    fn submit_print(&mut self, params: Json) -> Result<Json, String> {
+        if self.services.print_native.is_some() && !self.printing.ready() {
+            return Err("Select an available printer in File > Print before submitting.".into());
+        }
+        let pdf = self.run("file.print", params)?;
+        let encoded = pdf.get("base64").and_then(Json::as_str).ok_or("The print command did not produce a PDF.")?;
+        let bytes = gridcraft_engine::io::base64_decode(encoded).ok_or("Couldn't decode the generated PDF.")?;
+        let len = bytes.len();
+        if let Some(submit) = &self.services.print_native {
+            self.printing.begin(submit(bytes, self.printing.settings.clone())).map_err(|_| "A print job is already being submitted.".to_owned())?;
+            self.print_feedback_seen = None;
+        } else if let Some(print) = &self.services.print {
+            print(&bytes);
+        } else {
+            return Err("Printing is unavailable here; export a PDF instead.".into());
+        }
+        Ok(json!({"printing": true, "bytes": len, "pending": self.services.print_native.is_some()}))
     }
 
     /// UI-only commands (dialogs, view toggles that aren't saved in the file).
     fn run_ui_command(&mut self, id: &str, p: &Json) -> Option<Result<Json, String>> {
         let r = match id {
+            "ui.printSettings" => printing::settings(&mut self.printing, p, self.services.printers.as_ref()),
+            "ui.printSubmit" => self.submit_print(p.clone()),
             "ui.ribbonTab" => {
                 self.ui.ribbon_tab = p.get("tab").and_then(Json::as_str).unwrap_or("Home").to_string();
                 Ok(Json::Null)
@@ -834,6 +857,26 @@ impl SheetApp {
         self.grid.ensure_visible = true;
     }
 
+    /// Terminal feedback also reaches the normal window when printing starts through control.
+    pub fn poll_printing(&mut self, ctx: &egui::Context) {
+        self.printing.poll(ctx);
+        if self.printing.message == self.print_feedback_seen {
+            return;
+        }
+        self.print_feedback_seen = self.printing.message.clone();
+        let Some(message @ (printing::Feedback::Submitted(_) | printing::Feedback::Failed(_) | printing::Feedback::WorkerStopped)) =
+            self.printing.message.clone()
+        else {
+            return;
+        };
+        let text = printing::feedback(&message, |label| self.ui.language.tr(label).to_owned());
+        if matches!(message, printing::Feedback::Submitted(_)) {
+            self.toast = Some((text, now_ms()));
+        } else {
+            self.alert(text);
+        }
+    }
+
     /// Per-frame logic (control channel, screenshots). Call before `ui`.
     pub fn logic(&mut self, ctx: &egui::Context) {
         // A keytip control request lives one frame: the ribbon consumes it during `ui`, and
@@ -939,6 +982,7 @@ impl SheetApp {
     /// Lays out the whole window.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.poll_printing(&ctx);
         if !self.fonts_ready || self.fonts_rebind {
             ctx.request_repaint();
             return;

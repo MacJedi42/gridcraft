@@ -175,7 +175,18 @@ pub fn save_bytes(wb: &Workbook, path: &str) -> Result<Vec<u8>> {
 /// characters in each cell" (Microsoft Support, *Excel formatting and features that are not
 /// transferred to other file formats*): number formats applied, never column-width `#####`.
 fn csv(wb: &Workbook, sh: &Sheet, delimiter: u8) -> Vec<u8> {
-    gridcraft_xlsx::write_csv(sh, delimiter, |c| crate::display::value_text(wb, sh, c))
+    gridcraft_xlsx::write_csv(sh, delimiter, |c| {
+        // General's grid-width formatting rounds large identifiers to scientific notation.
+        // Delimited files have no column width, so preserve the whole numeric value instead.
+        if wb.styles.get(sh.style_id(c)).num_fmt.as_str().eq_ignore_ascii_case("General")
+            && let gridcraft_core::Value::Number(number) = sh.value(c)
+            && number.is_finite()
+        {
+            number.to_string()
+        } else {
+            crate::display::value_text(wb, sh, c)
+        }
+    })
 }
 
 fn esc(s: &str) -> String {
@@ -566,6 +577,22 @@ mod tests {
         assert_eq!(csv, "2026-01-01,\"$1,234.50\",12.5%,1 1/2,007,#N/A,TRUE\r\n2026-01-02,12345678.90,-0.25,\"1,234,567\",,,\r\n");
         let tsv = String::from_utf8(save_bytes(&wb, "out.tsv").unwrap()).unwrap();
         assert!(tsv.starts_with("2026-01-01\t$1,234.50\t12.5%\t"), "{tsv}");
+    }
+
+    #[test]
+    fn delimited_exports_preserve_general_precision_and_explicit_number_formats() {
+        use gridcraft_core::Value;
+        use gridcraft_model::{Cell, NumFmt, StyleId};
+        let mut workbook = Workbook::new();
+        let scientific = workbook.styles.derive(StyleId::DEFAULT, |style| style.num_fmt = NumFmt::new("0.00E+00"));
+        let sheet = workbook.sheet_mut(0).unwrap();
+        sheet.set_cell(CellRef::new(0, 0), Cell { value: Value::Number(124412140710.0), ..Default::default() });
+        sheet.set_cell(CellRef::new(0, 1), Cell { value: Value::Number(1.23456789012345), ..Default::default() });
+        sheet.set_cell(CellRef::new(0, 2), Cell { value: Value::Number(124412140710.0), style: scientific, ..Default::default() });
+        for (path, separator) in [("data.csv", ","), ("data.tsv", "\t")] {
+            let output = String::from_utf8(save_bytes(&workbook, path).unwrap()).unwrap();
+            assert_eq!(output, format!("124412140710{separator}1.23456789012345{separator}1.24E+11\r\n"));
+        }
     }
 
     #[test]
