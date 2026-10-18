@@ -1361,3 +1361,31 @@ fn pmt_keeps_a_tiny_rate_s_digits() {
     t.set("B3", "=PMT(0,10,1000)");
     assert_eq!(t.get("B3"), Value::Number(-100.0));
 }
+
+#[test]
+fn median_large_values_recalculate_dependents() {
+    let mut t = T::new();
+    t.set("A1", "1e308");
+    t.set("A2", "1.6e308");
+    t.set("B1", "=MEDIAN(A1:A2)");
+    t.set("B2", "=AGGREGATE(12,0,A1:A2)");
+    t.set("C1", "=B1/1e308");
+    t.set("C2", "=B2/1e308");
+    for cell in ["B1", "B2"] {
+        assert!((t.num(cell) / 1e308 - 1.3).abs() < 1e-14);
+    }
+    for cell in ["C1", "C2"] {
+        assert!((t.num(cell) - 1.3).abs() < 1e-14);
+    }
+    t.set("A2", "-1e308");
+    for cell in ["B1", "B2", "C1", "C2"] {
+        assert_eq!(t.num(cell), 0.0);
+    }
+    t.set("A1", "-1.6e308");
+    for cell in ["B1", "B2"] {
+        assert!((t.num(cell) / 1e308 + 1.3).abs() < 1e-14);
+    }
+    for cell in ["C1", "C2"] {
+        assert!((t.num(cell) + 1.3).abs() < 1e-14);
+    }
+}
