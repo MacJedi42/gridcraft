@@ -6,6 +6,7 @@
 use gridcraft_core::date::{datetime_from_serial, days_in_month, serial_from_ymd};
 use gridcraft_core::{CellError, DateSystem, Value};
 
+use crate::math::power_of;
 use crate::util::{R, S, array_numbers, as_array, flatten, has, num, num_val, numbers, opt_bool, opt_num, round_half_away, text, to_sig_digits};
 use crate::{Arg, Ctx, FnSpec, VAR};
 
@@ -13,31 +14,46 @@ use crate::{Arg, Ctx, FnSpec, VAR};
 // Time value of money
 // ---------------------------------------------------------------------------------------------
 
-fn pmt_calc(rate: f64, nper: f64, pv: f64, fv: f64, typ: f64) -> f64 {
+fn pmt_calc(rate: f64, nper: f64, pv: f64, fv: f64, typ: f64) -> R<f64> {
     if rate == 0.0 {
-        return -(pv + fv) / nper;
+        return Ok(-(pv + fv) / nper);
+    }
+    // Excel's PMT has no value at a rate of -1 or below, even where (1+rate)^nper does
+    // (PMT(-1,3,100) and PMT(-1.5,3,100) are #NUM!).
+    if rate <= -1.0 {
+        return Err(CellError::Num);
     }
     // (1+rate)^nper and (1+rate)^nper - 1 through ln_1p and exp_m1: forming 1+rate first loses a
     // tiny rate's digits (rate 1e-9 is only 7 digits right), and Excel's PMT keeps them
     // (suite pmt.00051 to 00060: PMT(1E-9,360,100000) is -277.7778279166697).
     let l = nper * rate.ln_1p();
-    -(rate * (fv + pv * l.exp())) / ((1.0 + rate * typ) * l.exp_m1())
+    Ok(-(rate * (fv + pv * l.exp())) / ((1.0 + rate * typ) * l.exp_m1()))
 }
 
-fn fv_calc(rate: f64, nper: f64, pmt: f64, pv: f64, typ: f64) -> f64 {
-    if rate == 0.0 {
-        return -(pv + pmt * nper);
-    }
-    let p = (1.0 + rate).powf(nper);
-    -(pv * p + pmt * (1.0 + rate * typ) * (p - 1.0) / rate)
+/// (1+rate)^nper for FV and PV, which use Excel's `^`: an integer power by repeated squaring, a
+/// negative base's odd root, and its errors (0^0 is #NUM!, 0^-n is #DIV/0!).
+fn growth(rate: f64, nper: f64) -> R<f64> {
+    power_of(1.0 + rate, nper)
 }
 
-fn pv_calc(rate: f64, nper: f64, pmt: f64, fv: f64, typ: f64) -> f64 {
+fn fv_calc(rate: f64, nper: f64, pmt: f64, pv: f64, typ: f64) -> R<f64> {
     if rate == 0.0 {
-        return -(fv + pmt * nper);
+        return Ok(-(pv + pmt * nper));
     }
-    let p = (1.0 + rate).powf(nper);
-    -(fv + pmt * (1.0 + rate * typ) * (p - 1.0) / rate) / p
+    let p = growth(rate, nper)?;
+    Ok(-(pv * p + pmt * (1.0 + rate * typ) * (p - 1.0) / rate))
+}
+
+fn pv_calc(rate: f64, nper: f64, pmt: f64, fv: f64, typ: f64) -> R<f64> {
+    if rate == 0.0 {
+        return Ok(-(fv + pmt * nper));
+    }
+    let p = growth(rate, nper)?;
+    // PV(-1,3,-10,100) and PV(-0.9,310,0,-1) divide by a zero growth (a subnormal is 0): #DIV/0!.
+    if p.abs() < f64::MIN_POSITIVE {
+        return Err(CellError::Div0);
+    }
+    Ok(-(fv + pmt * (1.0 + rate * typ) * (p - 1.0) / rate) / p)
 }
 
 fn type_arg(args: &[Arg], i: usize) -> R<f64> {
@@ -50,17 +66,17 @@ fn pmt(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     if nper == 0.0 {
         return Err(CellError::Num);
     }
-    num_val(pmt_calc(rate, nper, pv, fv, typ))
+    num_val(pmt_calc(rate, nper, pv, fv, typ)?)
 }
 
 fn fv(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     let (rate, nper, pmt) = (num(a, 0)?, num(a, 1)?, num(a, 2)?);
-    num_val(fv_calc(rate, nper, pmt, opt_num(a, 3, 0.0)?, type_arg(a, 4)?))
+    num_val(fv_calc(rate, nper, pmt, opt_num(a, 3, 0.0)?, type_arg(a, 4)?)?)
 }
 
 fn pv(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     let (rate, nper, pmt) = (num(a, 0)?, num(a, 1)?, num(a, 2)?);
-    num_val(pv_calc(rate, nper, pmt, opt_num(a, 3, 0.0)?, type_arg(a, 4)?))
+    num_val(pv_calc(rate, nper, pmt, opt_num(a, 3, 0.0)?, type_arg(a, 4)?)?)
 }
 
 fn nper(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
@@ -84,14 +100,15 @@ fn nper(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     num_val(q.ln() / (1.0 + rate).ln())
 }
 
-fn ipmt_calc(rate: f64, per: f64, nper: f64, pv: f64, fv: f64, typ: f64) -> f64 {
-    let p = pmt_calc(rate, nper, pv, fv, typ);
+fn ipmt_calc(rate: f64, per: f64, nper: f64, pv: f64, fv: f64, typ: f64) -> R<f64> {
+    // Before the payment: IPMT(-1,1,3,100,0,1) is 0 although PMT(-1,3,100,0,1) is #NUM!.
     if typ == 1.0 && per == 1.0 {
-        return 0.0;
+        return Ok(0.0);
     }
-    let bal = fv_calc(rate, per - 1.0, p, pv, typ);
+    let p = pmt_calc(rate, nper, pv, fv, typ)?;
+    let bal = fv_calc(rate, per - 1.0, p, pv, typ)?;
     let i = bal * rate;
-    if typ == 1.0 { i / (1.0 + rate) } else { i }
+    Ok(if typ == 1.0 { i / (1.0 + rate) } else { i })
 }
 
 fn ipmt(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
@@ -100,7 +117,7 @@ fn ipmt(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     if per < 1.0 || per > np || np == 0.0 {
         return Err(CellError::Num);
     }
-    num_val(ipmt_calc(rate, per, np, pv, fv, typ))
+    num_val(ipmt_calc(rate, per, np, pv, fv, typ)?)
 }
 
 fn ppmt(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
@@ -109,7 +126,7 @@ fn ppmt(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     if per < 1.0 || per > np || np == 0.0 {
         return Err(CellError::Num);
     }
-    num_val(pmt_calc(rate, np, pv, fv, typ) - ipmt_calc(rate, per, np, pv, fv, typ))
+    num_val(pmt_calc(rate, np, pv, fv, typ)? - ipmt_calc(rate, per, np, pv, fv, typ)?)
 }
 
 fn cumulative(a: &[Arg], principal: bool) -> R<Value> {
@@ -122,11 +139,11 @@ fn cumulative(a: &[Arg], principal: bool) -> R<Value> {
     if end - start > 1e7 || np_i > 1e15 {
         return Err(CellError::Num);
     }
-    let p = pmt_calc(rate, np_i, pv, 0.0, typ);
+    let p = pmt_calc(rate, np_i, pv, 0.0, typ)?;
     let mut sum = 0.0;
     let mut per = start;
     while per <= end {
-        let i = ipmt_calc(rate, per, np_i, pv, 0.0, typ);
+        let i = ipmt_calc(rate, per, np_i, pv, 0.0, typ)?;
         sum += if principal { p - i } else { i };
         per += 1.0;
     }
@@ -1796,6 +1813,39 @@ mod tests {
         close_tol(ev("CUMPRINC", vec![n(0.09 / 12.0), n(360.0), n(125000.0), n(1.0), n(1.0), n(0.0)]), -68.27827118, 1e-9);
         is_err(ev("CUMIPMT", vec![n(0.0), n(360.0), n(125000.0), n(1.0), n(1.0), n(0.0)]), CellError::Num);
         is_err(ev("CUMIPMT", vec![n(0.01), n(360.0), n(125000.0), n(1.0), n(1.0), n(2.0)]), CellError::Num);
+    }
+
+    #[test]
+    fn tvm_at_a_rate_of_minus_one_and_below() {
+        // Excel-observed (Microsoft 365, 16.0.20430). PMT, and IPMT and PPMT through it, has no
+        // value at a rate of -1 or below.
+        for rate in [-1.0, -1.5] {
+            is_err(ev("PMT", vec![n(rate), n(3.0), n(100.0)]), CellError::Num);
+            is_err(ev("PMT", vec![n(rate), n(3.0), n(100.0), n(50.0)]), CellError::Num);
+            is_err(ev("IPMT", vec![n(rate), n(2.0), n(3.0), n(100.0)]), CellError::Num);
+            is_err(ev("PPMT", vec![n(rate), n(2.0), n(3.0), n(100.0)]), CellError::Num);
+            is_err(ev("PPMT", vec![n(rate), n(1.0), n(3.0), n(100.0), n(0.0), n(1.0)]), CellError::Num);
+            // The first payment in advance carries no interest, whatever the rate.
+            close(ev("IPMT", vec![n(rate), n(1.0), n(3.0), n(100.0), n(0.0), n(1.0)]), 0.0);
+        }
+        // FV and PV keep a value: (1+rate)^nper is Excel's `^`, errors included.
+        close(ev("FV", vec![n(-1.0), n(3.0), n(-10.0), n(100.0)]), 10.0);
+        close(ev("FV", vec![n(-1.5), n(3.0), n(-10.0), n(100.0)]), 20.0);
+        close(ev("PV", vec![n(-1.5), n(3.0), n(-10.0), n(100.0), n(1.0)]), 830.0);
+        is_err(ev("FV", vec![n(-1.0), n(0.0), n(-10.0), n(100.0)]), CellError::Num);
+        is_err(ev("PV", vec![n(-1.0), n(0.0), n(-10.0), n(100.0)]), CellError::Num);
+        is_err(ev("FV", vec![n(-1.0), n(-3.0), n(-10.0), n(100.0)]), CellError::Div0);
+        is_err(ev("PV", vec![n(-1.0), n(3.0), n(-10.0), n(100.0)]), CellError::Div0);
+        is_err(ev("PV", vec![n(-0.9), n(310.0), n(0.0), n(-1.0)]), CellError::Div0);
+        is_err(ev("FV", vec![n(-1.5), n(2.5), n(-10.0), n(100.0)]), CellError::Num);
+        assert_eq!(ev("FV", vec![n(-1.5), n(1.0 / 3.0), n(0.0), n(-1.0)]), Value::Number(-0.7937005259840998));
+    }
+
+    #[test]
+    fn fv_and_pv_powers_use_repeated_squaring() {
+        // Excel-observed: pow() gives 4113.435153940674 and 0.00024310581365115218.
+        assert_eq!(ev("FV", vec![n(0.07), n(123.0), n(0.0), n(-1.0)]), Value::Number(4113.435153940649));
+        assert_eq!(ev("PV", vec![n(0.07), n(123.0), n(0.0), n(-1.0)]), Value::Number(0.00024310581365115367));
     }
 
     #[test]
